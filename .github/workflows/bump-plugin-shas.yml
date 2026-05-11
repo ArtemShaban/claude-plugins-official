@@ -31,7 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: anthropics/claude-plugins-community/.github/actions/bump-plugin-shas@f846a0bcb0e721b1f93d60e8b73e91dafc4a1e87
+      # createCommitOnBranch-based bump so commits are signed by GitHub and
+      # satisfy the org-level required_signatures ruleset on main.
+      - uses: anthropics/claude-plugins-community/.github/actions/bump-plugin-shas@c41c6911de0afffd2bc5cd8b21fb1e06444ee13b
         with:
           marketplace-path: .claude-plugin/marketplace.json
           max-bumps: ${{ inputs.max_bumps || '20' }}
