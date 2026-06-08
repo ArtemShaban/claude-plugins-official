@@ -127,20 +127,24 @@ numbered path. Build it from the template that ships with this plugin —
 do not hand-write the viewer:
 
 ```bash
-python3 - "$CLAUDE_PLUGIN_ROOT/assets/topology-viewer.html" analysis/$1 <<'EOF'
+python3 - "${CLAUDE_PLUGIN_ROOT}/assets/topology-viewer.html" analysis/$1 <<'EOF'
 import json, sys
 tpl_path, out_dir = sys.argv[1], sys.argv[2]
 tpl = open(tpl_path).read()
+marker = "/*__TOPOLOGY_DATA__*/ null"
+assert marker in tpl, f"injection marker not found in {tpl_path}"
 data = json.dumps(json.load(open(f"{out_dir}/topology.json")))
-html = tpl.replace("/*__TOPOLOGY_DATA__*/ null", "/*__TOPOLOGY_DATA__*/ " + data)
-open(f"{out_dir}/TOPOLOGY.html", "w").write(html)
-print(f"wrote {out_dir}/TOPOLOGY.html ({len(html):,} bytes)")
+open(f"{out_dir}/TOPOLOGY.html", "w").write(
+    tpl.replace(marker, "/*__TOPOLOGY_DATA__*/ " + data))
+print(f"wrote {out_dir}/TOPOLOGY.html")
 EOF
 ```
 
-The viewer loads d3 from a CDN, so opening it needs network access; the
-rest is self-contained. If the data injection marker is missing from the
-output, the template was not found — check `$CLAUDE_PLUGIN_ROOT`.
+The viewer loads d3 (version-pinned) from a CDN, so opening it needs
+one-time network access; the rest is self-contained and the page shows an
+explicit error if the CDN is unreachable. If the `python3` invocation
+fails to find the template, `${CLAUDE_PLUGIN_ROOT}` was not substituted —
+report that rather than hand-writing a viewer.
 
 Mermaid stays for **small, exportable** diagrams. Generate standalone
 `.mmd` files for reuse in docs and PRs — but keep each under ~40 edges;

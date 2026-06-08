@@ -92,14 +92,32 @@
 Re-run <code>/modernize-map</code> to regenerate it.</p></div>
 
 <script type="module">
-import * as d3 from "https://cdn.jsdelivr.net/npm/d3@7/+esm";
+function fail(html) {
+  const err = document.getElementById("err");
+  err.querySelector("p").innerHTML = html;
+  err.style.display = "grid";
+}
+
+// Version-pinned so the page renders the same bytes every time. On
+// networks that block the CDN, vendor the file locally and point this
+// import at it — everything else on the page is self-contained.
+let d3;
+try {
+  d3 = await import("https://cdn.jsdelivr.net/npm/d3@7.9.0/+esm");
+} catch {
+  fail("Could not load the d3 library from <code>cdn.jsdelivr.net</code>.<br>" +
+    "This page needs one-time network access to that CDN. On a restricted " +
+    "network, download d3 locally and update the import at the top of the " +
+    "script in this file.");
+  throw new Error("d3 load failed");
+}
 
 // Injected by /modernize-map: the contents of topology.json replace the
 // null after the marker comment. Schema documented in the command file.
 const DATA = /*__TOPOLOGY_DATA__*/ null;
 
 if (!DATA || !DATA.root) {
-  document.getElementById("err").style.display = "grid";
+  fail("No topology data found in this file.<br>Re-run <code>/modernize-map</code> to regenerate it.");
   throw new Error("no data");
 }
 
@@ -109,30 +127,37 @@ if (!DATA || !DATA.root) {
 const WORLD = 8000;
 // Leaves without a meaningful LOC (data stores, screens, jobs) get a floor
 // based on the median module size so they stay visible next to code.
+// LLM-generated data is messy: coerce loc to a finite number everywhere
+// (a single NaN propagates through pack() and blanks the whole canvas).
+const numLoc = d => { const l = Number(d.loc); return Number.isFinite(l) && l > 0 ? l : 0; };
 const locs = [];
 (function walk(d) { if (d.children && d.children.length) d.children.forEach(walk);
-  else if (d.loc > 1) locs.push(d.loc); })(DATA.root);
+  else if (numLoc(d) > 1) locs.push(numLoc(d)); })(DATA.root);
 locs.sort((a, b) => a - b);
 const FLOOR = Math.max(1, Math.round((locs[Math.floor(locs.length / 2)] || 100) * 0.4));
 const root = d3.hierarchy(DATA.root, d => d.children)
-  .sum(d => (d.children && d.children.length ? 0 : Math.max(d.loc || 0, d.kind === "module" ? 1 : FLOOR)))
+  .sum(d => (d.children && d.children.length ? 0 : Math.max(numLoc(d), d.kind === "module" ? 1 : FLOOR)))
   .sort((a, b) => b.value - a.value);
 d3.pack().size([WORLD, WORLD]).padding(d => Math.max(3, 24 / (d.depth + 1)))(root);
 
 const nodes = [];
 const byId = new Map();
 root.each(d => {
-  const n = { id: d.data.id, name: d.data.name, kind: d.data.kind || "module",
+  const id = String(d.data.id ?? d.data.name ?? `n${nodes.length}`);
+  const n = { id, name: String(d.data.name ?? d.data.id ?? "?"),
+    kind: d.data.kind || "module",
     language: d.data.language || null, file: d.data.file || null,
-    loc: d.data.loc || 0, x: d.x, y: d.y, r: d.r, depth: d.depth,
-    parent: d.parent ? d.parent.data.id : null,
+    loc: numLoc(d.data), x: d.x, y: d.y, r: d.r, depth: d.depth,
+    parent: d.parent ? String(d.parent.data.id ?? "") : null,
     container: !!(d.children && d.children.length) };
   nodes.push(n); byId.set(n.id, n);
 });
 nodes.sort((a, b) => b.r - a.r); // painters: parents under children
 
-const entrySet = new Set(DATA.entryPoints || []);
-const edges = (DATA.edges || []).filter(e => byId.has(e.source) && byId.has(e.target));
+const entrySet = new Set((DATA.entryPoints || []).map(String));
+const edges = (DATA.edges || [])
+  .filter(e => e && byId.has(String(e.source)) && byId.has(String(e.target)))
+  .map(e => ({ source: String(e.source), target: String(e.target), kind: e.kind }));
 const fanIn = new Map(), fanOut = new Map();
 for (const e of edges) {
   fanOut.set(e.source, (fanOut.get(e.source) || 0) + 1);
@@ -140,7 +165,7 @@ for (const e of edges) {
 }
 
 // ── Colors ──────────────────────────────────────────────────────────────
-const KIND_FILL = { system: "#1e1e1e", domain: null, module: "#4a6580",
+const KIND_FILL = { system: "#242424", domain: null, module: "#4a6580",
   datastore: "#3d6a5a", job: "#7a5d8a", screen: "#8a6d4a" };
 const LANG_FILL = { cobol: "#5e7a9e", java: "#9a6848", c: "#6e6a58",
   "c++": "#6e6a58", python: "#5a7850", javascript: "#9a8348",
@@ -186,8 +211,9 @@ function flowNodeSet() {
 function draw() {
   const dpr = window.devicePixelRatio || 1;
   const vw = innerWidth, vh = innerHeight;
-  if (canvas.width !== vw * dpr) { canvas.width = vw * dpr; canvas.style.width = vw + "px"; }
-  if (canvas.height !== vh * dpr) { canvas.height = vh * dpr; canvas.style.height = vh + "px"; }
+  const bw = Math.round(vw * dpr), bh = Math.round(vh * dpr);
+  if (canvas.width !== bw) { canvas.width = bw; canvas.style.width = vw + "px"; }
+  if (canvas.height !== bh) { canvas.height = bh; canvas.style.height = vh + "px"; }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = "#1e1e1e"; ctx.fillRect(0, 0, vw, vh);
 
@@ -287,7 +313,7 @@ function draw() {
 }
 
 // ── Zoom / pan / hit-testing ────────────────────────────────────────────
-const zoomB = d3.zoom().scaleExtent([0.05, 600])
+const zoomB = d3.zoom().scaleExtent([0.05, 600]).clickDistance(4)
   .on("zoom", ev => { transform = ev.transform; requestDraw(); })
   .on("start", () => canvas.classList.add("dragging"))
   .on("end", () => canvas.classList.remove("dragging"));
@@ -298,6 +324,11 @@ function hit(mx, my) {
   let best = null;
   for (const n of nodes) {
     if (n.r * transform.k < MIN_R) continue;
+    // Mirror the draw-time LOD rule so hidden nodes can't be clicked.
+    if (n.parent) {
+      const p = byId.get(n.parent);
+      if (p && p.r * transform.k < REVEAL_R) continue;
+    }
     const dx = wx - n.x, dy = wy - n.y;
     if (dx * dx + dy * dy <= n.r * n.r && (!best || n.r < best.r)) best = n;
   }
@@ -328,7 +359,11 @@ canvas.addEventListener("click", e => {
 });
 canvas.addEventListener("dblclick", e => { const h = hit(e.offsetX, e.offsetY); if (h) flyTo(h); });
 addEventListener("keydown", e => {
-  if (e.key === "Escape") { selected = null; setFlow(""); flyTo(byId.get(DATA.root.id)); renderSidebar(); }
+  if (e.key !== "Escape") return;
+  // Escape inside the search box or flow select should only affect that
+  // control, not reset the whole viewport.
+  if (e.target === searchEl || (e.target && e.target.tagName === "SELECT")) return;
+  selected = null; setFlow(""); flyTo(byId.get(String(DATA.root.id))); renderSidebar();
 });
 addEventListener("resize", requestDraw);
 
@@ -404,7 +439,11 @@ if (!togglesEl.children.length) togglesEl.style.display = "none";
 
 // ── Flows ───────────────────────────────────────────────────────────────
 const flowsPanel = document.getElementById("flows"), flowSel = document.getElementById("flowSel");
-const flows = DATA.flows || [];
+const flows = (DATA.flows || []).filter(Boolean).map(f => ({
+  ...f,
+  steps: (Array.isArray(f.steps) ? f.steps : []).map(s => ({
+    label: String(s?.label ?? ""), nodes: (s?.nodes || []).map(String) })),
+}));
 if (flows.length) {
   flowsPanel.style.display = "";
   flows.forEach((f, i) => {
