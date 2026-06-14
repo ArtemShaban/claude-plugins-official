@@ -397,7 +397,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. If the tag has a reply_to_message_id attribute, the sender used Telegram\'s reply feature on an earlier message — reply_to_text (and reply_to_quote, if present) shows what they replied to; treat it as the context for their message. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -958,6 +958,22 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  // Reply context — Telegram's Bot API exposes the message being replied to
+  // (reply_to_message) and, since Bot API 7.0, a `quote` for a partial
+  // selection. Surface it in meta so Claude knows which earlier message the
+  // sender is responding to. Snippets are sanitized + truncated (uploader-
+  // controlled text could otherwise break out of the <channel> tag).
+  const repliedTo = ctx.message?.reply_to_message
+  const replyMeta: Record<string, string> = {}
+  if (repliedTo != null) {
+    replyMeta.reply_to_message_id = String(repliedTo.message_id)
+    const repliedSnippet = safeName(repliedTo.text ?? repliedTo.caption)?.slice(0, 300)
+    if (repliedSnippet) replyMeta.reply_to_text = repliedSnippet
+    if (repliedTo.from) replyMeta.reply_to_user = repliedTo.from.username ?? String(repliedTo.from.id)
+  }
+  const quotedSnippet = safeName(ctx.message?.quote?.text)?.slice(0, 300)
+  if (quotedSnippet) replyMeta.reply_to_quote = quotedSnippet
+
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
   mcp.notification({
@@ -970,6 +986,7 @@ async function handleInbound(
         user: from.username ?? String(from.id),
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+        ...replyMeta,
         ...(imagePath ? { image_path: imagePath } : {}),
         ...(attachment ? {
           attachment_kind: attachment.kind,
