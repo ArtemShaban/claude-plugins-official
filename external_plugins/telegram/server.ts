@@ -16,7 +16,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { Bot, GrammyError, InlineKeyboard, InputFile, API_CONSTANTS, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
@@ -297,6 +297,39 @@ function dmCommandGate(ctx: Context): { access: Access; senderId: string } | nul
   return { access, senderId }
 }
 
+// Gate for message_reaction updates: allow/drop only, never pairing.
+// A reaction is not a message — it must not mint pairing codes or send any
+// reply, so this is intentionally side-effect-free (mirrors dmCommandGate's
+// shape, not gate()'s). Returns the reacting user's id when allowed.
+//
+// Anonymous reactions arrive with actor_chat set and `from` (messageReaction.user)
+// absent — we can't authenticate the actor against the user allowlist, so we
+// drop them. Only an explicitly allowlisted user (DM) or an allowlisted member
+// of a configured group is surfaced to Claude.
+function reactionGate(ctx: Context): { senderId: string } | null {
+  const access = loadAccess()
+  if (access.dmPolicy === 'disabled') return null
+
+  const from = ctx.from
+  if (!from) return null // anonymous reaction (actor_chat only) — can't authenticate
+  const senderId = String(from.id)
+  const chatType = ctx.chat?.type
+
+  if (chatType === 'private') {
+    return access.allowFrom.includes(senderId) ? { senderId } : null
+  }
+
+  if (chatType === 'group' || chatType === 'supergroup') {
+    const policy = access.groups[String(ctx.chat!.id)]
+    if (!policy) return null
+    const groupAllowFrom = policy.allowFrom ?? []
+    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return null
+    return { senderId }
+  }
+
+  return null
+}
+
 function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
   const entities = ctx.message?.entities ?? ctx.message?.caption_entities ?? []
   const text = ctx.message?.text ?? ctx.message?.caption ?? ''
@@ -398,6 +431,8 @@ const mcp = new Server(
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. If the tag has a reply_to_message_id attribute, the sender used Telegram\'s reply feature on an earlier message — reply_to_text (and reply_to_quote, if present) shows what they replied to; treat it as the context for their message. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      '',
+      'A <channel> block with meta event="reaction" is not a chat message — it means the sender changed their emoji reaction on an earlier message (message_id identifies which one). reaction_added / reaction_removed list the emoji they added/removed (space-separated). Use this for lightweight signals, e.g. a 👍 reaction on a message you sent asking for approval. Do not reply to a reaction unless it warrants one — often the right response is to act on the signal silently.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -882,6 +917,77 @@ bot.on('message:sticker', async ctx => {
   })
 })
 
+// Emoji reactions arrive as message_reaction updates (enabled via
+// allowed_updates in bot.start). Surface them to Claude as a structured
+// channel event so a reaction can drive, e.g., a binary approve/reject —
+// the user reacts to one of our messages instead of typing a reply.
+//
+// Security mirrors inbound messages: only allowlisted users (DM) or
+// allowlisted members of configured groups are forwarded; reactionGate has no
+// pairing side effects, so a reaction can never mint a code or send a reply.
+bot.on('message_reaction', async ctx => {
+  if (!reactionGate(ctx)) return
+
+  const r = ctx.messageReaction! // present on this update type
+  const from = ctx.from! // reactionGate dropped anonymous (no from)
+  const chat_id = String(r.chat.id)
+  const message_id = String(r.message_id)
+
+  // grammY diffs old_reaction → new_reaction for us. emojiAdded/Removed are
+  // standard whitelist emoji; custom emoji are surfaced by count only (their
+  // id isn't a glyph and isn't meaningful to Claude).
+  const reactions = ctx.reactions()
+  const added = reactions.emojiAdded
+  const removed = reactions.emojiRemoved
+  const customAdded = reactions.customEmojiAdded.length
+  const customRemoved = reactions.customEmojiRemoved.length
+
+  // A reaction update with no net emoji change (e.g. only paid, or a no-op)
+  // carries nothing actionable — don't wake Claude for it.
+  if (
+    added.length === 0 &&
+    removed.length === 0 &&
+    customAdded === 0 &&
+    customRemoved === 0
+  ) {
+    return
+  }
+
+  // Human-readable summary for the content field. The structured emoji lists
+  // live in meta so logic can branch on them without parsing prose.
+  const parts: string[] = []
+  if (added.length) parts.push(`added ${added.join(' ')}`)
+  if (removed.length) parts.push(`removed ${removed.join(' ')}`)
+  if (customAdded) parts.push(`added ${customAdded} custom emoji`)
+  if (customRemoved) parts.push(`removed ${customRemoved} custom emoji`)
+  const content = `(reaction on message ${message_id}: ${parts.join(', ')})`
+
+  // Mirror the inbound message meta shape: chat_id/message_id/user/user_id/ts,
+  // plus a reaction-specific block. event=reaction lets Claude distinguish this
+  // from a relayed chat message. Emoji are Telegram-whitelisted glyphs (not
+  // user free-text), so no sanitization is needed for the meta values.
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content,
+      meta: {
+        event: 'reaction',
+        chat_id,
+        message_id,
+        user: from.username ?? String(from.id),
+        user_id: String(from.id),
+        ts: new Date((r.date ?? 0) * 1000).toISOString(),
+        ...(added.length ? { reaction_added: added.join(' ') } : {}),
+        ...(removed.length ? { reaction_removed: removed.join(' ') } : {}),
+        ...(customAdded ? { reaction_custom_added: String(customAdded) } : {}),
+        ...(customRemoved ? { reaction_custom_removed: String(customRemoved) } : {}),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to deliver reaction to Claude: ${err}\n`)
+  })
+})
+
 type AttachmentMeta = {
   kind: string
   file_id: string
@@ -1017,6 +1123,13 @@ void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
+        // Telegram excludes message_reaction from the default update set, so
+        // without an explicit allowed_updates the bot never receives reaction
+        // changes. Start from grammY's default list (message, callback_query,
+        // …) and add message_reaction so emoji reactions arrive as updates.
+        // We deliberately do NOT add message_reaction_count (anonymous
+        // aggregate counts — no actor to authenticate) or chat_member.
+        allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, 'message_reaction'],
         onStart: info => {
           attempt = 0
           botUsername = info.username
