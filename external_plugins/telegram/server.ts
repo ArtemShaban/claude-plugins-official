@@ -61,11 +61,35 @@ const SHUTDOWN_LOG = join(STATE_DIR, 'shutdown.log')
 // Append one line to shutdown.log so post-mortem analysis can find the cause.
 // Synchronous write — the process may exit immediately after. Never throws
 // (logging must not itself crash the shutdown path).
+//
+// Re-entrancy guard + size cap. An EPIPE on stdout/stderr (the pipe to the parent
+// Claude Code process is gone) can re-fire from inside the handler's own writes;
+// without a guard that becomes a tight loop that floods shutdown.log. Real
+// incident 2026-06-16: ~35M lines / 2.6GB in ~17min, event loop starved, channel
+// unreachable. The guard makes logging re-entrant-safe; the size cap bounds the file.
+let inLogShutdown = false
+const SHUTDOWN_LOG_MAX_BYTES = 5_000_000 // ~5MB rolling cap (keeps one previous gen)
 function logShutdown(reason: string, detail?: string): void {
+  if (inLogShutdown) return
+  inLogShutdown = true
   try {
+    try {
+      if (statSync(SHUTDOWN_LOG).size > SHUTDOWN_LOG_MAX_BYTES) {
+        renameSync(SHUTDOWN_LOG, `${SHUTDOWN_LOG}.1`)
+      }
+    } catch {}
     const ts = new Date().toISOString()
     const extra = detail ? `  [${detail}]` : ''
     appendFileSync(SHUTDOWN_LOG, `${ts}  ${reason}${extra}\n`)
+  } catch {}
+  inLogShutdown = false
+}
+
+// Writing to a broken stderr is itself what triggers the EPIPE loop — never let
+// a diagnostic write throw or re-enter the uncaughtException handler.
+function safeStderr(msg: string): void {
+  try {
+    process.stderr.write(msg)
   } catch {}
 }
 
@@ -87,11 +111,19 @@ writeFileSync(PID_FILE, String(process.pid))
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
 process.on('unhandledRejection', err => {
-  process.stderr.write(`telegram channel: unhandled rejection: ${err}\n`)
+  safeStderr(`telegram channel: unhandled rejection: ${err}\n`)
   logShutdown('unhandledRejection', String(err).slice(0, 200))
 })
-process.on('uncaughtException', err => {
-  process.stderr.write(`telegram channel: uncaught exception: ${err}\n`)
+process.on('uncaughtException', (err: any) => {
+  // EPIPE = our stdio pipe to the parent (Claude Code) is gone. The channel
+  // cannot recover and any further write just re-throws EPIPE → infinite loop
+  // (incident 2026-06-16). Log once and exit cleanly so the watchdog brings up
+  // a fresh session, instead of spinning forever and starving the event loop.
+  if (err && (err.code === 'EPIPE' || /EPIPE|broken pipe/i.test(String(err)))) {
+    logShutdown('uncaughtException', 'EPIPE — pipe to parent closed, exiting')
+    process.exit(1)
+  }
+  safeStderr(`telegram channel: uncaught exception: ${err}\n`)
   logShutdown('uncaughtException', String(err).slice(0, 200))
 })
 
