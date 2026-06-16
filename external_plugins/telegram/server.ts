@@ -19,6 +19,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, API_CONSTANTS, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
+import { spawnSync } from 'child_process'
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
@@ -61,11 +62,35 @@ const SHUTDOWN_LOG = join(STATE_DIR, 'shutdown.log')
 // Append one line to shutdown.log so post-mortem analysis can find the cause.
 // Synchronous write — the process may exit immediately after. Never throws
 // (logging must not itself crash the shutdown path).
+//
+// Re-entrancy guard + size cap. An EPIPE on stdout/stderr (the pipe to the parent
+// Claude Code process is gone) can re-fire from inside the handler's own writes;
+// without a guard that becomes a tight loop that floods shutdown.log. Real
+// incident 2026-06-16: ~35M lines / 2.6GB in ~17min, event loop starved, channel
+// unreachable. The guard makes logging re-entrant-safe; the size cap bounds the file.
+let inLogShutdown = false
+const SHUTDOWN_LOG_MAX_BYTES = 5_000_000 // ~5MB rolling cap (keeps one previous gen)
 function logShutdown(reason: string, detail?: string): void {
+  if (inLogShutdown) return
+  inLogShutdown = true
   try {
+    try {
+      if (statSync(SHUTDOWN_LOG).size > SHUTDOWN_LOG_MAX_BYTES) {
+        renameSync(SHUTDOWN_LOG, `${SHUTDOWN_LOG}.1`)
+      }
+    } catch {}
     const ts = new Date().toISOString()
     const extra = detail ? `  [${detail}]` : ''
     appendFileSync(SHUTDOWN_LOG, `${ts}  ${reason}${extra}\n`)
+  } catch {}
+  inLogShutdown = false
+}
+
+// Writing to a broken stderr is itself what triggers the EPIPE loop — never let
+// a diagnostic write throw or re-enter the uncaughtException handler.
+function safeStderr(msg: string): void {
+  try {
+    process.stderr.write(msg)
   } catch {}
 }
 
@@ -73,13 +98,47 @@ function logShutdown(reason: string, detail?: string): void {
 // session crashed (SIGKILL, terminal closed) its server.ts grandchild can
 // survive as an orphan and hold the slot forever, so every new session sees
 // 409 Conflict. Kill any stale holder before we start polling.
+//
+// PID-reuse guard: before sending SIGTERM, verify the process actually looks
+// like the telegram plugin (command line contains 'server.ts').
+// Without this check a stale PID that was recycled by an UNRELATED process
+// (e.g. a developer's bun script, sleep, nginx) would be killed — real outage
+// risk. Mirrors the BOT_CMD_PATTERN approach in tools/mcp-health-check.sh.
+//
+// Why 'server.ts' only (not AND 'telegram'):
+//   The real plugin shows in ps as `/usr/local/bin/bun server.ts` — the path
+//   is the CWD-relative name, not the full plugin dir. 'telegram' does NOT
+//   appear in the argv, so an AND check would always skip real stale instances.
+//   'server.ts' is narrow enough to distinguish from typical recycled-PID
+//   processes (sleep, python, node-not-our-plugin, etc.) and covers the actual
+//   production command.
+//
+// TELEGRAM_BOT_CMD_PATTERN env override for tests (replaces default pattern).
+function looksLikePlugin(cmd: string): boolean {
+  const override = process.env.TELEGRAM_BOT_CMD_PATTERN
+  if (override) return new RegExp(override, 'i').test(cmd)
+  return /server\.ts/i.test(cmd)
+}
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
+    process.kill(stale, 0) // throws if dead → caught below
+    // Verify command line looks like our plugin before sending SIGTERM.
+    // `ps -p <pid> -o command=` prints the full argv on macOS/Linux.
+    const psResult = spawnSync('ps', ['-p', String(stale), '-o', 'command='], {
+      encoding: 'utf8',
+      timeout: 2000,
+    })
+    const cmd = psResult.stdout ?? ''
+    if (looksLikePlugin(cmd)) {
+      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+      process.kill(stale, 'SIGTERM')
+    } else {
+      process.stderr.write(
+        `telegram channel: stale pid=${stale} cmd="${cmd.trim()}" does not match plugin pattern — skipping SIGTERM (PID reuse?)\n`
+      )
+    }
   }
 } catch {}
 writeFileSync(PID_FILE, String(process.pid))
@@ -87,11 +146,19 @@ writeFileSync(PID_FILE, String(process.pid))
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
 process.on('unhandledRejection', err => {
-  process.stderr.write(`telegram channel: unhandled rejection: ${err}\n`)
+  safeStderr(`telegram channel: unhandled rejection: ${err}\n`)
   logShutdown('unhandledRejection', String(err).slice(0, 200))
 })
-process.on('uncaughtException', err => {
-  process.stderr.write(`telegram channel: uncaught exception: ${err}\n`)
+process.on('uncaughtException', (err: any) => {
+  // EPIPE = our stdio pipe to the parent (Claude Code) is gone. The channel
+  // cannot recover and any further write just re-throws EPIPE → infinite loop
+  // (incident 2026-06-16). Log once and exit cleanly so the watchdog brings up
+  // a fresh session, instead of spinning forever and starving the event loop.
+  if (err && (err.code === 'EPIPE' || /EPIPE|broken pipe/i.test(String(err)))) {
+    logShutdown('uncaughtException', 'EPIPE — pipe to parent closed, exiting')
+    process.exit(1)
+  }
+  safeStderr(`telegram channel: uncaught exception: ${err}\n`)
   logShutdown('uncaughtException', String(err).slice(0, 200))
 })
 
@@ -99,6 +166,9 @@ process.on('uncaughtException', err => {
 // src/services/mcp/channelPermissions.ts — inlined (no CC repo dep).
 // 5 lowercase letters a-z minus 'l'. Case-insensitive for phone autocorrect.
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
+// [a-km-z]{5} = exactly 5 chars from a-z excluding 'l' (avoids 1/l ambiguity).
+// This matches the CC-generated request_id alphabet; confirmed from shared spec
+// in discord/server.ts and imessage/server.ts which use the identical pattern.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
@@ -661,7 +731,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
         const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
         const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
-        mkdirSync(INBOX_DIR, { recursive: true })
+        mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
         writeFileSync(path, buf)
         return { content: [{ type: 'text', text: path }] }
       }
@@ -866,7 +936,7 @@ bot.on('message:photo', async ctx => {
       const buf = Buffer.from(await res.arrayBuffer())
       const ext = file.file_path.split('.').pop() ?? 'jpg'
       const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
-      mkdirSync(INBOX_DIR, { recursive: true })
+      mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
       writeFileSync(path, buf)
       return path
     } catch (err) {
