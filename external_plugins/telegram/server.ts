@@ -22,6 +22,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { classifyRoute, persistIdea, ideaInboxDir } from './idea-inbox'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -41,6 +42,13 @@ try {
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
+
+// idea-inbox (async topic capture). Directory comes from IDEA_INBOX_DIR (env or
+// the channel .env). Unset => async routing is DISABLED and every message routes
+// 'work' (fail-safe: the channel keeps its current behaviour). NOT hardcoded so
+// the store lives in Семён's repo (e.g. <repo>/tasks/idea-inbox) without baking
+// an absolute path into the plugin. See idea-inbox.ts / the idea-inbox spec.
+const IDEA_INBOX_DIR = ideaInboxDir(process.env)
 
 if (!TOKEN) {
   process.stderr.write(
@@ -147,6 +155,16 @@ type PendingEntry = {
 type GroupPolicy = {
   requireMention: boolean
   allowFrom: string[]
+  /**
+   * Forum-topic ids (message_thread_id, as strings) that are captured ASYNC:
+   * the message is persisted to the idea-inbox WITHOUT waking the main Claude
+   * session (no mcp.notification). Any topic not listed here — and the General
+   * topic, which carries no message_thread_id — routes to 'work' (wakes the
+   * session, current behaviour). Empty/omitted => every message routes 'work'
+   * (fail-safe: a real work message is never silently swallowed). See
+   * classifyRoute() + the idea-inbox spec.
+   */
+  asyncThreads?: string[]
 }
 
 type Access = {
@@ -532,7 +550,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id (forum topic) to land the reply in the right topic, and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -541,6 +559,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           reply_to: {
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
+          },
+          message_thread_id: {
+            type: 'string',
+            description: 'Forum topic id to post into. Use message_thread_id from the inbound <channel> meta so the reply lands in the same topic (e.g. "Работа"). Omit for General / DM.',
           },
           files: {
             type: 'array',
@@ -609,9 +631,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        const message_thread_id =
+          args.message_thread_id != null ? Number(args.message_thread_id) : undefined
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        // R-OUT: in a forum, a message without message_thread_id lands in General
+        // (or TOPIC_DELETED). Carry it on every send so replies land in the topic.
+        const threadOpt =
+          message_thread_id != null ? { message_thread_id } : {}
 
         assertAllowedChat(chat_id)
 
@@ -637,6 +665,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
+              ...threadOpt,
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
             })
@@ -654,9 +683,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         for (const f of files) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
+          const opts = {
+            ...threadOpt,
+            ...(reply_to != null && replyMode !== 'off'
+              ? { reply_parameters: { message_id: reply_to } }
+              : {}),
+          }
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
             sentIds.push(sent.message_id)
@@ -1107,6 +1139,55 @@ async function handleInbound(
     return
   }
 
+  // ── idea-inbox topic routing (CRUX: async capture WITHOUT waking session) ──
+  // Branch on the forum topic. An async topic (config'd asyncThreads, only when
+  // IDEA_INBOX_DIR is set) is persisted to the durable store and returned ON THE
+  // SPOT — BEFORE the typing indicator and, critically, before mcp.notification.
+  // That is the ONLY thing that prevents this update from waking the main Claude
+  // session. Default ('work', incl. General / DM / any non-async topic) falls
+  // through to the existing behaviour below. classifyRoute is unit-tested.
+  const threadId = ctx.message?.message_thread_id
+  const route = classifyRoute(access, chat_id, threadId, IDEA_INBOX_DIR != null)
+  if (route === 'ignore') return // gate() already drops these; belt-and-suspenders
+  if (route === 'async') {
+    // IDEA_INBOX_DIR is guaranteed non-null here (classifyRoute returns 'work'
+    // when async is disabled), but assert for the type-checker + safety.
+    const dir = IDEA_INBOX_DIR!
+    const repliedToId = ctx.message?.reply_to_message?.message_id
+    try {
+      persistIdea(dir, {
+        chat_id,
+        message_id: msgId ?? 0,
+        from_user_id: String(from.id),
+        thread_id: threadId,
+        date: ctx.message?.date,
+        kind: attachment?.kind ?? 'text',
+        text: text || undefined,
+        attachment_file_id: attachment?.file_id,
+        reply_to_message_id: repliedToId != null ? String(repliedToId) : undefined,
+      })
+      // Durable write succeeded => quiet ack via a reaction (NOT a new message,
+      // so no push ping). ✍ tells Артём "captured, not woken".
+      if (msgId != null) {
+        void bot.api
+          .setMessageReaction(chat_id, msgId, [
+            { type: 'emoji', emoji: '✍' as ReactionTypeEmoji['emoji'] },
+          ])
+          .catch(() => {})
+      }
+    } catch (err) {
+      // R-LOSS: a persist failure must be LOUD — never a false ✍ success.
+      process.stderr.write(`telegram channel: idea-inbox persist FAILED: ${err}\n`)
+      await bot.api
+        .sendMessage(chat_id, '⚠️ идея НЕ сохранена (ошибка записи) — пришли ещё раз', {
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+        })
+        .catch(() => {})
+    }
+    return // KEY: no mcp.notification below => the session is NOT woken.
+  }
+  // route === 'work': fall through to the existing wake-the-session path.
+
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
 
@@ -1151,6 +1232,10 @@ async function handleInbound(
         user: from.username ?? String(from.id),
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+        // Forum topic of the inbound message (R-OUT): surface it so Claude can
+        // pass message_thread_id back to the reply tool and land the answer in
+        // the same topic. Absent for General / DM.
+        ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
         ...replyMeta,
         ...(imagePath ? { image_path: imagePath } : {}),
         ...(attachment ? {
