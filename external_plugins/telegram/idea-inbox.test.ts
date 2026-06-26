@@ -13,6 +13,7 @@ import { join } from 'path'
 import {
   classifyRoute,
   dispatchIdeaRoute,
+  findIdea,
   ideaExists,
   ideaId,
   ideaInboxDir,
@@ -22,6 +23,7 @@ import {
   PersistInput,
   selectReadyForPour,
   setIdeaStatus,
+  shouldSuppressReaction,
 } from './idea-inbox'
 
 const ARTEM = '378650081'
@@ -373,5 +375,85 @@ describe('dispatchIdeaRoute — no-interrupt guarantee (AC3) [REAL seam]', () =>
     const outcome = dispatchIdeaRoute('ignore', 800, h.baseInput, h.fx)
     expect(outcome).toBe('ignored')
     expect(h.calls).toEqual({ persist: 0, react: 0, warnUser: 0, logError: 0, notify: 0 })
+  })
+})
+
+// ── Reaction parity (CRUX) — a reaction on an async-thread message must NOT
+// wake the session, exactly like the message itself doesn't. Telegram's
+// MessageReactionUpdated carries NO message_thread_id, so shouldSuppressReaction
+// maps the reacted message_id back to its thread via the durable store. The
+// server's message_reaction handler is a thin guard: `if
+// (shouldSuppressReaction(...)) return` before mcp.notification, so this
+// predicate IS the production decision (mirrors classifyRoute for messages).
+describe('shouldSuppressReaction — reaction thread parity', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'idea-reaction-'))
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  // A reaction on a message captured into the Ideas (async) thread => SUPPRESS
+  // (do not notify). The message_id is mapped to its thread via the store.
+  test('async-thread message reaction => suppress (true)', () => {
+    persistIdea(dir, {
+      chat_id: SUPERGROUP,
+      message_id: 100,
+      from_user_id: ARTEM,
+      thread_id: IDEAS_THREAD,
+      kind: 'text',
+      text: 'an idea',
+    })
+    expect(shouldSuppressReaction(access, dir, SUPERGROUP, 100)).toBe(true)
+  })
+
+  // A reaction on a WORK message => DEFAULT-SAFE let through (false). Work
+  // messages are never persisted, so the id is unknown to the store.
+  test('work message reaction (not in store) => let through (false)', () => {
+    expect(shouldSuppressReaction(access, dir, SUPERGROUP, 7777)).toBe(false)
+  })
+
+  // Unknown message_id (e.g. a reaction on one of Семён's own messages, or one
+  // captured before the store existed) => DEFAULT-SAFE: never drop it.
+  test('unknown message_id => let through (false)', () => {
+    expect(shouldSuppressReaction(access, dir, SUPERGROUP, 999999)).toBe(false)
+  })
+
+  // async disabled (no dir) => never suppress (channel keeps full behaviour).
+  test('dir undefined (async disabled) => false', () => {
+    expect(shouldSuppressReaction(access, undefined, SUPERGROUP, 100)).toBe(false)
+  })
+
+  // A DM / unconfigured chat is never an async source => never suppress.
+  test('DM chat => false', () => {
+    persistIdea(dir, { chat_id: ARTEM, message_id: 1, from_user_id: ARTEM, kind: 'text', text: 'x' })
+    expect(shouldSuppressReaction(access, dir, ARTEM, 1)).toBe(false)
+  })
+
+  // A group with no async threads => nothing is async => never suppress.
+  test('group with empty asyncThreads => false', () => {
+    const a = { allowFrom: [ARTEM], groups: { [SUPERGROUP]: {} } }
+    persistIdea(dir, {
+      chat_id: SUPERGROUP, message_id: 100, from_user_id: ARTEM, thread_id: IDEAS_THREAD, kind: 'text', text: 'x',
+    })
+    expect(shouldSuppressReaction(a, dir, SUPERGROUP, 100)).toBe(false)
+  })
+
+  // Config drift: the message was captured in a thread that is NO LONGER in
+  // asyncThreads => let the reaction through (we only suppress for CURRENT
+  // async threads, re-checked against config).
+  test('stored thread no longer in asyncThreads => false', () => {
+    persistIdea(dir, {
+      chat_id: SUPERGROUP, message_id: 100, from_user_id: ARTEM, thread_id: WORK_THREAD, kind: 'text', text: 'x',
+    })
+    expect(shouldSuppressReaction(access, dir, SUPERGROUP, 100)).toBe(false)
+  })
+
+  // findIdea (the shared reader) returns the record or undefined.
+  test('findIdea returns the stored record / undefined', () => {
+    persistIdea(dir, { chat_id: SUPERGROUP, message_id: 55, from_user_id: ARTEM, kind: 'text', text: 'y' })
+    const path = join(dir, 'inbox.jsonl')
+    expect(findIdea(path, ideaId(SUPERGROUP, 55))!.text).toBe('y')
+    expect(findIdea(path, ideaId(SUPERGROUP, 56))).toBeUndefined()
+    expect(findIdea(join(dir, 'nope.jsonl'), 'x')).toBeUndefined()
   })
 })

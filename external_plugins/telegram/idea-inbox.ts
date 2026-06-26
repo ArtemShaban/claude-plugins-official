@@ -54,6 +54,47 @@ export function classifyRoute(
   return 'work'
 }
 
+/**
+ * Reaction-side analog of classifyRoute (CRUX, reaction parity).
+ *
+ * Telegram's MessageReactionUpdated carries NO message_thread_id — unlike a
+ * message, a reaction update doesn't tell us which forum topic it happened in.
+ * So a reaction on an Ideas-thread (async) message would still wake the session,
+ * even though the message itself was captured silently. We close that gap by
+ * mapping the reacted message_id back to its thread via the DURABLE idea store
+ * (chosen over an in-memory Map: the store survives a plugin restart, so a
+ * reaction on an idea captured before the restart is still correctly silenced —
+ * an in-memory map would lose that and re-open the bug after every restart; it
+ * also reuses findIdea/ideaId with no new state to keep in sync).
+ *
+ * Returns true (SUPPRESS — do not notify) ONLY when ALL hold:
+ *   - async is enabled (dir set) AND the chat is a configured group,
+ *   - the group has async threads,
+ *   - the reacted message is in the store AND its recorded thread_id is one of
+ *     that group's CURRENT async threads (re-checked, so removing a thread from
+ *     asyncThreads re-enables its reactions).
+ *
+ * Everything else => false = DEFAULT-SAFE: let the reaction through. In
+ * particular an UNKNOWN message_id (a reaction on one of Семён's own messages, a
+ * work message, or anything captured before the store existed) is never
+ * suppressed — we must never silently drop a reaction on a non-Ideas message.
+ */
+export function shouldSuppressReaction(
+  access: RouteAccess,
+  dir: string | undefined,
+  chat_id: string,
+  message_id: number,
+): boolean {
+  if (!dir) return false // async disabled => never suppress
+  const group = access.groups[chat_id]
+  if (!group) return false // DM / unconfigured chat => never an async source
+  const asyncThreads = group.asyncThreads ?? []
+  if (asyncThreads.length === 0) return false
+  const rec = findIdea(join(dir, 'inbox.jsonl'), ideaId(chat_id, message_id))
+  if (!rec) return false // unknown message => DEFAULT-SAFE, let it through
+  return rec.thread_id != null && asyncThreads.includes(rec.thread_id)
+}
+
 // ── durable store ──────────────────────────────────────────────────────────
 
 /**
@@ -99,23 +140,33 @@ export function ideaId(chat_id: string, message_id: number): string {
   return `telegram:${chat_id}:${message_id}`
 }
 
-/** True if `id` already exists in the JSONL file (idempotency check). */
-export function ideaExists(jsonlPath: string, id: string): boolean {
+/**
+ * Find a stored idea record by id. The single JSONL reader, reused by
+ * ideaExists, the persist idempotency check, and reaction thread-lookup (DRY).
+ * Returns the record, or undefined (no file / not found / unparseable line).
+ */
+export function findIdea(jsonlPath: string, id: string): IdeaRecord | undefined {
   let raw: string
   try {
     raw = readFileSync(jsonlPath, 'utf8')
   } catch {
-    return false // no file yet => nothing recorded
+    return undefined // no file yet => nothing recorded
   }
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue
     try {
-      if ((JSON.parse(line) as IdeaRecord).id === id) return true
+      const r = JSON.parse(line) as IdeaRecord
+      if (r.id === id) return r
     } catch {
       // tolerate a partially-written trailing line
     }
   }
-  return false
+  return undefined
+}
+
+/** True if `id` already exists in the JSONL file (idempotency check). */
+export function ideaExists(jsonlPath: string, id: string): boolean {
+  return findIdea(jsonlPath, id) !== undefined
 }
 
 /**
@@ -132,16 +183,8 @@ export function persistIdea(dir: string, input: PersistInput): IdeaRecord {
   const id = ideaId(input.chat_id, input.message_id)
 
   // Idempotency: if this id already exists, return it without re-appending.
-  if (ideaExists(jsonlPath, id)) {
-    const raw = readFileSync(jsonlPath, 'utf8')
-    for (const line of raw.split('\n')) {
-      if (!line.trim()) continue
-      try {
-        const r = JSON.parse(line) as IdeaRecord
-        if (r.id === id) return r
-      } catch {}
-    }
-  }
+  const existing = findIdea(jsonlPath, id)
+  if (existing) return existing
 
   const nowIso = new Date().toISOString()
   const status = input.kind === 'voice' ? 'new' : 'ready'

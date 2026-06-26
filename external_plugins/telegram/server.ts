@@ -22,7 +22,13 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
-import { classifyRoute, persistIdea, ideaInboxDir, dispatchIdeaRoute } from './idea-inbox'
+import {
+  classifyRoute,
+  persistIdea,
+  ideaInboxDir,
+  dispatchIdeaRoute,
+  shouldSuppressReaction,
+} from './idea-inbox'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -374,7 +380,7 @@ function dmCommandGate(ctx: Context): { access: Access; senderId: string } | nul
 // absent — we can't authenticate the actor against the user allowlist, so we
 // drop them. Only an explicitly allowlisted user (DM) or an allowlisted member
 // of a configured group is surfaced to Claude.
-function reactionGate(ctx: Context): { senderId: string } | null {
+function reactionGate(ctx: Context): { senderId: string; access: Access } | null {
   const access = loadAccess()
   if (access.dmPolicy === 'disabled') return null
 
@@ -384,7 +390,7 @@ function reactionGate(ctx: Context): { senderId: string } | null {
   const chatType = ctx.chat?.type
 
   if (chatType === 'private') {
-    return access.allowFrom.includes(senderId) ? { senderId } : null
+    return access.allowFrom.includes(senderId) ? { senderId, access } : null
   }
 
   if (chatType === 'group' || chatType === 'supergroup') {
@@ -392,7 +398,7 @@ function reactionGate(ctx: Context): { senderId: string } | null {
     if (!policy) return null
     const groupAllowFrom = policy.allowFrom ?? []
     if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return null
-    return { senderId }
+    return { senderId, access }
   }
 
   return null
@@ -1017,12 +1023,24 @@ bot.on('message:sticker', async ctx => {
 // allowlisted members of configured groups are forwarded; reactionGate has no
 // pairing side effects, so a reaction can never mint a code or send a reply.
 bot.on('message_reaction', async ctx => {
-  if (!reactionGate(ctx)) return
+  const gated = reactionGate(ctx)
+  if (!gated) return
 
   const r = ctx.messageReaction! // present on this update type
   const from = ctx.from! // reactionGate dropped anonymous (no from)
   const chat_id = String(r.chat.id)
   const message_id = String(r.message_id)
+
+  // idea-inbox reaction parity (CRUX): a MessageReactionUpdated carries NO
+  // message_thread_id, so a reaction on an async (Ideas) topic message would
+  // wake the session even though the message itself was captured silently. Map
+  // the reacted message_id back to its thread via the durable store and suppress
+  // the notification for async threads. DEFAULT-SAFE: an unknown message_id (not
+  // in the store — work messages, Семён's own messages) is never suppressed.
+  // See shouldSuppressReaction + the idea-inbox spec.
+  if (shouldSuppressReaction(gated.access, IDEA_INBOX_DIR, chat_id, r.message_id)) {
+    return
+  }
 
   // grammY diffs old_reaction → new_reaction for us. emojiAdded/Removed are
   // standard whitelist emoji; custom emoji are surfaced by count only (their
