@@ -772,7 +772,15 @@ let shuttingDown = false
 function shutdown(reason = 'shutdown: unknown'): void {
   if (shuttingDown) return
   shuttingDown = true
-  process.stderr.write('telegram channel: shutting down\n')
+  // safeStderr (not raw write): shutdown is most often triggered by the parent
+  // (Claude Code) closing our stdio pipe — stdin EOF. At that point the stderr
+  // pipe is gone too, so a raw write throws EPIPE → the uncaughtException
+  // handler fires and exits with code 1 (visible in shutdown.log as a
+  // 'stdin: end' line immediately followed by an 'uncaughtException [EPIPE …]'
+  // line). The write is purely diagnostic; swallow a broken-pipe failure so the
+  // shutdown stays clean (exit 0). Does NOT touch the EPIPE-flood guard in the
+  // uncaughtException handler (that still protects the polling/runtime path).
+  safeStderr('telegram channel: shutting down\n')
   logShutdown(reason)
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
