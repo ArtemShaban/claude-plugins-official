@@ -22,7 +22,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
-import { classifyRoute, persistIdea, ideaInboxDir } from './idea-inbox'
+import { classifyRoute, persistIdea, ideaInboxDir, dispatchIdeaRoute } from './idea-inbox'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1148,45 +1148,60 @@ async function handleInbound(
   // through to the existing behaviour below. classifyRoute is unit-tested.
   const threadId = ctx.message?.message_thread_id
   const route = classifyRoute(access, chat_id, threadId, IDEA_INBOX_DIR != null)
-  if (route === 'ignore') return // gate() already drops these; belt-and-suspenders
-  if (route === 'async') {
-    // IDEA_INBOX_DIR is guaranteed non-null here (classifyRoute returns 'work'
-    // when async is disabled), but assert for the type-checker + safety.
-    const dir = IDEA_INBOX_DIR!
-    const repliedToId = ctx.message?.reply_to_message?.message_id
-    try {
-      persistIdea(dir, {
-        chat_id,
-        message_id: msgId ?? 0,
-        from_user_id: String(from.id),
-        thread_id: threadId,
-        date: ctx.message?.date,
-        kind: attachment?.kind ?? 'text',
-        text: text || undefined,
-        attachment_file_id: attachment?.file_id,
-        reply_to_message_id: repliedToId != null ? String(repliedToId) : undefined,
-      })
-      // Durable write succeeded => quiet ack via a reaction (NOT a new message,
-      // so no push ping). ✍ tells Артём "captured, not woken".
-      if (msgId != null) {
+  // IDEA_INBOX_DIR is guaranteed non-null when route !== 'work' (classifyRoute
+  // returns 'work' when async is disabled), but assert for the type-checker.
+  const dir = IDEA_INBOX_DIR
+  const repliedToId = ctx.message?.reply_to_message?.message_id
+
+  // Decision seam (idea-inbox.ts): owns notify-vs-persist + the side-effect
+  // ORDER. The same dispatchIdeaRoute runs in the unit test, so moving the
+  // async return below notify (or notifying before persist) goes red there.
+  // fx.notify is the REAL wake-signal: it flips workRoute, the sole gate on the
+  // mcp.notification block below. The seam alone decides if/when it fires, so
+  // the spy-based unit test exercises the production wake decision (no replica).
+  let workRoute = false
+  dispatchIdeaRoute(
+    route,
+    msgId,
+    {
+      chat_id,
+      from_user_id: String(from.id),
+      thread_id: threadId,
+      date: ctx.message?.date,
+      kind: attachment?.kind ?? 'text',
+      text: text || undefined,
+      attachment_file_id: attachment?.file_id,
+      reply_to_message_id: repliedToId != null ? String(repliedToId) : undefined,
+    },
+    {
+      persist: input => persistIdea(dir!, input),
+      // Quiet ✍ ack via a reaction (NOT a new message, so no push ping).
+      // dispatchIdeaRoute only calls react() when msgId is proven non-null.
+      react: () => {
+        if (msgId != null) {
+          void bot.api
+            .setMessageReaction(chat_id, msgId, [
+              { type: 'emoji', emoji: '✍' as ReactionTypeEmoji['emoji'] },
+            ])
+            .catch(() => {})
+        }
+      },
+      warnUser: () => {
         void bot.api
-          .setMessageReaction(chat_id, msgId, [
-            { type: 'emoji', emoji: '✍' as ReactionTypeEmoji['emoji'] },
-          ])
+          .sendMessage(chat_id, '⚠️ идея НЕ сохранена (ошибка записи) — пришли ещё раз', {
+            ...(threadId != null ? { message_thread_id: threadId } : {}),
+          })
           .catch(() => {})
-      }
-    } catch (err) {
-      // R-LOSS: a persist failure must be LOUD — never a false ✍ success.
-      process.stderr.write(`telegram channel: idea-inbox persist FAILED: ${err}\n`)
-      await bot.api
-        .sendMessage(chat_id, '⚠️ идея НЕ сохранена (ошибка записи) — пришли ещё раз', {
-          ...(threadId != null ? { message_thread_id: threadId } : {}),
-        })
-        .catch(() => {})
-    }
-    return // KEY: no mcp.notification below => the session is NOT woken.
-  }
-  // route === 'work': fall through to the existing wake-the-session path.
+      },
+      logError: reason => process.stderr.write(`telegram channel: ${reason}\n`),
+      // 'work' route only: wake the main Claude session. The mcp.notification
+      // payload below needs the awaited imagePath, so the seam flips this flag
+      // (the wake-intent) and the block below fires only when it is set. The
+      // seam guarantees this never flips for an async capture / persist-failure.
+      notify: () => { workRoute = true },
+    },
+  )
+  if (!workRoute) return // async / persist-failed / ignored => session NOT woken
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})

@@ -189,6 +189,93 @@ export function selectReadyForPour(records: IdeaRecord[]): IdeaRecord[] {
     })
 }
 
+// ── routing seam (the no-interrupt guarantee, tested against PRODUCTION code) ──
+//
+// dispatchIdeaRoute owns the notify-vs-persist DECISION + the order of side
+// effects for an already-gated inbound update. server.ts's handleInbound calls
+// it with effect callbacks bound to the grammY runtime; the unit test calls the
+// SAME function with mocked effects. Because the production path runs through
+// here (no replica), moving the async-branch return below the notification, or
+// adding a notify before persist, changes THIS function and a test goes red.
+//
+// Invariants enforced here (the whole point of the seam):
+//  - route 'ignore'            -> nothing (gate already dropped it).
+//  - route 'async' + msgId set + persist OK
+//                              -> persist, react(✍), DO NOT notify.
+//  - route 'async' + msgId is null/undefined (would coerce to id ...:0 and let a
+//    second such message be silently dropped by idempotency)
+//                              -> the SAME loud failure path: warnUser + stderr,
+//                                 NO ✍, DO NOT notify. (FIX C2)
+//  - route 'async' + persist throws
+//                              -> warnUser + stderr, NO ✍, DO NOT notify. (R-LOSS)
+//  - route 'work' (DM / General / any non-async topic)
+//                              -> notify (wake the session) — the SAFE DEFAULT.
+
+/** What dispatchIdeaRoute did — returned so callers/tests can assert the path. */
+export type IdeaRouteOutcome = 'ignored' | 'persisted' | 'persist-failed' | 'work'
+
+/**
+ * Side effects dispatchIdeaRoute may invoke. server.ts binds these to grammY;
+ * tests pass spies. persist throwing is the persist-failure signal.
+ */
+export type IdeaRouteEffects = {
+  /** Append the idea to the durable store (throws on a real write failure). */
+  persist: (input: PersistInput) => void
+  /** Quiet ✍ ack on the captured message (no push ping). Async-success only. */
+  react: () => void
+  /** Loud, user-visible "not saved" warning (persist-failure / missing id). */
+  warnUser: () => void
+  /** Log a one-line reason to stderr on the failure path. */
+  logError: (reason: string) => void
+  /** Wake the main Claude session (mcp.notification). 'work' route only. */
+  notify: () => void
+}
+
+/**
+ * Drive the idea-inbox routing decision for one gated inbound update.
+ *
+ * @param route   classifyRoute(...) result.
+ * @param msgId   ctx.message?.message_id — null/undefined is a HARD failure for
+ *                the async route (see FIX C2): persisting with a coerced 0 would
+ *                mis-id the record and let idempotency silently drop a second
+ *                id-less message. We refuse to persist and take the loud path.
+ * @param input   the PersistInput sans message_id (filled in here once msgId is
+ *                proven non-null, so a 0 can never be persisted).
+ */
+export function dispatchIdeaRoute(
+  route: Route,
+  msgId: number | null | undefined,
+  input: Omit<PersistInput, 'message_id'>,
+  fx: IdeaRouteEffects,
+): IdeaRouteOutcome {
+  if (route === 'ignore') return 'ignored'
+
+  if (route === 'async') {
+    // FIX C2: a missing message_id must NEVER be coerced to 0 (silent mis-id +
+    // idempotency drop). Fail loud on the SAME path as a persist failure.
+    if (msgId == null) {
+      fx.logError('idea-inbox: missing message_id — refusing to persist (would mis-id as :0)')
+      fx.warnUser()
+      return 'persist-failed' // no react, no notify
+    }
+    try {
+      fx.persist({ ...input, message_id: msgId })
+    } catch (err) {
+      // R-LOSS: a persist failure must be LOUD — never a false ✍ success.
+      fx.logError(`idea-inbox persist FAILED: ${err}`)
+      fx.warnUser()
+      return 'persist-failed' // no react, no notify
+    }
+    // Durable write succeeded => quiet ✍ ack only. CRITICAL: do NOT notify.
+    fx.react()
+    return 'persisted'
+  }
+
+  // route === 'work': the safe default — wake the session.
+  fx.notify()
+  return 'work'
+}
+
 /** Atomically rewrite a single record's status (used by Фаза-2 triage). */
 export function setIdeaStatus(jsonlPath: string, id: string, status: string): boolean {
   let raw: string

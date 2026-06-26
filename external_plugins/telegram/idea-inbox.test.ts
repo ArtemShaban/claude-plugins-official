@@ -12,11 +12,14 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   classifyRoute,
+  dispatchIdeaRoute,
   ideaExists,
   ideaId,
   ideaInboxDir,
   IdeaRecord,
+  IdeaRouteEffects,
   persistIdea,
+  PersistInput,
   selectReadyForPour,
   setIdeaStatus,
 } from './idea-inbox'
@@ -204,54 +207,171 @@ describe('selectReadyForPour (snapshot-cutoff, AC12)', () => {
   })
 })
 
-// ── No-interrupt proof (AC3) ────────────────────────────────────────────────
-// handleInbound itself imports the grammY runtime, so we test the decision the
-// async branch makes against a notification *mock*: route 'async' persists and
-// MUST NOT notify; route 'work' notifies. This mirrors the exact code in
-// server.ts's handleInbound (classifyRoute => async => persist+return BEFORE
-// mcp.notification).
-describe('async branch does not wake the session (AC3)', () => {
+// ── No-interrupt proof (AC3) — drives the REAL production seam ───────────────
+// dispatchIdeaRoute is the EXACT function server.ts's handleInbound calls to
+// make the notify-vs-persist decision (no replica): we feed it classifyRoute's
+// result + spy effects and assert the production decision. Acceptance bar: if a
+// developer moves the async-branch return below notify, or notifies before
+// persist, THESE tests go red because the spies observe the real ordering.
+describe('dispatchIdeaRoute — no-interrupt guarantee (AC3) [REAL seam]', () => {
   let dir: string
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'idea-inbox-noint-'))
   })
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
-  // Replica of the server.ts handleInbound routing block (kept in lock-step).
-  function route(threadId: number | undefined, notify: () => void): 'persisted' | 'notified' {
-    const r = classifyRoute(access, SUPERGROUP, threadId, true)
-    if (r === 'async') {
-      persistIdea(dir, {
-        chat_id: SUPERGROUP,
-        message_id: 200 + (threadId ?? 0),
-        from_user_id: ARTEM,
-        thread_id: threadId,
-        kind: 'text',
-        text: 'idea',
-      })
-      return 'persisted'
+  // A spy harness whose persist actually writes (so we can assert durability),
+  // recording the call order so a reordered notify/persist is observable.
+  function harness(opts: { persistThrows?: boolean; msgId?: number } = {}) {
+    const log: string[] = []
+    const calls = { persist: 0, react: 0, warnUser: 0, logError: 0, notify: 0 }
+    const baseInput: Omit<PersistInput, 'message_id'> = {
+      chat_id: SUPERGROUP,
+      from_user_id: ARTEM,
+      thread_id: IDEAS_THREAD,
+      kind: 'text',
+      text: 'idea',
     }
-    notify()
-    return 'notified'
+    const fx: IdeaRouteEffects = {
+      persist: (input: PersistInput) => {
+        calls.persist++
+        log.push('persist')
+        if (opts.persistThrows) throw new Error('disk full')
+        persistIdea(dir, input)
+      },
+      react: () => { calls.react++; log.push('react') },
+      warnUser: () => { calls.warnUser++; log.push('warnUser') },
+      logError: () => { calls.logError++; log.push('logError') },
+      notify: () => { calls.notify++; log.push('notify') },
+    }
+    return { fx, calls, log, baseInput }
   }
 
-  test('Ideas topic => persisted, notify NOT called', () => {
-    let calls = 0
-    const res = route(IDEAS_THREAD, () => calls++)
-    expect(res).toBe('persisted')
-    expect(calls).toBe(0)
+  // AC3: async route persists, ✍-reacts, and MUST NOT notify (no wake).
+  test('Ideas topic (async) => persisted + react, notify NOT called', () => {
+    const h = harness()
+    const route = classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true)
+    const outcome = dispatchIdeaRoute(route, 500, h.baseInput, h.fx)
+    expect(outcome).toBe('persisted')
+    expect(h.calls.notify).toBe(0) // the no-interrupt guarantee
+    expect(h.calls.persist).toBe(1)
+    expect(h.calls.react).toBe(1)
+    expect(h.calls.warnUser).toBe(0)
+    // durable: the idea actually hit the JSONL store.
+    expect(ideaExists(join(dir, 'inbox.jsonl'), ideaId(SUPERGROUP, 500))).toBe(true)
   })
 
-  test('work topic => notify called', () => {
-    let calls = 0
-    const res = route(WORK_THREAD, () => calls++)
-    expect(res).toBe('notified')
-    expect(calls).toBe(1)
+  // Order proof: persist happens BEFORE react, and notify never appears. If
+  // someone adds fx.notify() above the persist/return, 'notify' enters the log.
+  test('async side-effect ORDER is persist→react with no notify', () => {
+    const h = harness()
+    const route = classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true)
+    dispatchIdeaRoute(route, 501, h.baseInput, h.fx)
+    expect(h.log).toEqual(['persist', 'react'])
+  })
+
+  // Default work path (named non-async topic) MUST wake the session.
+  test('work topic => notify called, nothing persisted', () => {
+    const h = harness()
+    const route = classifyRoute(access, SUPERGROUP, WORK_THREAD, true)
+    const outcome = dispatchIdeaRoute(route, 502, { ...h.baseInput, thread_id: WORK_THREAD }, h.fx)
+    expect(outcome).toBe('work')
+    expect(h.calls.notify).toBe(1)
+    expect(h.calls.persist).toBe(0)
+    expect(h.calls.react).toBe(0)
+  })
+
+  // Default work path: General topic (threadId undefined) MUST wake.
+  test('General (threadId undefined) => notify called', () => {
+    const h = harness()
+    const route = classifyRoute(access, SUPERGROUP, undefined, true)
+    const outcome = dispatchIdeaRoute(route, 503, { ...h.baseInput, thread_id: undefined }, h.fx)
+    expect(outcome).toBe('work')
+    expect(h.calls.notify).toBe(1)
+  })
+
+  // Default work path: a DM MUST wake (never async).
+  test('DM (chat in allowFrom) => notify called', () => {
+    const h = harness()
+    const route = classifyRoute(access, ARTEM, undefined, true)
+    const outcome = dispatchIdeaRoute(route, 504, { ...h.baseInput, chat_id: ARTEM, thread_id: undefined }, h.fx)
+    expect(outcome).toBe('work')
+    expect(h.calls.notify).toBe(1)
   })
 
   test('a burst of ideas wakes the session zero times', () => {
-    let calls = 0
-    for (let i = 0; i < 5; i++) route(IDEAS_THREAD, () => calls++)
-    expect(calls).toBe(0)
+    const h = harness()
+    const route = classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true)
+    for (let i = 0; i < 5; i++) dispatchIdeaRoute(route, 600 + i, h.baseInput, h.fx)
+    expect(h.calls.notify).toBe(0)
+    expect(h.calls.persist).toBe(5)
+  })
+
+  // FIX C2: a missing message_id must NEVER be coerced to a 0-id. The async
+  // route takes the loud failure path (warnUser + logError), NO react, NO
+  // notify, and does NOT persist (which would mis-id as telegram:<chat>:0 and
+  // let a second id-less message be silently dropped by idempotency).
+  describe('FIX C2 — missing message_id fails loud, never mis-ids', () => {
+    test('async route with msgId=undefined => warn, no persist, no react, no notify', () => {
+      const h = harness()
+      const route = classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true)
+      const outcome = dispatchIdeaRoute(route, undefined, h.baseInput, h.fx)
+      expect(outcome).toBe('persist-failed')
+      expect(h.calls.persist).toBe(0) // never coerce a 0-id into the store
+      expect(h.calls.react).toBe(0)   // no false ✍ success
+      expect(h.calls.notify).toBe(0)  // still not woken
+      expect(h.calls.warnUser).toBe(1)
+      expect(h.calls.logError).toBe(1)
+    })
+
+    test('async route with msgId=null => same loud failure path', () => {
+      const h = harness()
+      const route = classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true)
+      const outcome = dispatchIdeaRoute(route, null, h.baseInput, h.fx)
+      expect(outcome).toBe('persist-failed')
+      expect(h.calls.persist).toBe(0)
+      expect(h.calls.react).toBe(0)
+      expect(h.calls.notify).toBe(0)
+      expect(h.calls.warnUser).toBe(1)
+    })
+
+    test('store stays empty after a missing-id async message', () => {
+      const h = harness()
+      const route = classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true)
+      dispatchIdeaRoute(route, undefined, h.baseInput, h.fx)
+      // no inbox.jsonl written => nothing persisted under a coerced :0 id.
+      expect(ideaExists(join(dir, 'inbox.jsonl'), ideaId(SUPERGROUP, 0))).toBe(false)
+    })
+  })
+
+  // FIX C3: server-side persist-failure branch. persist throws => warnUser +
+  // logError, NO react (no false ✍), NO notify (session not woken).
+  describe('FIX C3 — persist failure is loud, no false ack, no wake', () => {
+    test('persist throws => warn + logError, no react, no notify', () => {
+      const h = harness({ persistThrows: true })
+      const route = classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true)
+      const outcome = dispatchIdeaRoute(route, 700, h.baseInput, h.fx)
+      expect(outcome).toBe('persist-failed')
+      expect(h.calls.persist).toBe(1) // attempted
+      expect(h.calls.react).toBe(0)   // NO false ✍
+      expect(h.calls.notify).toBe(0)  // NOT woken
+      expect(h.calls.warnUser).toBe(1)
+      expect(h.calls.logError).toBe(1)
+    })
+
+    test('persist-failure order is persist→logError→warnUser, no notify/react', () => {
+      const h = harness({ persistThrows: true })
+      const route = classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true)
+      dispatchIdeaRoute(route, 701, h.baseInput, h.fx)
+      expect(h.log).toEqual(['persist', 'logError', 'warnUser'])
+    })
+  })
+
+  // Belt-and-suspenders: an 'ignore' route does nothing at all.
+  test("'ignore' route => no effects", () => {
+    const h = harness()
+    const outcome = dispatchIdeaRoute('ignore', 800, h.baseInput, h.fx)
+    expect(outcome).toBe('ignored')
+    expect(h.calls).toEqual({ persist: 0, react: 0, warnUser: 0, logError: 0, notify: 0 })
   })
 })
