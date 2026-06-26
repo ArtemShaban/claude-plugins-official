@@ -28,7 +28,12 @@ import {
   ideaInboxDir,
   dispatchIdeaRoute,
   shouldSuppressReaction,
+  transcribeCmd,
+  transcribeVoiceIdea,
+  recordTranscript,
+  ideaId,
 } from './idea-inbox'
+import { spawn } from 'child_process'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -55,6 +60,16 @@ const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 // the store lives in Семён's repo (e.g. <repo>/tasks/idea-inbox) without baking
 // an absolute path into the plugin. See idea-inbox.ts / the idea-inbox spec.
 const IDEA_INBOX_DIR = ideaInboxDir(process.env)
+
+// Voice ideas captured into an async (Ideas) topic are transcribed on capture
+// via this command (whisper wrapper, wired by the orchestrator in start-semen.sh
+// — NOT hardcoded). Unset => transcription is disabled and the voice idea stays
+// status:'new' with its file_id (deferred to triage). See transcribeVoiceIdea.
+const TRANSCRIBE_CMD = transcribeCmd(process.env)
+
+// Telegram caps bot file downloads at 20MB; getFile already rejects larger, but
+// we also short-circuit on a known size hint to avoid a doomed API round-trip.
+const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
 if (!TOKEN) {
   process.stderr.write(
@@ -1120,6 +1135,60 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// Download a Telegram voice file by file_id into the idea-inbox attachments/
+// dir. Reuses the getFile + fetch pattern (cf. download_attachment / photo
+// download). Returns the local path, or undefined when no file is available
+// (expired / over the 20MB cap). Throws on a network/HTTP error (the caller's
+// orchestrator catches it and keeps the idea status:'new').
+async function downloadVoiceToInbox(
+  file_id: string,
+  dir: string,
+  sizeHint?: number,
+): Promise<string | undefined> {
+  if (sizeHint != null && sizeHint > MAX_DOWNLOAD_BYTES) {
+    safeStderr(`telegram channel: voice ${file_id} is ${sizeHint}B > 20MB cap — skipping download\n`)
+    return undefined
+  }
+  const file = await bot.api.getFile(file_id)
+  if (!file.file_path) return undefined
+  if (file.file_size != null && file.file_size > MAX_DOWNLOAD_BYTES) return undefined
+  const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`voice download failed: HTTP ${res.status}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  // file_path is Telegram-controlled (trusted) but strip to safe chars anyway.
+  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'oga'
+  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'oga'
+  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'voice'
+  const attachDir = join(dir, 'attachments')
+  mkdirSync(attachDir, { recursive: true })
+  const path = join(attachDir, `${Date.now()}-${uniqueId}.${ext}`)
+  writeFileSync(path, buf)
+  return path
+}
+
+// Run the configured transcribe command. Contract: CMD receives the audio path
+// as $1 and the language as $2 and prints the transcript to stdout. We invoke
+// `sh -c '<CMD> "$1" "$2"' sh <audio> <lang>` so CMD may be a bare executable
+// (args appended) OR a pipeline referencing $1/$2. Rejects on spawn error or a
+// non-zero exit (the orchestrator catches => idea stays status:'new').
+function runTranscribeCmd(cmd: string, audioPath: string, lang: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('sh', ['-c', `${cmd} "$1" "$2"`, 'sh', audioPath, lang], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let out = ''
+    let err = ''
+    child.stdout.on('data', (d: Buffer) => { out += d.toString() })
+    child.stderr.on('data', (d: Buffer) => { err += d.toString() })
+    child.on('error', reject)
+    child.on('close', code => {
+      if (code === 0) resolve(out)
+      else reject(new Error(`transcribe cmd exited ${code}: ${err.slice(0, 500)}`))
+    })
+  })
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -1186,7 +1255,7 @@ async function handleInbound(
   // mcp.notification block below. The seam alone decides if/when it fires, so
   // the spy-based unit test exercises the production wake decision (no replica).
   let workRoute = false
-  dispatchIdeaRoute(
+  const ideaOutcome = dispatchIdeaRoute(
     route,
     msgId,
     {
@@ -1227,6 +1296,46 @@ async function handleInbound(
       notify: () => { workRoute = true },
     },
   )
+  // Voice ideas: transcribe on capture. FIRE-AND-FORGET — never awaited, so a
+  // slow/failed whisper can't block or break the inbound capture path (the ✍ ack
+  // already fired inside dispatchIdeaRoute). FAILURE-SAFE: transcribeVoiceIdea
+  // keeps the idea status:'new' (file_id retained) on any download/transcribe
+  // error; the outer .catch is a last-resort net so this never crashes the
+  // handler. Only runs for a successfully-persisted async voice capture.
+  if (
+    ideaOutcome === 'persisted' &&
+    attachment?.kind === 'voice' &&
+    attachment.file_id &&
+    dir != null &&
+    msgId != null
+  ) {
+    const fileId = attachment.file_id
+    const sizeHint = attachment.size
+    const voiceDir = dir
+    const recId = ideaId(chat_id, msgId)
+    const replyOpts = {
+      ...(threadId != null ? { message_thread_id: threadId } : {}),
+      reply_parameters: { message_id: msgId },
+    }
+    void transcribeVoiceIdea(TRANSCRIBE_CMD != null, {
+      download: () => downloadVoiceToInbox(fileId, voiceDir, sizeHint),
+      transcribe: audioPath => runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, 'ru'),
+      onSuccess: (transcript, audioPath) => recordTranscript(voiceDir, recId, transcript, audioPath),
+      replyTranscript: async transcript => {
+        await bot.api
+          .sendMessage(chat_id, `🎤 Транскрипт:\n${transcript}`, replyOpts)
+          .catch(() => {})
+      },
+      replyFailure: async () => {
+        await bot.api
+          .sendMessage(chat_id, '🎤 не смог транскрибировать — разберу при разборе', replyOpts)
+          .catch(() => {})
+      },
+      logError: reason => safeStderr(`telegram channel: voice transcribe: ${reason}\n`),
+      logNotice: reason => safeStderr(`telegram channel: voice transcribe: ${reason}\n`),
+    }).catch(err => safeStderr(`telegram channel: voice transcribe crashed: ${err}\n`))
+  }
+
   if (!workRoute) return // async / persist-failed / ignored => session NOT woken
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).

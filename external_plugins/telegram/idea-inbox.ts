@@ -107,6 +107,21 @@ export function ideaInboxDir(env: NodeJS.ProcessEnv = process.env): string | und
   return d && d.trim() ? d : undefined
 }
 
+/**
+ * Resolve the voice-transcription command from env. Returns undefined when
+ * SEMEN_TRANSCRIBE_CMD is unset/blank — the caller treats that as
+ * "transcription disabled" (fail-safe: the voice idea stays status:'new' with
+ * its file_id, transcription deferred to triage; the channel never errors).
+ * NOT an absolute path baked into the plugin — the orchestrator wires the actual
+ * command (a whisper wrapper) in start-semen.sh. Contract: the command receives
+ * the audio file path as $1 and the language ('ru') as $2 and prints the
+ * transcript to stdout.
+ */
+export function transcribeCmd(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const c = env.SEMEN_TRANSCRIBE_CMD
+  return c && c.trim() ? c : undefined
+}
+
 export type IdeaRecord = {
   id: string
   ts_captured: string
@@ -319,8 +334,14 @@ export function dispatchIdeaRoute(
   return 'work'
 }
 
-/** Atomically rewrite a single record's status (used by Фаза-2 triage). */
-export function setIdeaStatus(jsonlPath: string, id: string, status: string): boolean {
+/**
+ * Atomically merge a patch into a single record (matched by id), always bumping
+ * ts_status. The shared writer behind setIdeaStatus and recordTranscript (DRY:
+ * one read→rewrite→atomic-rename path). Returns false (no write) when the file
+ * is missing or the id isn't found. Unknown patch keys are merged as-is — the
+ * caller is responsible for passing valid IdeaRecord fields.
+ */
+export function patchIdea(jsonlPath: string, id: string, patch: Partial<IdeaRecord>): boolean {
   let raw: string
   try {
     raw = readFileSync(jsonlPath, 'utf8')
@@ -336,8 +357,7 @@ export function setIdeaStatus(jsonlPath: string, id: string, status: string): bo
         const r = JSON.parse(line) as IdeaRecord
         if (r.id === id) {
           found = true
-          r.status = status
-          r.ts_status = new Date().toISOString()
+          Object.assign(r, patch, { ts_status: new Date().toISOString() })
           return JSON.stringify(r)
         }
       } catch {}
@@ -349,4 +369,139 @@ export function setIdeaStatus(jsonlPath: string, id: string, status: string): bo
   writeFileSync(tmp, out)
   renameSync(tmp, jsonlPath)
   return true
+}
+
+/** Atomically rewrite a single record's status (used by Фаза-2 triage). */
+export function setIdeaStatus(jsonlPath: string, id: string, status: string): boolean {
+  return patchIdea(jsonlPath, id, { status })
+}
+
+/**
+ * Persist a successful transcription: write the transcript text to a file under
+ * transcripts/ (durable, greppable) AND patch the record in-place with the
+ * transcript, the saved audio path, and status:'ready' (pourable with text).
+ * Returns false if the record id isn't in the store (caller logs loud — the
+ * voice idea then stays status:'new' with its file_id, never lost).
+ */
+export function recordTranscript(
+  dir: string,
+  id: string,
+  transcript: string,
+  attachmentPath?: string,
+): boolean {
+  const jsonlPath = join(dir, 'inbox.jsonl')
+  const safeId = id.replace(/[^a-zA-Z0-9._-]/g, '_')
+  mkdirSync(join(dir, 'transcripts'), { recursive: true })
+  writeFileSync(join(dir, 'transcripts', `${safeId}.txt`), transcript)
+  return patchIdea(jsonlPath, id, {
+    transcript,
+    ...(attachmentPath ? { attachment_path: attachmentPath } : {}),
+    status: 'ready',
+  })
+}
+
+// ── voice transcription orchestrator (effect-injected, runtime-agnostic) ──────
+//
+// Same seam pattern as dispatchIdeaRoute: server.ts binds the effects to grammY
+// + the shell-out + the store; the unit test passes mocks/spies (NO real whisper,
+// NO real download). The PRODUCTION path runs through this function, so the
+// failure-safety invariants are tested against the real code.
+//
+// Invariants (the whole point of "never lose the original voice idea"):
+//  - cmd not configured        -> SKIP, log a notice, idea stays 'new'.
+//  - download fails / no file  -> stays 'new' (file_id retained), loud log,
+//                                 brief failure reply, NO status flip.
+//  - transcribe throws/empty   -> stays 'new', loud log, failure reply.
+//  - store flip (onSuccess) fails -> stays 'new', loud log, but we DID get a
+//                                 transcript so we still reply it to the user.
+//  - all good                  -> onSuccess flips to 'ready', reply the transcript.
+
+export type TranscribeOutcome = 'skipped' | 'ready' | 'failed'
+
+/** Effects transcribeVoiceIdea drives. server.ts binds grammY/shell/store; tests spy. */
+export type TranscribeEffects = {
+  /** Download the voice file to attachments/; resolves to the local path, or
+   *  undefined when no file is available (expired / over the 20MB cap). */
+  download: () => Promise<string | undefined>
+  /** Run the transcribe command on the audio path; resolves the transcript,
+   *  rejects on a spawn/non-zero-exit failure. */
+  transcribe: (audioPath: string) => Promise<string>
+  /** Persist transcript + flip status:'ready' (recordTranscript). false/throw =>
+   *  store failure (idea kept 'new'). */
+  onSuccess: (transcript: string, audioPath: string) => boolean | void
+  /** Reply the transcript to the user (🎤 Транскрипт:). Best-effort. */
+  replyTranscript: (transcript: string) => Promise<void> | void
+  /** Brief "couldn't transcribe" reply on a failure path. Best-effort. */
+  replyFailure: () => Promise<void> | void
+  /** Loud stderr on a failure path. */
+  logError: (reason: string) => void
+  /** Quiet notice (cmd unset / skipped). */
+  logNotice: (reason: string) => void
+}
+
+async function safeCall(fn: () => Promise<void> | void): Promise<void> {
+  try {
+    await fn()
+  } catch {
+    // best-effort side effect (a reply) — never let it break the orchestrator.
+  }
+}
+
+/**
+ * Transcribe a just-persisted voice idea, FAILURE-SAFE. Resolves to the outcome;
+ * never rejects for an expected failure (download/transcribe/store) — the caller
+ * runs this fire-and-forget so the inbound capture path is never blocked.
+ *
+ * @param cmdConfigured transcribeCmd(env) != null — false => skip gracefully.
+ */
+export async function transcribeVoiceIdea(
+  cmdConfigured: boolean,
+  fx: TranscribeEffects,
+): Promise<TranscribeOutcome> {
+  if (!cmdConfigured) {
+    fx.logNotice(
+      'SEMEN_TRANSCRIBE_CMD unset — voice idea kept status:new (transcription deferred to triage)',
+    )
+    return 'skipped'
+  }
+
+  let audioPath: string | undefined
+  let downloadErr: unknown
+  try {
+    audioPath = await fx.download()
+  } catch (err) {
+    downloadErr = err
+  }
+  if (!audioPath) {
+    fx.logError(
+      `voice download failed — idea stays new, file_id retained${downloadErr ? `: ${downloadErr}` : ''}`,
+    )
+    await safeCall(() => fx.replyFailure())
+    return 'failed'
+  }
+
+  let transcript: string
+  try {
+    transcript = (await fx.transcribe(audioPath)).trim()
+  } catch (err) {
+    fx.logError(`transcription failed — idea stays new, file_id retained: ${err}`)
+    await safeCall(() => fx.replyFailure())
+    return 'failed'
+  }
+  if (!transcript) {
+    fx.logError('transcription produced empty output — idea stays new, file_id retained')
+    await safeCall(() => fx.replyFailure())
+    return 'failed'
+  }
+
+  let saved = true
+  try {
+    saved = fx.onSuccess(transcript, audioPath) !== false
+  } catch (err) {
+    saved = false
+    fx.logError(`persisting transcript failed — idea stays new: ${err}`)
+  }
+  // Whether or not the store flip stuck, we HAVE a transcript — surface it.
+  await safeCall(() => fx.replyTranscript(transcript))
+  return saved ? 'ready' : 'failed'
 }

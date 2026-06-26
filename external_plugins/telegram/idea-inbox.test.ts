@@ -21,9 +21,13 @@ import {
   IdeaRouteEffects,
   persistIdea,
   PersistInput,
+  recordTranscript,
   selectReadyForPour,
   setIdeaStatus,
   shouldSuppressReaction,
+  transcribeCmd,
+  TranscribeEffects,
+  transcribeVoiceIdea,
 } from './idea-inbox'
 
 const ARTEM = '378650081'
@@ -455,5 +459,193 @@ describe('shouldSuppressReaction — reaction thread parity', () => {
     expect(findIdea(path, ideaId(SUPERGROUP, 55))!.text).toBe('y')
     expect(findIdea(path, ideaId(SUPERGROUP, 56))).toBeUndefined()
     expect(findIdea(join(dir, 'nope.jsonl'), 'x')).toBeUndefined()
+  })
+})
+
+// ── transcribeCmd resolver ───────────────────────────────────────────────────
+describe('transcribeCmd', () => {
+  test('returns undefined when SEMEN_TRANSCRIBE_CMD unset/blank', () => {
+    expect(transcribeCmd({} as NodeJS.ProcessEnv)).toBeUndefined()
+    expect(transcribeCmd({ SEMEN_TRANSCRIBE_CMD: '  ' } as NodeJS.ProcessEnv)).toBeUndefined()
+  })
+  test('returns the command when set', () => {
+    expect(transcribeCmd({ SEMEN_TRANSCRIBE_CMD: 'whisper-wrap' } as NodeJS.ProcessEnv)).toBe('whisper-wrap')
+  })
+})
+
+// ── recordTranscript store helper ────────────────────────────────────────────
+describe('recordTranscript', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'idea-transcript-'))
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  const read = (): IdeaRecord[] =>
+    readFileSync(join(dir, 'inbox.jsonl'), 'utf8').split('\n').filter(l => l.trim()).map(l => JSON.parse(l))
+
+  test('flips a voice record new→ready with transcript + path, writes the transcript file', () => {
+    persistIdea(dir, {
+      chat_id: SUPERGROUP, message_id: 200, from_user_id: ARTEM, thread_id: IDEAS_THREAD,
+      kind: 'voice', attachment_file_id: 'AwAC123',
+    })
+    const id = ideaId(SUPERGROUP, 200)
+    expect(read().find(r => r.id === id)!.status).toBe('new')
+
+    const ok = recordTranscript(dir, id, 'привет это идея', '/x/attachments/200.oga')
+    expect(ok).toBe(true)
+
+    const rec = read().find(r => r.id === id)!
+    expect(rec.status).toBe('ready')
+    expect(rec.transcript).toBe('привет это идея')
+    expect(rec.attachment_path).toBe('/x/attachments/200.oga')
+    expect(rec.attachment_file_id).toBe('AwAC123') // original file_id retained
+    // a durable transcript file landed under transcripts/
+    const fname = id.replace(/[^a-zA-Z0-9._-]/g, '_') + '.txt'
+    expect(readFileSync(join(dir, 'transcripts', fname), 'utf8')).toBe('привет это идея')
+  })
+
+  test('returns false when the id is unknown (record left untouched)', () => {
+    persistIdea(dir, { chat_id: SUPERGROUP, message_id: 1, from_user_id: ARTEM, kind: 'voice', attachment_file_id: 'f' })
+    expect(recordTranscript(dir, ideaId(SUPERGROUP, 999), 't')).toBe(false)
+    expect(read().find(r => r.id === ideaId(SUPERGROUP, 1))!.status).toBe('new')
+  })
+})
+
+// ── transcribeVoiceIdea orchestrator (REAL seam, mocked download/transcribe) ──
+// The exact function server.ts fires (fire-and-forget) after a voice idea
+// persists. Effects are spied; the store transition uses the REAL recordTranscript
+// against a temp dir. No real whisper, no real download. Asserts the failure-safe
+// invariant: the record only flips to 'ready' on success, stays 'new' otherwise.
+describe('transcribeVoiceIdea — failure-safe on-capture transcription', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'idea-transcribe-'))
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  const id = ideaId(SUPERGROUP, 300)
+  const statusOf = (): string =>
+    findIdea(join(dir, 'inbox.jsonl'), id)!.status
+
+  function persistVoice() {
+    persistIdea(dir, {
+      chat_id: SUPERGROUP, message_id: 300, from_user_id: ARTEM, thread_id: IDEAS_THREAD,
+      kind: 'voice', attachment_file_id: 'AwAC-voice',
+    })
+  }
+
+  // A spy harness; onSuccess wired to the REAL recordTranscript so the store
+  // transition is exercised end-to-end (download/transcribe stay mocked).
+  function harness(opts: {
+    download?: () => Promise<string | undefined>
+    transcribe?: () => Promise<string>
+  } = {}) {
+    const calls = { download: 0, transcribe: 0, onSuccess: 0, replyTranscript: 0, replyFailure: 0, logError: 0, logNotice: 0 }
+    let lastTranscript: string | undefined
+    const fx: TranscribeEffects = {
+      download: async () => { calls.download++; return (opts.download ?? (async () => '/tmp/voice-300.oga'))() },
+      transcribe: async () => { calls.transcribe++; return (opts.transcribe ?? (async () => 'это голосовая идея'))() },
+      onSuccess: (transcript, audioPath) => { calls.onSuccess++; return recordTranscript(dir, id, transcript, audioPath) },
+      replyTranscript: t => { calls.replyTranscript++; lastTranscript = t },
+      replyFailure: () => { calls.replyFailure++ },
+      logError: () => { calls.logError++ },
+      logNotice: () => { calls.logNotice++ },
+    }
+    return { fx, calls, get lastTranscript() { return lastTranscript } }
+  }
+
+  // SUCCESS: new→ready, transcript persisted, transcript replied, no failure reply.
+  test('success => record new→ready with transcript, replies the transcript', async () => {
+    persistVoice()
+    const h = harness()
+    const outcome = await transcribeVoiceIdea(true, h.fx)
+    expect(outcome).toBe('ready')
+    expect(statusOf()).toBe('ready')
+    expect(findIdea(join(dir, 'inbox.jsonl'), id)!.transcript).toBe('это голосовая идея')
+    expect(h.calls.replyTranscript).toBe(1)
+    expect(h.lastTranscript).toBe('это голосовая идея')
+    expect(h.calls.replyFailure).toBe(0)
+  })
+
+  // FAILURE (transcribe throws): stays 'new', file_id retained, failure reply,
+  // NO transcript reply, NO store flip.
+  test('transcribe throws => stays new, failure reply, no transcript persisted', async () => {
+    persistVoice()
+    const h = harness({ transcribe: async () => { throw new Error('whisper boom') } })
+    const outcome = await transcribeVoiceIdea(true, h.fx)
+    expect(outcome).toBe('failed')
+    expect(statusOf()).toBe('new')
+    expect(findIdea(join(dir, 'inbox.jsonl'), id)!.attachment_file_id).toBe('AwAC-voice')
+    expect(h.calls.replyFailure).toBe(1)
+    expect(h.calls.replyTranscript).toBe(0)
+    expect(h.calls.onSuccess).toBe(0)
+    expect(h.calls.logError).toBeGreaterThanOrEqual(1)
+  })
+
+  // FAILURE (download yields no file): stays 'new', never transcribes.
+  test('download returns undefined => stays new, no transcribe, failure reply', async () => {
+    persistVoice()
+    const h = harness({ download: async () => undefined })
+    const outcome = await transcribeVoiceIdea(true, h.fx)
+    expect(outcome).toBe('failed')
+    expect(statusOf()).toBe('new')
+    expect(h.calls.transcribe).toBe(0)
+    expect(h.calls.replyFailure).toBe(1)
+  })
+
+  // FAILURE (download throws): same loud failure path, stays 'new'.
+  test('download throws => stays new, failure reply, loud log', async () => {
+    persistVoice()
+    const h = harness({ download: async () => { throw new Error('net down') } })
+    const outcome = await transcribeVoiceIdea(true, h.fx)
+    expect(outcome).toBe('failed')
+    expect(statusOf()).toBe('new')
+    expect(h.calls.replyFailure).toBe(1)
+    expect(h.calls.logError).toBeGreaterThanOrEqual(1)
+  })
+
+  // FAILURE (empty transcript): treated as failure, stays 'new'.
+  test('empty transcript => stays new, failure reply', async () => {
+    persistVoice()
+    const h = harness({ transcribe: async () => '   ' })
+    const outcome = await transcribeVoiceIdea(true, h.fx)
+    expect(outcome).toBe('failed')
+    expect(statusOf()).toBe('new')
+    expect(h.calls.replyFailure).toBe(1)
+    expect(h.calls.replyTranscript).toBe(0)
+  })
+
+  // SKIP (cmd unset): graceful no-op — stays 'new', nothing downloaded, a notice.
+  test('cmd not configured => skipped, stays new, no download/transcribe/reply', async () => {
+    persistVoice()
+    const h = harness()
+    const outcome = await transcribeVoiceIdea(false, h.fx)
+    expect(outcome).toBe('skipped')
+    expect(statusOf()).toBe('new')
+    expect(h.calls.download).toBe(0)
+    expect(h.calls.transcribe).toBe(0)
+    expect(h.calls.replyTranscript).toBe(0)
+    expect(h.calls.replyFailure).toBe(0)
+    expect(h.calls.logNotice).toBe(1)
+  })
+
+  // STORE-FLIP failure: we still have the transcript, so reply it, but the
+  // record could not be flipped => outcome 'failed' (idea kept recoverable).
+  test('onSuccess store-flip fails => replies transcript, outcome failed', async () => {
+    persistVoice()
+    const calls = { replyTranscript: 0, replyFailure: 0, logError: 0 }
+    const fx: TranscribeEffects = {
+      download: async () => '/tmp/voice-300.oga',
+      transcribe: async () => 'хорошая идея',
+      onSuccess: () => false, // simulate record not found / write failure
+      replyTranscript: () => { calls.replyTranscript++ },
+      replyFailure: () => { calls.replyFailure++ },
+      logError: () => { calls.logError++ },
+      logNotice: () => {},
+    }
+    const outcome = await transcribeVoiceIdea(true, fx)
+    expect(outcome).toBe('failed')
+    expect(calls.replyTranscript).toBe(1) // user still gets the transcript
   })
 })
