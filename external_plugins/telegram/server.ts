@@ -20,8 +20,8 @@ import { Bot, GrammyError, InlineKeyboard, InputFile, API_CONSTANTS, type Contex
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { spawnSync } from 'child_process'
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
-import { homedir } from 'os'
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, unlinkSync } from 'fs'
+import { homedir, tmpdir } from 'os'
 import { join, extname, sep } from 'path'
 import {
   classifyRoute,
@@ -33,6 +33,9 @@ import {
   transcribeVoiceIdea,
   recordTranscript,
   ideaId,
+  ttsCmd,
+  sendVoiceReply,
+  voiceSendOpts,
 } from './idea-inbox'
 import { spawn } from 'child_process'
 
@@ -67,6 +70,13 @@ const IDEA_INBOX_DIR = ideaInboxDir(process.env)
 // — NOT hardcoded). Unset => transcription is disabled and the voice idea stays
 // status:'new' with its file_id (deferred to triage). See transcribeVoiceIdea.
 const TRANSCRIBE_CMD = transcribeCmd(process.env)
+
+// Text-to-speech command for the reply tool's voice:true option (synthesize an
+// Opus .ogg voice bubble of the reply text). Wired by the orchestrator (or
+// derived from IDEA_INBOX_DIR as <repo>/tools/tts.sh) — NOT hardcoded. Unset =>
+// voice replies are skipped gracefully; the text reply is unaffected. See
+// sendVoiceReply / ttsCmd.
+const TTS_CMD = ttsCmd(process.env)
 
 // Telegram caps bot file downloads at 20MB; getFile already rejects larger, but
 // we also short-circuit on a known size hint to avoid a doomed API round-trip.
@@ -561,7 +571,7 @@ const mcp = new Server(
       '',
       'A <channel> block with meta event="reaction" is not a chat message — it means the sender changed their emoji reaction on an earlier message (message_id identifies which one). reaction_added / reaction_removed list the emoji they added/removed (space-separated). Use this for lightweight signals, e.g. a 👍 reaction on a message you sent asking for approval. Do not reply to a reaction unless it warrants one — often the right response is to act on the signal silently.',
       '',
-      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Pass voice:true to also send a voice bubble (text-to-speech of the same text) in addition to the text reply — best-effort, the text always sends even if the voice fails. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -609,7 +619,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id (forum topic) to land the reply in the right topic, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id (forum topic) to land the reply in the right topic, files (absolute paths) to attach images or documents, and voice:true to ALSO send a voice bubble (TTS of the same text) in addition to the text.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -632,6 +642,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['text', 'markdownv2'],
             description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+          },
+          voice: {
+            type: 'boolean',
+            description: 'When true, AFTER sending the text reply, ALSO send a Telegram voice bubble (TTS of the same text). Best-effort: if TTS is unavailable or fails, the text reply still succeeds (the bubble is silently dropped). No effect when text is empty.',
           },
         },
         required: ['chat_id', 'text'],
@@ -757,11 +771,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        // Voice bubble (voice:true): the TEXT is already delivered above; this is
+        // a BEST-EFFORT extra — sendVoiceReply swallows every failure so a TTS /
+        // sendVoice error can never turn the successful text reply into an error.
+        let voiceNote = ''
+        if (args.voice === true && text.trim()) {
+          const oggPath = join(tmpdir(), `tg-voice-${randomBytes(6).toString('hex')}.ogg`)
+          const outcome = await sendVoiceReply(TTS_CMD != null, oggPath, {
+            synthesize: out => runTtsCmd(TTS_CMD!, text, out, 'ru'),
+            sendVoice: async ogg => {
+              await bot.api.sendVoice(chat_id, new InputFile(ogg), voiceSendOpts(message_thread_id, reply_to))
+            },
+            cleanup: ogg => { try { unlinkSync(ogg) } catch {} },
+            logError: reason => safeStderr(`telegram channel: voice reply: ${reason}\n`),
+          })
+          voiceNote =
+            outcome === 'sent' ? ' +voice' : outcome === 'failed' ? ' (voice bubble failed; text sent)' : ''
+        }
+
         const result =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
-        return { content: [{ type: 'text', text: result }] }
+        return { content: [{ type: 'text', text: result + voiceNote }] }
       }
       case 'react': {
         assertAllowedChat(args.chat_id as string)
@@ -1223,6 +1255,28 @@ function runTranscribeCmd(cmd: string, audioPath: string, lang: string): Promise
     child.on('close', code => {
       if (code === 0) resolve(out)
       else reject(new Error(`transcribe cmd exited ${code}: ${err.slice(0, 500)}`))
+    })
+  })
+}
+
+// Run the configured TTS command to synthesize an Opus .ogg voice bubble.
+// Contract (mirrors tools/tts.sh): CMD receives the text as $1, the output .ogg
+// path as $2, and the language as $3, and writes an Opus-encoded .ogg to $2. We
+// invoke `sh -c '<CMD> "$1" "$2" "$3"' sh <text> <out> <lang>` so CMD may be a
+// bare executable (args appended) OR a pipeline referencing $1/$2/$3. Rejects on
+// spawn error or a non-zero exit (the caller's sendVoiceReply swallows it =>
+// text reply already delivered, bubble dropped).
+function runTtsCmd(cmd: string, text: string, outPath: string, lang: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('sh', ['-c', `${cmd} "$1" "$2" "$3"`, 'sh', text, outPath, lang], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let err = ''
+    child.stderr.on('data', (d: Buffer) => { err += d.toString() })
+    child.on('error', reject)
+    child.on('close', code => {
+      if (code === 0) resolve()
+      else reject(new Error(`tts cmd exited ${code}: ${err.slice(0, 500)}`))
     })
   })
 }

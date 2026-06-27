@@ -130,6 +130,25 @@ export function transcribeCmd(env: NodeJS.ProcessEnv = process.env): string | un
   return undefined
 }
 
+/**
+ * Resolve the text-to-speech command (used by the reply tool's voice:true
+ * option to synthesize a Telegram voice bubble). Returns undefined when neither
+ * SEMEN_TTS_CMD nor IDEA_INBOX_DIR is set — the caller treats that as "voice
+ * disabled" (fail-safe: the text reply is unaffected; the voice bubble is simply
+ * skipped). Mirrors transcribeCmd exactly: SEMEN_TTS_CMD wins, else derive the
+ * repo's tools/tts.sh from IDEA_INBOX_DIR (which is `<repo>/tasks/idea-inbox`),
+ * else undefined. Contract: `<cmd> "<text>" <out.ogg> ru` writes an Opus .ogg.
+ */
+export function ttsCmd(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const c = env.SEMEN_TTS_CMD
+  if (c && c.trim()) return c
+  const inbox = env.IDEA_INBOX_DIR
+  if (inbox && inbox.trim()) {
+    return join(dirname(dirname(inbox)), 'tools', 'tts.sh')
+  }
+  return undefined
+}
+
 export type IdeaRecord = {
   id: string
   ts_captured: string
@@ -512,4 +531,87 @@ export async function transcribeVoiceIdea(
   // Whether or not the store flip stuck, we HAVE a transcript — surface it.
   await safeCall(() => fx.replyTranscript(transcript))
   return saved ? 'ready' : 'failed'
+}
+
+// ── voice-reply (TTS bubble) orchestrator (effect-injected, runtime-agnostic) ──
+//
+// Same seam pattern as transcribeVoiceIdea: server.ts binds the effects to the
+// TTS shell-out + bot.api.sendVoice + fs.unlink; the unit test passes spies (NO
+// real TTS, NO real bot). The PRODUCTION path runs through this function, so the
+// failure-safety invariant is tested against the real code.
+//
+// The CONTRACT that must never break: the TEXT reply is sent FIRST by server.ts
+// (existing behaviour, unchanged). This adds a voice bubble of the SAME text as
+// a BEST-EFFORT extra. Any failure here (cmd unset, TTS throws, sendVoice throws)
+// is logged loud and SWALLOWED — never rethrown — so the already-delivered text
+// reply and the channel itself are never broken.
+//
+// Invariants:
+//  - cmd not configured        -> SKIP, log a notice, return 'skipped'.
+//  - synthesize throws         -> 'failed', sendVoice NOT called, loud log, cleanup.
+//  - sendVoice throws          -> 'failed', loud log, cleanup; never rethrows.
+//  - all good                  -> 'sent', cleanup.
+// cleanup (unlink temp .ogg) ALWAYS runs (finally) and is itself best-effort.
+
+export type VoiceReplyOutcome = 'skipped' | 'sent' | 'failed'
+
+/** Effects sendVoiceReply drives. server.ts binds TTS/bot/fs; tests spy. */
+export type VoiceReplyEffects = {
+  /** Run the TTS command, writing an Opus .ogg to outPath. Rejects on failure. */
+  synthesize: (outPath: string) => Promise<void>
+  /** Upload the .ogg as a Telegram voice bubble (bot.api.sendVoice). Rejects on failure. */
+  sendVoice: (oggPath: string) => Promise<void>
+  /** Remove the temp .ogg (best-effort; swallow its own errors). */
+  cleanup: (oggPath: string) => void
+  /** Loud stderr on the skip/failure path. */
+  logError: (reason: string) => void
+}
+
+/**
+ * Synthesize + send a voice bubble for an already-sent text reply, FAILURE-SAFE.
+ * Never rejects — the caller awaits it only to surface the outcome in the tool
+ * result; a failure must not turn the (already-successful) reply into an error.
+ *
+ * @param cmdConfigured ttsCmd(env) != null — false => skip gracefully.
+ * @param oggPath       a unique temp path for the synthesized .ogg.
+ */
+export async function sendVoiceReply(
+  cmdConfigured: boolean,
+  oggPath: string,
+  fx: VoiceReplyEffects,
+): Promise<VoiceReplyOutcome> {
+  if (!cmdConfigured) {
+    fx.logError('SEMEN_TTS_CMD unset (and no IDEA_INBOX_DIR fallback) — voice bubble skipped, text already sent')
+    return 'skipped'
+  }
+  try {
+    await fx.synthesize(oggPath)
+    await fx.sendVoice(oggPath)
+    return 'sent'
+  } catch (err) {
+    fx.logError(`voice bubble failed — text already sent, dropping bubble: ${err}`)
+    return 'failed'
+  } finally {
+    try {
+      fx.cleanup(oggPath)
+    } catch {
+      // best-effort temp cleanup — never let it surface.
+    }
+  }
+}
+
+/**
+ * Build the grammY sendVoice options (forum thread + optional quote-reply). Pure
+ * so the payload shape is unit-testable without a bot. Mirrors the reply/file
+ * opts: carry message_thread_id so the bubble lands in the right topic, and
+ * reply_parameters when threading under an earlier message.
+ */
+export function voiceSendOpts(
+  message_thread_id: number | undefined,
+  reply_to: number | null | undefined,
+): Record<string, unknown> {
+  return {
+    ...(message_thread_id != null ? { message_thread_id } : {}),
+    ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
+  }
 }

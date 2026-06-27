@@ -28,6 +28,10 @@ import {
   transcribeCmd,
   TranscribeEffects,
   transcribeVoiceIdea,
+  ttsCmd,
+  sendVoiceReply,
+  VoiceReplyEffects,
+  voiceSendOpts,
 } from './idea-inbox'
 
 const ARTEM = '378650081'
@@ -470,6 +474,115 @@ describe('transcribeCmd', () => {
   })
   test('returns the command when set', () => {
     expect(transcribeCmd({ SEMEN_TRANSCRIBE_CMD: 'whisper-wrap' } as NodeJS.ProcessEnv)).toBe('whisper-wrap')
+  })
+})
+
+// ── ttsCmd resolver (voice-reply TTS command) ────────────────────────────────
+describe('ttsCmd', () => {
+  test('returns undefined when both SEMEN_TTS_CMD and IDEA_INBOX_DIR unset/blank', () => {
+    expect(ttsCmd({} as NodeJS.ProcessEnv)).toBeUndefined()
+    expect(ttsCmd({ SEMEN_TTS_CMD: '   ' } as NodeJS.ProcessEnv)).toBeUndefined()
+    expect(ttsCmd({ IDEA_INBOX_DIR: '  ' } as NodeJS.ProcessEnv)).toBeUndefined()
+  })
+  test('returns SEMEN_TTS_CMD verbatim when set (wins over the fallback)', () => {
+    expect(ttsCmd({ SEMEN_TTS_CMD: 'say-it' } as NodeJS.ProcessEnv)).toBe('say-it')
+    expect(
+      ttsCmd({ SEMEN_TTS_CMD: 'say-it', IDEA_INBOX_DIR: '/repo/tasks/idea-inbox' } as NodeJS.ProcessEnv),
+    ).toBe('say-it')
+  })
+  test('derives <repo>/tools/tts.sh from IDEA_INBOX_DIR (=<repo>/tasks/idea-inbox)', () => {
+    expect(ttsCmd({ IDEA_INBOX_DIR: '/repo/tasks/idea-inbox' } as NodeJS.ProcessEnv)).toBe(
+      '/repo/tools/tts.sh',
+    )
+  })
+})
+
+// ── voiceSendOpts (sendVoice payload shape) ──────────────────────────────────
+describe('voiceSendOpts', () => {
+  test('no thread, no reply => empty opts', () => {
+    expect(voiceSendOpts(undefined, undefined)).toEqual({})
+    expect(voiceSendOpts(undefined, null)).toEqual({})
+  })
+  test('thread only => message_thread_id, no reply_parameters', () => {
+    expect(voiceSendOpts(IDEAS_THREAD, undefined)).toEqual({ message_thread_id: IDEAS_THREAD })
+  })
+  test('reply only => reply_parameters, no thread', () => {
+    expect(voiceSendOpts(undefined, 99)).toEqual({ reply_parameters: { message_id: 99 } })
+  })
+  test('thread + reply => both carried (bubble lands in topic, quotes the message)', () => {
+    expect(voiceSendOpts(WORK_THREAD, 99)).toEqual({
+      message_thread_id: WORK_THREAD,
+      reply_parameters: { message_id: 99 },
+    })
+  })
+})
+
+// ── sendVoiceReply orchestrator (failure-safe voice bubble) [REAL seam] ───────
+describe('sendVoiceReply — best-effort, never breaks the text reply', () => {
+  const mkFx = () => {
+    const calls: string[] = []
+    const fx: VoiceReplyEffects & { calls: string[]; errors: string[] } = {
+      calls,
+      errors: [],
+      synthesize: async () => { calls.push('synthesize') },
+      sendVoice: async () => { calls.push('sendVoice') },
+      cleanup: () => { calls.push('cleanup') },
+      logError: r => { fx.errors.push(r) },
+    }
+    return fx
+  }
+
+  test('cmd not configured => skipped, no synthesize/sendVoice, logs', async () => {
+    const fx = mkFx()
+    const out = await sendVoiceReply(false, '/tmp/x.ogg', fx)
+    expect(out).toBe('skipped')
+    expect(fx.calls).toEqual([])
+    expect(fx.errors.length).toBe(1)
+  })
+
+  test('happy path => synthesize→sendVoice→cleanup in order, sent', async () => {
+    const fx = mkFx()
+    const out = await sendVoiceReply(true, '/tmp/x.ogg', fx)
+    expect(out).toBe('sent')
+    expect(fx.calls).toEqual(['synthesize', 'sendVoice', 'cleanup'])
+    expect(fx.errors).toEqual([])
+  })
+
+  test('synthesize throws => failed, sendVoice NOT called, cleanup runs, loud log, never rethrows', async () => {
+    const fx = mkFx()
+    fx.synthesize = async () => { fx.calls.push('synthesize'); throw new Error('tts boom') }
+    const out = await sendVoiceReply(true, '/tmp/x.ogg', fx)
+    expect(out).toBe('failed')
+    expect(fx.calls).toEqual(['synthesize', 'cleanup'])
+    expect(fx.calls).not.toContain('sendVoice')
+    expect(fx.errors.length).toBe(1)
+  })
+
+  test('sendVoice throws => failed, cleanup runs, loud log, never rethrows', async () => {
+    const fx = mkFx()
+    fx.sendVoice = async () => { fx.calls.push('sendVoice'); throw new Error('upload boom') }
+    const out = await sendVoiceReply(true, '/tmp/x.ogg', fx)
+    expect(out).toBe('failed')
+    expect(fx.calls).toEqual(['synthesize', 'sendVoice', 'cleanup'])
+    expect(fx.errors.length).toBe(1)
+  })
+
+  test('cleanup throwing is swallowed — outcome still reflects the send', async () => {
+    const fx = mkFx()
+    fx.cleanup = () => { throw new Error('unlink boom') }
+    const out = await sendVoiceReply(true, '/tmp/x.ogg', fx)
+    expect(out).toBe('sent')
+  })
+
+  test('passes the given oggPath through to every effect', async () => {
+    const seen: string[] = []
+    await sendVoiceReply(true, '/tmp/unique-123.ogg', {
+      synthesize: async p => { seen.push(p) },
+      sendVoice: async p => { seen.push(p) },
+      cleanup: p => { seen.push(p) },
+      logError: () => {},
+    })
+    expect(seen).toEqual(['/tmp/unique-123.ogg', '/tmp/unique-123.ogg', '/tmp/unique-123.ogg'])
   })
 })
 
