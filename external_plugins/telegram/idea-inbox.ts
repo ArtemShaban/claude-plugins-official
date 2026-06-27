@@ -12,7 +12,7 @@
 // forum topic ids.
 
 import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
-import { join } from 'path'
+import { dirname, join } from 'path'
 
 export type Route = 'work' | 'async' | 'ignore'
 
@@ -119,7 +119,15 @@ export function ideaInboxDir(env: NodeJS.ProcessEnv = process.env): string | und
  */
 export function transcribeCmd(env: NodeJS.ProcessEnv = process.env): string | undefined {
   const c = env.SEMEN_TRANSCRIBE_CMD
-  return c && c.trim() ? c : undefined
+  if (c && c.trim()) return c
+  // Fallback (so voice-transcribe works without a separate env wire / session
+  // restart): derive the repo's tools/transcribe.sh from IDEA_INBOX_DIR, which is
+  // `<repo>/tasks/idea-inbox`. Still overridable via SEMEN_TRANSCRIBE_CMD.
+  const inbox = env.IDEA_INBOX_DIR
+  if (inbox && inbox.trim()) {
+    return join(dirname(dirname(inbox)), 'tools', 'transcribe.sh')
+  }
+  return undefined
 }
 
 export type IdeaRecord = {
