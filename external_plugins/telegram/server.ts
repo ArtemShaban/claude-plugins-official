@@ -18,7 +18,7 @@ import {
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, API_CONSTANTS, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { randomBytes } from 'crypto'
+import { createHmac, randomBytes } from 'crypto'
 import { spawnSync } from 'child_process'
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, unlinkSync } from 'fs'
 import { homedir, tmpdir } from 'os'
@@ -57,6 +57,73 @@ try {
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
+
+// Route A (SemenAssistant analysis/routea-spec-FINAL.md — authenticated owner-
+// approval side-channel). The plugin ADDITIVELY appends a signed, structured
+// approval event to a 0600 JSONL file whenever the CONFIGURED OWNER reacts/
+// replies in their own DM — the bridge (a separate, non-LLM process) tails +
+// verifies it, so an owner 👍 becomes a mechanism the orchestrator LLM cannot
+// mint or forge. Dark (no-op) unless ALL THREE are set by the owner's setup
+// script (services/sam-whatsapp-bridge/bin/routea-setup.sh) — a fresh/
+// unprovisioned install emits nothing, zero behavior change.
+const APPROVAL_SIGNING_KEY_HEX = process.env.SAM_WA_APPROVAL_SIGNING_KEY
+const APPROVAL_CHANNEL_PATH = process.env.SAM_WA_APPROVAL_CHANNEL
+const APPROVAL_OWNER_ID = process.env.SAM_WA_APPROVAL_OWNER_ID // NOT a secret — an existing allowlist entry
+
+type ApprovalFields = {
+  kind: string
+  owner_id: string
+  chat_id: string
+  message_id: string
+  reply_to_message_id: string
+  payload: string
+  nonce: string
+  issued_at_ms: number
+}
+
+// Byte-identical to the bridge's services/sam-whatsapp-bridge/src/security/
+// approvalSign.js (canonicalString + sign). KAT (cross-runtime conformance
+// oracle): services/sam-whatsapp-bridge/test/fixtures/routea-kat.json.
+function signApproval(f: ApprovalFields): string {
+  const canonical = [
+    'SAMWA-APPROVAL-v1', f.kind, f.owner_id, f.chat_id, f.message_id,
+    f.reply_to_message_id, f.payload, f.nonce, String(f.issued_at_ms),
+  ].join('\n')
+  return createHmac('sha256', Buffer.from(APPROVAL_SIGNING_KEY_HEX!, 'hex'))
+    .update(canonical, 'utf8').digest('hex')
+}
+
+// Append one signed record to the side-channel. Dark unless all three env
+// pointers above are set. Never throws (mirrors the handlers' own .catch
+// discipline elsewhere in this file) — a Route A emit failure must never break
+// the existing reaction/reply handling it is additive to.
+function emitApprovalSignal(f: ApprovalFields): void {
+  if (!APPROVAL_SIGNING_KEY_HEX || !APPROVAL_CHANNEL_PATH || !APPROVAL_OWNER_ID) return // feature dark
+  if (/[\r\n]/.test(f.payload)) return // never sign/emit a CR/LF payload
+  try {
+    // appendFileSync({mode}) only applies mode on CREATE. If the channel
+    // already exists with loose perms, refuse to append (never leak the
+    // owner's reply text into a group/world-readable file).
+    let exists = false
+    try {
+      const st = statSync(APPROVAL_CHANNEL_PATH)
+      exists = true
+      if ((st.mode & 0o077) !== 0) {
+        process.stderr.write('telegram channel: approval-channel has loose perms — refusing to append\n')
+        return
+      }
+    } catch {
+      // ENOENT: will be created 0600 below.
+    }
+    const rec = { schema: 'samwa.approval.v1', ...f, sig: signApproval(f) }
+    appendFileSync(APPROVAL_CHANNEL_PATH, JSON.stringify(rec) + '\n', { mode: 0o600 })
+    if (!exists) {
+      try { chmodSync(APPROVAL_CHANNEL_PATH, 0o600) } catch {} // belt on first create
+    }
+  } catch (err) {
+    process.stderr.write(`telegram channel: approval-signal emit skipped: ${err}\n`)
+  }
+}
 
 // idea-inbox (async topic capture). Directory comes from IDEA_INBOX_DIR (env or
 // the channel .env). Unset => async routing is DISABLED and every message routes
@@ -1188,6 +1255,28 @@ bot.on('message_reaction', async ctx => {
   }).catch(err => {
     process.stderr.write(`telegram channel: failed to deliver reaction to Claude: ${err}\n`)
   })
+
+  // Route A — additive signed approval-channel emit. `reactionGate` already
+  // proved an ALLOWLISTED user acted in their own DM; this additionally
+  // requires the CONFIGURED OWNER specifically (not just any allowlisted
+  // user), a net-add reaction (never a removal), and the reactor's own DM
+  // (chat_id === the reactor's id). The existing mcp.notification above is
+  // completely unchanged — this is purely additive.
+  if (
+    APPROVAL_OWNER_ID && String(from.id) === APPROVAL_OWNER_ID &&
+    chat_id === String(from.id) && added.length > 0
+  ) {
+    emitApprovalSignal({
+      kind: 'reaction',
+      owner_id: String(from.id),
+      chat_id,
+      message_id,
+      reply_to_message_id: '',
+      payload: added.join(' '),
+      nonce: randomBytes(16).toString('hex'),
+      issued_at_ms: Date.now(),
+    })
+  }
 })
 
 type AttachmentMeta = {
@@ -1492,6 +1581,29 @@ async function handleInbound(
   }).catch(err => {
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
   })
+
+  // Route A — additive signed approval-channel emit (step-2 / reply parity).
+  // `gate(ctx)` already dropped non-allowlisted senders above; this
+  // additionally requires the CONFIGURED OWNER specifically, a reply (not a
+  // fresh message), and the sender's own DM. The reply's typed text lands
+  // ONLY in the 0600 side-channel — never logged, never re-echoed in the
+  // mcp.notification above (which is unchanged). repliedTo/chat_id/from/msgId
+  // are all already in scope from the work-route relay just above.
+  if (
+    APPROVAL_OWNER_ID && String(from.id) === APPROVAL_OWNER_ID &&
+    repliedTo != null && chat_id === String(from.id) && msgId != null
+  ) {
+    emitApprovalSignal({
+      kind: 'reply',
+      owner_id: String(from.id),
+      chat_id,
+      message_id: String(msgId),
+      reply_to_message_id: String(repliedTo.message_id),
+      payload: text,
+      nonce: randomBytes(16).toString('hex'),
+      issued_at_ms: Date.now(),
+    })
+  }
 }
 
 // Without this, any throw in a message handler stops polling permanently

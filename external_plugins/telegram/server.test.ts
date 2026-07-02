@@ -18,7 +18,7 @@
 
 import { describe, test, expect } from 'bun:test'
 import { spawnSync, spawn } from 'child_process'
-import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'fs'
+import { writeFileSync, mkdirSync, mkdtempSync, rmSync, readFileSync, statSync, chmodSync, existsSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { randomBytes } from 'crypto'
@@ -302,6 +302,291 @@ process.exit(0)
     } finally {
       try { fakePlugin.kill('SIGKILL') } catch {} // force-kill for cleanup
       rmSync(stateDir, { recursive: true, force: true })
+    }
+  })
+})
+
+// ── Route A — signed approval-channel emit (SemenAssistant analysis/routea-
+// spec-FINAL.md M3) ──────────────────────────────────────────────────────────
+//
+// signApproval/emitApprovalSignal are pure module-level functions in server.ts
+// (not exported — the file is a live entrypoint, same reason every other test
+// in this file uses the extracted-reproduction pattern instead of importing
+// server.ts directly, which would require a real bot token and try to connect
+// to Telegram). These reproduction scripts mirror the server.ts logic
+// EXACTLY. Cross-runtime KAT conformance itself is proven independently in the
+// bridge repo (services/sam-whatsapp-bridge/test/approvalsign.test.js reading
+// test/fixtures/routea-kat.json) — the SAME test-only key + vectors are
+// embedded here so this repo can prove ITS signApproval reproduces the exact
+// same expected_sig, without a cross-repo file dependency.
+describe('Route A — signed approval-channel emit', () => {
+  // TEST-ONLY key + vectors — identical to services/sam-whatsapp-bridge/test/
+  // fixtures/routea-kat.json. NOT a real secret.
+  const KAT_KEY_HEX = '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff'
+  const KAT_CASES = [
+    {
+      kind: 'reaction', owner_id: '378650081', chat_id: '378650081', message_id: '4321',
+      reply_to_message_id: '', payload: '👍',
+      nonce: '0123456789abcdef0123456789abcdef', issued_at_ms: 1751490000000,
+      expected_sig: '7ee80c4bb9a92f9fafe866d15e4a865a74fd3da33419120cc5ed287e9461bafe',
+    },
+    {
+      kind: 'reply', owner_id: '378650081', chat_id: '378650081', message_id: '5555',
+      reply_to_message_id: '4321', payload: 'ПОДТВЕРЖДАЮ',
+      nonce: 'fedcba9876543210fedcba9876543210', issued_at_ms: 1751490000000,
+      expected_sig: 'e146940011956308dde613e8e7771fa6c817bd1ff6d4ab1cbc3a3425b0a2abb3',
+    },
+  ]
+
+  // Reproduces signApproval() from server.ts verbatim (createHmac + the exact
+  // 9-line \n-joined canonical string, no trailing newline).
+  function signApprovalScript(keyHex: string): string {
+    return /* js */ `
+import { createHmac } from 'crypto'
+const KEY_HEX = ${JSON.stringify(keyHex)}
+function signApproval(f) {
+  const canonical = ['SAMWA-APPROVAL-v1', f.kind, f.owner_id, f.chat_id, f.message_id,
+    f.reply_to_message_id, f.payload, f.nonce, String(f.issued_at_ms)].join('\\n')
+  return createHmac('sha256', Buffer.from(KEY_HEX, 'hex')).update(canonical, 'utf8').digest('hex')
+}
+const cases = ${JSON.stringify(KAT_CASES)}
+for (const c of cases) {
+  const got = signApproval(c)
+  console.log(got === c.expected_sig ? 'MATCH:' + c.kind : 'MISMATCH:' + c.kind + ':' + got)
+}
+`
+  }
+
+  test('signApproval reproduces the M0 KAT expected_sig for both cases (cross-runtime conformance)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'routea-kat-'))
+    try {
+      const scriptPath = join(dir, 'kat.mjs')
+      writeFileSync(scriptPath, signApprovalScript(KAT_KEY_HEX))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.status, `KAT script failed: ${result.stderr}`).toBe(0)
+      expect(result.stdout).toContain('MATCH:reaction')
+      expect(result.stdout).toContain('MATCH:reply')
+      expect(result.stdout).not.toContain('MISMATCH')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('signApproval: a different key produces a different signature (sanity — not a constant)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'routea-kat-negative-'))
+    try {
+      const scriptPath = join(dir, 'kat-neg.mjs')
+      const wrongKey = '11'.repeat(32)
+      writeFileSync(scriptPath, signApprovalScript(wrongKey))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain('MISMATCH')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // Reproduces emitApprovalSignal() from server.ts verbatim (env-pointer dark
+  // switch, CR/LF rejection, loose-perms refusal, atomic 0600 create).
+  function emitScript(channelPath: string, keyHex?: string, ownerId?: string, payload?: string): string {
+    return /* js */ `
+import { createHmac, randomBytes } from 'crypto'
+import { appendFileSync, statSync, chmodSync } from 'fs'
+
+const APPROVAL_SIGNING_KEY_HEX = ${keyHex ? JSON.stringify(keyHex) : 'undefined'}
+const APPROVAL_CHANNEL_PATH = ${JSON.stringify(channelPath)}
+const APPROVAL_OWNER_ID = ${ownerId ? JSON.stringify(ownerId) : 'undefined'}
+
+function signApproval(f) {
+  const canonical = ['SAMWA-APPROVAL-v1', f.kind, f.owner_id, f.chat_id, f.message_id,
+    f.reply_to_message_id, f.payload, f.nonce, String(f.issued_at_ms)].join('\\n')
+  return createHmac('sha256', Buffer.from(APPROVAL_SIGNING_KEY_HEX, 'hex')).update(canonical, 'utf8').digest('hex')
+}
+
+function emitApprovalSignal(f) {
+  if (!APPROVAL_SIGNING_KEY_HEX || !APPROVAL_CHANNEL_PATH || !APPROVAL_OWNER_ID) return
+  if (/[\\r\\n]/.test(f.payload)) return
+  try {
+    let exists = false
+    try {
+      const st = statSync(APPROVAL_CHANNEL_PATH)
+      exists = true
+      if ((st.mode & 0o077) !== 0) {
+        process.stderr.write('LOOSE_PERMS_REFUSED\\n')
+        return
+      }
+    } catch {}
+    const rec = { schema: 'samwa.approval.v1', ...f, sig: signApproval(f) }
+    appendFileSync(APPROVAL_CHANNEL_PATH, JSON.stringify(rec) + '\\n', { mode: 0o600 })
+    if (!exists) { try { chmodSync(APPROVAL_CHANNEL_PATH, 0o600) } catch {} }
+    console.log('EMITTED')
+  } catch (err) {
+    process.stderr.write('EMIT_ERROR:' + err + '\\n')
+  }
+}
+
+emitApprovalSignal({
+  kind: 'reaction', owner_id: '111222333', chat_id: '111222333', message_id: 'm1',
+  reply_to_message_id: '', payload: ${JSON.stringify(payload ?? '👍')},
+  nonce: randomBytes(16).toString('hex'), issued_at_ms: Date.now(),
+})
+`
+  }
+
+  test('emitApprovalSignal: all three pointers set -> writes one parseable line whose sig verifies', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'routea-emit-'))
+    try {
+      const channelPath = join(dir, 'approval-channel.jsonl')
+      const scriptPath = join(dir, 'emit.mjs')
+      writeFileSync(scriptPath, emitScript(channelPath, KAT_KEY_HEX, '111222333'))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.status, `emit script failed: ${result.stderr}`).toBe(0)
+      expect(result.stdout).toContain('EMITTED')
+
+      const lines = readFileSync(channelPath, 'utf8').trim().split('\n')
+      expect(lines.length).toBe(1)
+      const rec = JSON.parse(lines[0]!)
+      expect(rec.schema).toBe('samwa.approval.v1')
+      expect(rec.owner_id).toBe('111222333')
+      expect(rec.sig).toMatch(/^[0-9a-f]{64}$/)
+
+      // 0600 from creation.
+      const mode = statSync(channelPath).mode & 0o777
+      expect(mode).toBe(0o600)
+
+      // The written sig independently verifies against the SAME KAT-style
+      // canonical construction (proves the record is self-consistent, not
+      // just "some hex string").
+      const verifyScript = /* js */ `
+import { createHmac } from 'crypto'
+const rec = ${JSON.stringify(rec)}
+const canonical = ['SAMWA-APPROVAL-v1', rec.kind, rec.owner_id, rec.chat_id, rec.message_id,
+  rec.reply_to_message_id, rec.payload, rec.nonce, String(rec.issued_at_ms)].join('\\n')
+const expected = createHmac('sha256', Buffer.from(${JSON.stringify(KAT_KEY_HEX)}, 'hex')).update(canonical, 'utf8').digest('hex')
+console.log(expected === rec.sig ? 'VERIFIED' : 'MISMATCH')
+`
+      const vPath = join(dir, 'verify.mjs')
+      writeFileSync(vPath, verifyScript)
+      const vResult = spawnSync('bun', ['run', vPath], { encoding: 'utf8', timeout: 5000 })
+      expect(vResult.stdout).toContain('VERIFIED')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('emitApprovalSignal: signing key unset -> feature dark, no file write', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'routea-emit-dark1-'))
+    try {
+      const channelPath = join(dir, 'approval-channel.jsonl')
+      const scriptPath = join(dir, 'emit.mjs')
+      writeFileSync(scriptPath, emitScript(channelPath, undefined, '111222333'))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.status).toBe(0)
+      expect(result.stdout).not.toContain('EMITTED')
+      expect(existsSync(channelPath)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('emitApprovalSignal: owner id unset -> feature dark, no file write', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'routea-emit-dark2-'))
+    try {
+      const channelPath = join(dir, 'approval-channel.jsonl')
+      const scriptPath = join(dir, 'emit.mjs')
+      writeFileSync(scriptPath, emitScript(channelPath, KAT_KEY_HEX, undefined))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.status).toBe(0)
+      expect(result.stdout).not.toContain('EMITTED')
+      expect(existsSync(channelPath)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('emitApprovalSignal: a pre-existing loose-perms channel file refuses to append [FIX B-3]', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'routea-emit-loose-'))
+    try {
+      const channelPath = join(dir, 'approval-channel.jsonl')
+      writeFileSync(channelPath, '', { mode: 0o600 })
+      chmodSync(channelPath, 0o644) // loosen AFTER creation
+      const scriptPath = join(dir, 'emit.mjs')
+      writeFileSync(scriptPath, emitScript(channelPath, KAT_KEY_HEX, '111222333'))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.status).toBe(0)
+      expect(result.stderr).toContain('LOOSE_PERMS_REFUSED')
+      expect(result.stdout).not.toContain('EMITTED')
+      expect(readFileSync(channelPath, 'utf8')).toBe('') // untouched
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('emitApprovalSignal: a CR/LF payload never emits [FIX B-8]', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'routea-emit-crlf-'))
+    try {
+      const channelPath = join(dir, 'approval-channel.jsonl')
+      const scriptPath = join(dir, 'emit.mjs')
+      writeFileSync(scriptPath, emitScript(channelPath, KAT_KEY_HEX, '111222333', 'line1\nline2'))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.status).toBe(0)
+      expect(result.stdout).not.toContain('EMITTED')
+      expect(existsSync(channelPath)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // ── the owner-id gate the two call sites add on top of the existing
+  // reactionGate()/gate() allowlist checks — [FIX B-1] ──────────────────────
+  function ownerGateScript(fromId: string, ownerEnv?: string): string {
+    return /* js */ `
+const APPROVAL_OWNER_ID = ${ownerEnv ? JSON.stringify(ownerEnv) : 'undefined'}
+const from = { id: ${JSON.stringify(fromId)} }
+const chat_id = String(from.id) // simulate the sender's own DM
+const added = ['👍']
+const wouldEmit = !!(
+  APPROVAL_OWNER_ID && String(from.id) === APPROVAL_OWNER_ID &&
+  chat_id === String(from.id) && added.length > 0
+)
+console.log(wouldEmit ? 'WOULD_EMIT' : 'WOULD_NOT_EMIT')
+`
+  }
+
+  test('[FIX B-1] owner-id gate: the CONFIGURED owner -> would emit', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'routea-ownergate-'))
+    try {
+      const scriptPath = join(dir, 'gate.mjs')
+      writeFileSync(scriptPath, ownerGateScript('111222333', '111222333'))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.stdout).toContain('WOULD_EMIT')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('[FIX B-1] owner-id gate: an ALLOWLISTED-but-not-owner DM -> would NOT emit (the B-1 fix)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'routea-ownergate-notowner-'))
+    try {
+      const scriptPath = join(dir, 'gate.mjs')
+      // a DIFFERENT allowlisted user id than the configured owner
+      writeFileSync(scriptPath, ownerGateScript('999888777', '111222333'))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.stdout).toContain('WOULD_NOT_EMIT')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('[FIX B-1] owner-id gate: APPROVAL_OWNER_ID unset -> would NOT emit (feature dark)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'routea-ownergate-unset-'))
+    try {
+      const scriptPath = join(dir, 'gate.mjs')
+      writeFileSync(scriptPath, ownerGateScript('111222333', undefined))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.stdout).toContain('WOULD_NOT_EMIT')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 })
