@@ -47,6 +47,7 @@ import {
   writeContextBufferFile,
   type BufferEntry,
 } from './group-buffer'
+import { sendWithAutoFormat } from './telegram-format'
 import { spawn } from 'child_process'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -777,8 +778,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['auto', 'text', 'markdownv2'],
+            description: "Rendering mode. Default 'auto': common markdown in the text (**bold**, *italic*, `code`, ```blocks```, [links](url), - lists, # headers) is automatically converted to Telegram formatting, with a guaranteed plain-text fallback if anything fails to parse — no manual escaping needed. 'text' forces fully literal plain output (no conversion at all). 'markdownv2' is a legacy mode: Telegram MarkdownV2 formatting where the caller must hand-escape every reserved character themselves.",
           },
           voice: {
             type: 'boolean',
@@ -823,8 +824,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['auto', 'text', 'markdownv2'],
+            description: "Rendering mode. Default 'auto': common markdown in the text (**bold**, *italic*, `code`, ```blocks```, [links](url), - lists, # headers) is automatically converted to Telegram formatting, with a guaranteed plain-text fallback if anything fails to parse — no manual escaping needed. 'text' forces fully literal plain output (no conversion at all). 'markdownv2' is a legacy mode: Telegram MarkdownV2 formatting where the caller must hand-escape every reserved character themselves.",
           },
         },
         required: ['chat_id', 'message_id', 'text'],
@@ -844,7 +845,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const message_thread_id =
           args.message_thread_id != null ? Number(args.message_thread_id) : undefined
         const files = (args.files as string[] | undefined) ?? []
-        const format = (args.format as string | undefined) ?? 'text'
+        // Default 'auto': convert common markdown (**bold**, `code`, links,
+        // lists, headers, ...) to Telegram formatting automatically, with a
+        // guaranteed plain-text fallback (see telegram-format.ts) — fixes
+        // raw "**bold**" showing up literally when the caller doesn't
+        // remember to opt into (and hand-escape) 'markdownv2'. 'text' forces
+        // fully literal output (no conversion at all); 'markdownv2' is the
+        // legacy caller-pre-escaped mode, kept for back-compat.
+        const format = (args.format as string | undefined) ?? 'auto'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
         // R-OUT: in a forum, a message without message_thread_id lands in General
         // (or TOPIC_DELETED). Carry it on every send so replies land in the topic.
@@ -874,11 +882,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
-            const sent = await bot.api.sendMessage(chat_id, chunks[i], {
+            const sendOpts = {
               ...threadOpt,
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-              ...(parseMode ? { parse_mode: parseMode } : {}),
-            })
+            }
+            const sent =
+              format === 'auto'
+                ? await sendWithAutoFormat(
+                    (chunkText, chunkParseMode) =>
+                      bot.api.sendMessage(chat_id, chunkText, {
+                        ...sendOpts,
+                        ...(chunkParseMode ? { parse_mode: chunkParseMode } : {}),
+                      }),
+                    chunks[i],
+                  )
+                : await bot.api.sendMessage(chat_id, chunks[i], {
+                    ...sendOpts,
+                    ...(parseMode ? { parse_mode: parseMode } : {}),
+                  })
             sentIds.push(sent.message_id)
           }
         } catch (err) {
@@ -959,14 +980,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
-        const editFormat = (args.format as string | undefined) ?? 'text'
+        // Default 'auto': same auto-format + guaranteed-plain-fallback
+        // behavior as 'reply' — see telegram-format.ts.
+        const editFormat = (args.format as string | undefined) ?? 'auto'
         const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
-        const edited = await bot.api.editMessageText(
-          args.chat_id as string,
-          Number(args.message_id),
-          args.text as string,
-          ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
-        )
+        const editChatId = args.chat_id as string
+        const editMessageId = Number(args.message_id)
+        const edited =
+          editFormat === 'auto'
+            ? await sendWithAutoFormat(
+                (text, parseMode) =>
+                  bot.api.editMessageText(
+                    editChatId,
+                    editMessageId,
+                    text,
+                    parseMode ? { parse_mode: parseMode } : undefined,
+                  ),
+                args.text as string,
+              )
+            : await bot.api.editMessageText(
+                editChatId,
+                editMessageId,
+                args.text as string,
+                ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
+              )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
       }
