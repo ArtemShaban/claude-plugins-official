@@ -35,7 +35,16 @@ Arguments passed: `$ARGUMENTS`
   "dmPolicy": "pairing",
   "allowFrom": ["<senderId>", ...],
   "groups": {
-    "<groupId>": { "requireMention": true, "allowFrom": [] }
+    "<groupId>": {
+      "requireMention": true,
+      "allowFrom": [],
+      // "open" (default, field omitted) or "gated" — a gated group is
+      // READ-ONLY: inbound messages still reach the session, but
+      // reply/react/edit_message all refuse to send there until this is
+      // set back to "open". Use for a group with a third party in it where
+      // the assistant should read but never autonomously post.
+      "postPolicy": "open"
+    }
   },
   "pending": {
     "<6-char-code>": {
@@ -43,7 +52,12 @@ Arguments passed: `$ARGUMENTS`
       "createdAt": <ms>, "expiresAt": <ms>
     }
   },
-  "mentionPatterns": ["@mybot"]
+  "mentionPatterns": ["@mybot"],
+  // Breadcrumbs auto-recorded for groups the bot has SEEN a message from but
+  // that are NOT in "groups" yet — see "Discover a new group's chat_id".
+  "seenGroups": {
+    "<chatId>": { "title": "...", "lastSenderId": "...", "lastSenderName": "...", "lastSeenAt": "...", "hits": 1 }
+  }
 }
 ```
 
@@ -59,7 +73,10 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
 1. Read `~/.claude/channels/telegram/access.json` (handle missing file).
 2. Show: dmPolicy, allowFrom count and list, pending count with codes +
-   sender IDs + age, groups count.
+   sender IDs + age, groups count (and each group's postPolicy if "gated").
+3. If `seenGroups` is non-empty, list each entry: chatId, title (if known),
+   last sender, hits, last-seen age — these are candidate chat_ids for
+   `group add` (see "Discover a new group's chat_id" below).
 
 ### `pair <code>`
 
@@ -95,16 +112,51 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 1. Validate `<mode>` is one of `pairing`, `allowlist`, `disabled`.
 2. Read (create default if missing), set `dmPolicy`, write.
 
-### `group add <groupId>` (optional: `--no-mention`, `--allow id1,id2`)
+### `group add <groupId>` (optional: `--no-mention`, `--allow id1,id2`, `--gated-post`)
 
 1. Read (create default if missing).
 2. Set `groups[<groupId>] = { requireMention: !hasFlag("--no-mention"),
-   allowFrom: parsedAllowList }`.
-3. Write.
+   allowFrom: parsedAllowList, ...(hasFlag("--gated-post") ? { postPolicy: "gated" } : {}) }`.
+   `--gated-post` makes the group READ-ONLY from the start — recommended for
+   any group with a third party in it (the assistant should read but not
+   autonomously post there; see "Post-gating" below).
+3. If the groupId matches an entry in `seenGroups`, delete that entry (it's
+   now a real config, not a discovery breadcrumb).
+4. Write.
 
 ### `group rm <groupId>`
 
 1. Read, `delete groups[<groupId>]`, write.
+
+### `group post-policy <groupId> <open|gated>`
+
+1. Read. If `groups[<groupId>]` doesn't exist, tell the user to `group add`
+   first and stop.
+2. Validate `<open|gated>`. Set `groups[<groupId>].postPolicy`, write.
+3. Confirm the new policy. Flipping to `open` is the owner's explicit "go" to
+   let the assistant post in that chat — treat it as a one-shot enablement,
+   not a standing default; suggest flipping back to `gated` after the post if
+   the group has a third party in it.
+
+### Discover a new group's chat_id
+
+The bot only reports a group's numeric `chat_id` for groups already in
+`groups` — the ACCESS.md "at a glance" table explains why (negative
+`-100…` supergroup IDs aren't shown anywhere in the Telegram UI). Two ways to
+find a NEW group's id, in order of preference:
+
+1. **`seenGroups` (built-in, no extra bot needed).** Once the assistant's bot
+   is a member of the group and someone sends ANY message there, the channel
+   server records a breadcrumb in `access.seenGroups` even though the message
+   itself is dropped (the group isn't configured yet). Run `/telegram:access`
+   with no args and read the `seenGroups` list for the chatId, title, and
+   last sender — then `group add <chatId>` it.
+2. **@RawDataBot (Telegram-native, zero risk to this session).** Temporarily
+   add [@RawDataBot](https://t.me/RawDataBot) to the group — it posts a JSON
+   blob including the chat ID — then remove it. Doesn't touch this plugin or
+   its live poller at all; use this if `seenGroups` hasn't populated yet (no
+   message has been sent since the bot joined) or you want the id
+   immediately without waiting for one.
 
 ### `set <key> <value>`
 

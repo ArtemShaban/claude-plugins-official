@@ -49,7 +49,7 @@ Groups are off by default. Opt each one in individually.
 /telegram:access group add -1001654782309
 ```
 
-Supergroup IDs are negative numbers with a `-100` prefix, e.g. `-1001654782309`. They're not shown in the Telegram UI. To find one, either add [@RawDataBot](https://t.me/RawDataBot) to the group temporarily (it dumps a JSON blob including the chat ID), or add your bot and run `/telegram:access` to see recent dropped-from groups.
+Supergroup IDs are negative numbers with a `-100` prefix, e.g. `-1001654782309`. They're not shown in the Telegram UI. To find one, either add [@RawDataBot](https://t.me/RawDataBot) to the group temporarily (it dumps a JSON blob including the chat ID) — doesn't touch this plugin at all — or add your bot to the group, have anyone send one message, and run `/telegram:access` to read the auto-recorded breadcrumb in `seenGroups` (chatId + title + last sender). The bot doesn't need to be configured yet for `seenGroups` to pick it up — every message from an unconfigured group is still dropped (unchanged), but the sighting is recorded.
 
 With the default `requireMention: true`, the bot responds only when @mentioned or replied to. Pass `--no-mention` to process every message, or `--allow id1,id2` to restrict which members can trigger it.
 
@@ -60,6 +60,27 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 ```
 
 **Privacy mode.** Telegram bots default to a server-side privacy mode that filters group messages before they reach your code: only @mentions and replies are delivered. This matches the default `requireMention: true`, so it's normally invisible. Using `--no-mention` requires disabling privacy mode as well: message [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Without that step, Telegram never delivers the messages regardless of local config.
+
+## Post-gating (read-only groups)
+
+A group configured with `--gated-post` (or `postPolicy: "gated"` set directly)
+is **read-only**: the assistant still receives every message from it exactly
+as before, but the `reply`/`react`/`edit_message` tools refuse to send
+anything there — the call errors out instead of posting. This matters for any
+group with a third party in it (a friend, a shared channel) where the
+assistant reading is fine but it must never autonomously post to someone who
+never paired with it, even if the group's own message content tries to talk
+it into replying (prompt injection from an untrusted sender).
+
+```
+/telegram:access group add -1001654782309 --gated-post   # read-only from the start
+/telegram:access group post-policy -1001654782309 open    # owner's explicit go, one message
+/telegram:access group post-policy -1001654782309 gated   # back to read-only
+```
+
+Treat flipping to `open` as a one-shot approval for the message(s) about to
+be sent, not a standing setting — flip it back to `gated` afterward for a
+group with a third party in it.
 
 ## Mention detection
 
@@ -102,8 +123,9 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
 | `/telegram:access allow 412587349` | Add a user ID directly. |
 | `/telegram:access remove 412587349` | Remove from the allowlist. |
 | `/telegram:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
-| `/telegram:access group add -1001654782309` | Enable a group. Flags: `--no-mention` (also requires disabling privacy mode), `--allow id1,id2`. |
+| `/telegram:access group add -1001654782309` | Enable a group. Flags: `--no-mention` (also requires disabling privacy mode), `--allow id1,id2`, `--gated-post` (read-only from the start). |
 | `/telegram:access group rm -1001654782309` | Disable a group. |
+| `/telegram:access group post-policy -1001654782309 open\|gated` | Toggle whether the assistant may post in this group (see Post-gating above). |
 | `/telegram:access set ackReaction 👀` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. |
 
 ## Config file
@@ -125,7 +147,9 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
       // false also requires disabling privacy mode via BotFather.
       "requireMention": true,
       // Restrict triggers to these senders. Empty = any member (subject to requireMention).
-      "allowFrom": []
+      "allowFrom": [],
+      // "open" (default, field omittable) or "gated" — see Post-gating above.
+      "postPolicy": "open"
     }
   },
 
@@ -142,6 +166,18 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
   "textChunkLimit": 4096,
 
   // length = cut at limit. newline = prefer paragraph boundaries.
-  "chunkMode": "newline"
+  "chunkMode": "newline",
+
+  // Auto-recorded sightings of groups NOT in "groups" yet (see "find one" above).
+  // Not hand-edited; the server writes it, /telegram:access reads it.
+  "seenGroups": {
+    "-1001654782309": {
+      "title": "MAG & HIU взаимозачёт",
+      "lastSenderId": "628194073",
+      "lastSenderName": "timur",
+      "lastSeenAt": "2026-07-06T09:14:00.000Z",
+      "hits": 1
+    }
+  }
 }
 ```

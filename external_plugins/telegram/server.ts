@@ -37,6 +37,7 @@ import {
   sendVoiceReply,
   voiceSendOpts,
 } from './idea-inbox'
+import { checkOutboundAllowed, recordSeenGroup, type SeenGroup } from './group-access'
 import { spawn } from 'child_process'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -301,6 +302,17 @@ type GroupPolicy = {
    * classifyRoute() + the idea-inbox spec.
    */
   asyncThreads?: string[]
+  /**
+   * 'open' (default, field absent) — this group's chat can be posted to by
+   * the reply/react/edit_message tools, same as today. 'gated' — the group
+   * is READ-ONLY from the tools' side: inbound messages still reach the
+   * session unchanged, but every outbound tool call targeting this chat is
+   * refused until the owner flips it back to 'open' via /telegram:access.
+   * See checkOutboundAllowed() in group-access.ts — this is the structural
+   * gate for "Sam may read a group with a third party in it, but must never
+   * autonomously post there."
+   */
+  postPolicy?: 'open' | 'gated'
 }
 
 type Access = {
@@ -318,6 +330,13 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /**
+   * Discovery breadcrumbs for groups the bot has SEEN a message from but that
+   * are NOT YET configured in `groups` — see recordSeenGroup() in
+   * group-access.ts. Lets the owner find a new group's chat_id via
+   * /telegram:access without a third-party bot or interrupting the poller.
+   */
+  seenGroups?: Record<string, SeenGroup>
 }
 
 function defaultAccess(): Access {
@@ -362,6 +381,7 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      seenGroups: parsed.seenGroups,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -396,11 +416,12 @@ function loadAccess(): Access {
 
 // Outbound gate — reply/react/edit can only target chats the inbound gate
 // would deliver from. Telegram DM chat_id == user_id, so allowFrom covers DMs.
+// ALSO enforces postPolicy:'gated' (group-access.ts) — a group configured
+// read-only refuses every outbound tool call until the owner reopens it.
 function assertAllowedChat(chat_id: string): void {
   const access = loadAccess()
-  if (access.allowFrom.includes(chat_id)) return
-  if (chat_id in access.groups) return
-  throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram:access`)
+  const result = checkOutboundAllowed(access, chat_id)
+  if (!result.allowed) throw new Error(result.reason)
 }
 
 function saveAccess(a: Access): void {
@@ -473,7 +494,22 @@ function gate(ctx: Context): GateResult {
   if (chatType === 'group' || chatType === 'supergroup') {
     const groupId = String(ctx.chat!.id)
     const policy = access.groups[groupId]
-    if (!policy) return { action: 'drop' }
+    if (!policy) {
+      // Discovery breadcrumb (group-access.ts): lets the owner find this new
+      // group's chat_id via /telegram:access later, without a third-party bot
+      // or interrupting the live poller. Purely additive — the drop below is
+      // unchanged behaviour. Skipped in static mode (no runtime writes).
+      if (!STATIC) {
+        const chatTitle = ctx.chat && 'title' in ctx.chat ? ctx.chat.title : undefined
+        access.seenGroups = recordSeenGroup(access.seenGroups, groupId, {
+          title: chatTitle,
+          senderId,
+          senderName: from.username,
+        })
+        saveAccess(access)
+      }
+      return { action: 'drop' }
+    }
     const groupAllowFrom = policy.allowFrom ?? []
     const requireMention = policy.requireMention ?? true
     if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
