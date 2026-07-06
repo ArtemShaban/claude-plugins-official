@@ -114,6 +114,11 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
 ### `group add <groupId>` (optional: `--no-mention`, `--allow id1,id2`, `--gated-post`)
 
+Prerequisite: the bot must be a group **admin** (any minimal rights) — a
+plain-member bot only receives @mentions/replies/commands due to Telegram's
+bot privacy mode, so a non-admin bot silently misses everything else even
+after `group add`. See ACCESS.md's "Groups" section.
+
 1. Read (create default if missing).
 2. Set `groups[<groupId>] = { requireMention: !hasFlag("--no-mention"),
    allowFrom: parsedAllowList, ...(hasFlag("--gated-post") ? { postPolicy: "gated" } : {}) }`.
@@ -145,12 +150,15 @@ The bot only reports a group's numeric `chat_id` for groups already in
 `-100…` supergroup IDs aren't shown anywhere in the Telegram UI). Two ways to
 find a NEW group's id, in order of preference:
 
-1. **`seenGroups` (built-in, no extra bot needed).** Once the assistant's bot
-   is a member of the group and someone sends ANY message there, the channel
-   server records a breadcrumb in `access.seenGroups` even though the message
-   itself is dropped (the group isn't configured yet). Run `/telegram:access`
-   with no args and read the `seenGroups` list for the chatId, title, and
-   last sender — then `group add <chatId>` it.
+1. **`seenGroups` (built-in, no extra bot needed).** Requires the bot to
+   already be a group **admin** — a plain-member bot never sees a non-mention
+   message at all (Telegram privacy mode), so this breadcrumb never fires for
+   it. Once the assistant's bot is an admin member of the group and someone
+   sends ANY message there, the channel server records a breadcrumb in
+   `access.seenGroups` even though the message itself is dropped (the group
+   isn't configured yet). Run `/telegram:access` with no args and read the
+   `seenGroups` list for the chatId, title, and last sender — then
+   `group add <chatId>` it.
 2. **@RawDataBot (Telegram-native, zero risk to this session).** Temporarily
    add [@RawDataBot](https://t.me/RawDataBot) to the group — it posts a JSON
    blob including the chat ID — then remove it. Doesn't touch this plugin or
