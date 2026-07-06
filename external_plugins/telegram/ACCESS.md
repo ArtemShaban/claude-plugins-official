@@ -45,11 +45,13 @@ Pairing captures the ID automatically. To find one manually, have the person mes
 
 Groups are off by default. Opt each one in individually.
 
+**Step zero, before anything else: make the bot a group ADMIN.** Telegram's server-side bot privacy mode blocks a plain-member bot from receiving ordinary group messages — it only ever gets @mentions, replies to its own messages, and commands. Admin status (any minimal rights are enough) bypasses privacy mode entirely for that group and is the surgical fix. Skip this and BOTH `seenGroups` discovery below AND all subsequent group reading will silently see nothing — even though the bot is in the group and people are sending messages. (Live-confirmed 2026-07-06: a plain-member bot produced zero `seenGroups` breadcrumb for a test message; promoting it to admin made discovery work immediately, no restart needed.) The alternative is disabling privacy mode globally via [@BotFather](https://t.me/BotFather) (`/setprivacy` → Disable — see "Privacy mode" below) — but that applies to *every* group the bot is ever added to, not just this one; admin-per-group is the preferred, scoped choice unless you specifically want the global behavior.
+
 ```
 /telegram:access group add -1001654782309
 ```
 
-Supergroup IDs are negative numbers with a `-100` prefix, e.g. `-1001654782309`. They're not shown in the Telegram UI. To find one, either add [@RawDataBot](https://t.me/RawDataBot) to the group temporarily (it dumps a JSON blob including the chat ID) — doesn't touch this plugin at all — or add your bot to the group, have anyone send one message, and run `/telegram:access` to read the auto-recorded breadcrumb in `seenGroups` (chatId + title + last sender). The bot doesn't need to be configured yet for `seenGroups` to pick it up — every message from an unconfigured group is still dropped (unchanged), but the sighting is recorded.
+Supergroup IDs are negative numbers with a `-100` prefix, e.g. `-1001654782309`. They're not shown in the Telegram UI. To find one, either add [@RawDataBot](https://t.me/RawDataBot) to the group temporarily (it dumps a JSON blob including the chat ID) — doesn't touch this plugin at all — or add your bot to the group **as an admin** (see above), have anyone send one message, and run `/telegram:access` to read the auto-recorded breadcrumb in `seenGroups` (chatId + title + last sender). The bot doesn't need to be configured yet for `seenGroups` to pick it up — every message from an unconfigured group is still dropped (unchanged), but the sighting is recorded — provided privacy mode isn't blocking it from reaching the bot in the first place.
 
 With the default `requireMention: true`, the bot responds only when @mentioned or replied to. Pass `--no-mention` to process every message, or `--allow id1,id2` to restrict which members can trigger it.
 
