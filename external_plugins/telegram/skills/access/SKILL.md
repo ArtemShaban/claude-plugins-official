@@ -43,7 +43,12 @@ Arguments passed: `$ARGUMENTS`
       // reply/react/edit_message all refuse to send there until this is
       // set back to "open". Use for a group with a third party in it where
       // the assistant should read but never autonomously post.
-      "postPolicy": "open"
+      "postPolicy": "open",
+      // true: a message that does NOT mention the bot is buffered (per-group,
+      // capped, file-backed) instead of silently dropped, and attached to the
+      // NEXT genuine wake in this group. Default (field omitted) = drop, same
+      // as today.
+      "contextBuffer": true
     }
   },
   "pending": {
@@ -112,7 +117,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 1. Validate `<mode>` is one of `pairing`, `allowlist`, `disabled`.
 2. Read (create default if missing), set `dmPolicy`, write.
 
-### `group add <groupId>` (optional: `--no-mention`, `--allow id1,id2`, `--gated-post`)
+### `group add <groupId>` (optional: `--no-mention`, `--allow id1,id2`, `--gated-post`, `--context-buffer`)
 
 Prerequisite: the bot must be a group **admin** (any minimal rights) — a
 plain-member bot only receives @mentions/replies/commands due to Telegram's
@@ -121,10 +126,13 @@ after `group add`. See ACCESS.md's "Groups" section.
 
 1. Read (create default if missing).
 2. Set `groups[<groupId>] = { requireMention: !hasFlag("--no-mention"),
-   allowFrom: parsedAllowList, ...(hasFlag("--gated-post") ? { postPolicy: "gated" } : {}) }`.
+   allowFrom: parsedAllowList, ...(hasFlag("--gated-post") ? { postPolicy: "gated" } : {}),
+   ...(hasFlag("--context-buffer") ? { contextBuffer: true } : {}) }`.
    `--gated-post` makes the group READ-ONLY from the start — recommended for
    any group with a third party in it (the assistant should read but not
-   autonomously post there; see "Post-gating" below).
+   autonomously post there; see "Post-gating" below). `--context-buffer`
+   buffers non-mention messages instead of dropping them, delivering them all
+   on the next wake — see ACCESS.md's "Context buffer" section.
 3. If the groupId matches an entry in `seenGroups`, delete that entry (it's
    now a real config, not a discovery breadcrumb).
 4. Write.
@@ -142,6 +150,19 @@ after `group add`. See ACCESS.md's "Groups" section.
    let the assistant post in that chat — treat it as a one-shot enablement,
    not a standing default; suggest flipping back to `gated` after the post if
    the group has a third party in it.
+
+### `group context-buffer <groupId> <on|off>`
+
+Toggle `contextBuffer` on an ALREADY-CONFIGURED group without touching its
+other settings — prefer this over re-running `group add` on an existing
+group, since `group add` replaces `requireMention`/`allowFrom`/`postPolicy`
+wholesale and you'd have to reproduce them exactly to avoid a regression.
+
+1. Read. If `groups[<groupId>]` doesn't exist, tell the user to `group add`
+   first and stop.
+2. Validate `<on|off>`. Set `groups[<groupId>].contextBuffer` to `true`/`false`
+   (or delete the key for `off`, either is equivalent — default is off), write.
+3. Confirm the new setting. See ACCESS.md's "Context buffer" section.
 
 ### Discover a new group's chat_id
 
