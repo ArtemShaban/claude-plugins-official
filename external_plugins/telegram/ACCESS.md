@@ -84,6 +84,32 @@ Treat flipping to `open` as a one-shot approval for the message(s) about to
 be sent, not a standing setting — flip it back to `gated` afterward for a
 group with a third party in it.
 
+## Context buffer (store-don't-wake)
+
+With `requireMention: true` (the default), a message that doesn't mention the
+bot is normally dropped silently — you never see it and neither does the
+assistant. A group configured with `contextBuffer: true` changes that: instead
+of dropping, the message is appended to a per-group buffer (`{ts,
+senderName, text}`, capped at 200 messages / 64KB, oldest evicted first). The
+next time someone DOES mention the bot, everything buffered since the last
+wake is attached to that wake and the buffer resets — so you're only
+interrupted per-mention, not per-message, without losing the chatter in
+between. The buffer survives a plugin restart (file-backed, like the
+idea-inbox). Default (field absent) is unchanged: silent drop.
+
+```
+/telegram:access group add -1001654782309 --context-buffer
+```
+
+For a group that's already configured, use the toggle instead — `group add`
+replaces the whole policy object, so re-running it risks clobbering the
+group's existing `requireMention`/`allowFrom`/`postPolicy`:
+
+```
+/telegram:access group context-buffer -1001654782309 on
+/telegram:access group context-buffer -1001654782309 off
+```
+
 ## Mention detection
 
 In groups with `requireMention: true`, any of the following triggers the bot:
@@ -125,9 +151,10 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
 | `/telegram:access allow 412587349` | Add a user ID directly. |
 | `/telegram:access remove 412587349` | Remove from the allowlist. |
 | `/telegram:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
-| `/telegram:access group add -1001654782309` | Enable a group. Flags: `--no-mention` (also requires disabling privacy mode), `--allow id1,id2`, `--gated-post` (read-only from the start). |
+| `/telegram:access group add -1001654782309` | Enable a group. Flags: `--no-mention` (also requires disabling privacy mode), `--allow id1,id2`, `--gated-post` (read-only from the start), `--context-buffer` (buffer non-mention messages instead of dropping them — see Context buffer above). |
 | `/telegram:access group rm -1001654782309` | Disable a group. |
 | `/telegram:access group post-policy -1001654782309 open\|gated` | Toggle whether the assistant may post in this group (see Post-gating above). |
+| `/telegram:access group context-buffer -1001654782309 on\|off` | Toggle buffering of non-mention messages on an already-configured group (see Context buffer above), without touching its other settings. |
 | `/telegram:access set ackReaction 👀` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. |
 
 ## Config file
@@ -151,7 +178,10 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
       // Restrict triggers to these senders. Empty = any member (subject to requireMention).
       "allowFrom": [],
       // "open" (default, field omittable) or "gated" — see Post-gating above.
-      "postPolicy": "open"
+      "postPolicy": "open",
+      // true: buffer non-mention messages instead of dropping them — see
+      // Context buffer above. Default (field omittable) = silent drop.
+      "contextBuffer": true
     }
   },
 
