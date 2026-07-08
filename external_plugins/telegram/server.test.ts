@@ -590,3 +590,78 @@ console.log(wouldEmit ? 'WOULD_EMIT' : 'WOULD_NOT_EMIT')
     }
   })
 })
+
+// ── message:photo idea-capture attachment parity (P0 fix) ────────────────────
+//
+// bot.on('message:photo', ...) is a live grammY handler (not exported — same
+// reason every other server.ts-internal test in this file uses the extracted-
+// reproduction pattern instead of importing server.ts directly, which would
+// require a real bot token and try to connect to Telegram). This reproduces
+// the handler's attachment-construction lines + handleInbound's kind/
+// attachment_file_id derivation VERBATIM, over a mocked ctx.message.photo
+// array (NO real network, NO real bot) — exactly what regressed: before the
+// fix, the message:photo handler never passed a 4th (attachment) argument to
+// handleInbound, so an async-captured photo idea persisted as kind:'text'
+// with no attachment_file_id (an unrecoverable empty husk).
+describe('message:photo idea-capture attachment parity (P0 fix)', () => {
+  // Verbatim reproduction of:
+  //   const photos = ctx.message.photo
+  //   const best = photos[photos.length - 1]
+  //   ...
+  //   await handleInbound(ctx, caption, downloadImage, {
+  //     kind: 'photo', file_id: best.file_id, size: best.file_size,
+  //   })
+  // and handleInbound's dispatchIdeaRoute input line:
+  //   kind: attachment?.kind ?? 'text', attachment_file_id: attachment?.file_id
+  function photoAttachmentScript(photosJson: string): string {
+    return /* js */ `
+const ctx = { message: { photo: ${photosJson} } }
+const photos = ctx.message.photo
+const best = photos[photos.length - 1]
+const attachment = { kind: 'photo', file_id: best.file_id, size: best.file_size }
+const dispatchInput = {
+  kind: attachment?.kind ?? 'text',
+  attachment_file_id: attachment?.file_id,
+}
+console.log(JSON.stringify(dispatchInput))
+`
+  }
+
+  test('photo attachment (largest PhotoSize) reaches dispatchIdeaRoute input as kind:photo + file_id', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'photo-attach-'))
+    try {
+      const photos = JSON.stringify([
+        { file_id: 'AgAC-small', file_unique_id: 'u-small', width: 90, height: 90, file_size: 1200 },
+        { file_id: 'AgAC-large', file_unique_id: 'u-large', width: 1280, height: 1280, file_size: 87000 },
+      ])
+      const scriptPath = join(dir, 'photo-attach.mjs')
+      writeFileSync(scriptPath, photoAttachmentScript(photos))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.status, `script failed: ${result.stderr}`).toBe(0)
+      const out = JSON.parse(result.stdout.trim())
+      // The P0 bug: pre-fix, this would be { kind: 'text', attachment_file_id: undefined }.
+      expect(out.kind).toBe('photo')
+      expect(out.attachment_file_id).toBe('AgAC-large') // largest size, not the first
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a single-size photo still carries its file_id through (no off-by-one on a 1-element array)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'photo-attach-single-'))
+    try {
+      const photos = JSON.stringify([
+        { file_id: 'AgAC-only', file_unique_id: 'u-only', width: 512, height: 512, file_size: 40000 },
+      ])
+      const scriptPath = join(dir, 'photo-attach-single.mjs')
+      writeFileSync(scriptPath, photoAttachmentScript(photos))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      expect(result.status).toBe(0)
+      const out = JSON.parse(result.stdout.trim())
+      expect(out.kind).toBe('photo')
+      expect(out.attachment_file_id).toBe('AgAC-only')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})

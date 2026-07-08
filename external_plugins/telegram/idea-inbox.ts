@@ -533,6 +533,80 @@ export async function transcribeVoiceIdea(
   return saved ? 'ready' : 'failed'
 }
 
+// ── attachment download orchestrator (effect-injected, runtime-agnostic) ──────
+//
+// Same seam pattern as transcribeVoiceIdea: server.ts binds the effects to the
+// grammY download + patchIdea; the unit test passes mocks/spies (NO real
+// network, NO real bot). Used for kinds that already persisted with a file_id
+// (today: photo — see the message:photo handler + handleInbound in server.ts)
+// and get bytes fetched to attachments/ as a BEST-EFFORT enrichment, strictly
+// AFTER dispatchIdeaRoute's persist already made the record durable.
+//
+// The whole point: a download/store failure here must NEVER cost the idea its
+// attachment_file_id — the record was already durable (with file_id) before
+// this ever runs, and neither branch below touches attachment_file_id. A later
+// triage pass can always retry the download from the retained file_id — this
+// is the fix for the "photo idea captured as an unrecoverable empty husk" bug
+// (the record used to have neither a file_id NOR bytes when this path never ran).
+//
+// Invariants:
+//  - download rejects / resolves undefined -> 'failed', file_id retained, loud log.
+//  - onSuccess (patchIdea) returns false/throws -> 'failed', loud log (bytes were
+//    fetched but the record patch didn't stick — file_id is still there).
+//  - all good                               -> 'saved'.
+
+export type DownloadAttachmentOutcome = 'saved' | 'failed'
+
+/** Effects downloadIdeaAttachment drives. server.ts binds grammY/fs/store; tests spy. */
+export type DownloadAttachmentEffects = {
+  /** Download the file to attachments/; resolves to the local path, or
+   *  undefined when no file is available (expired / over the size cap). */
+  download: () => Promise<string | undefined>
+  /** Patch attachment_path onto the already-persisted record (patchIdea).
+   *  false/throw => store failure (record keeps attachment_file_id, no path). */
+  onSuccess: (attachmentPath: string) => boolean | void
+  /** Loud stderr on any failure path. */
+  logError: (reason: string) => void
+}
+
+/**
+ * Download bytes for an already-persisted idea attachment, FAILURE-SAFE.
+ * Resolves to the outcome; never rejects — the caller runs this fire-and-forget
+ * so the inbound capture path is never blocked. A failure never touches the
+ * record's attachment_file_id (already durable from the earlier persist call).
+ */
+export async function downloadIdeaAttachment(
+  fx: DownloadAttachmentEffects,
+): Promise<DownloadAttachmentOutcome> {
+  let path: string | undefined
+  let downloadErr: unknown
+  try {
+    path = await fx.download()
+  } catch (err) {
+    downloadErr = err
+  }
+  if (!path) {
+    fx.logError(
+      `attachment download failed — file_id retained for later retry${downloadErr ? `: ${downloadErr}` : ''}`,
+    )
+    return 'failed'
+  }
+
+  let saved = true
+  try {
+    saved = fx.onSuccess(path) !== false
+  } catch (err) {
+    saved = false
+    fx.logError(`persisting attachment_path failed — file_id retained: ${err}`)
+    return 'failed'
+  }
+  if (!saved) {
+    fx.logError('persisting attachment_path failed (record not found?) — file_id retained')
+    return 'failed'
+  }
+  return 'saved'
+}
+
 // ── voice-reply (TTS bubble) orchestrator (effect-injected, runtime-agnostic) ──
 //
 // Same seam pattern as transcribeVoiceIdea: server.ts binds the effects to the

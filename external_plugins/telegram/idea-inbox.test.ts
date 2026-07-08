@@ -13,12 +13,15 @@ import { join } from 'path'
 import {
   classifyRoute,
   dispatchIdeaRoute,
+  DownloadAttachmentEffects,
+  downloadIdeaAttachment,
   findIdea,
   ideaExists,
   ideaId,
   ideaInboxDir,
   IdeaRecord,
   IdeaRouteEffects,
+  patchIdea,
   persistIdea,
   PersistInput,
   recordTranscript,
@@ -157,6 +160,29 @@ describe('persistIdea + JSONL store', () => {
     })
     expect(rec.status).toBe('new')
     expect(rec.attachment_file_id).toBe('AwACAgIAxyz')
+  })
+
+  // P0 REGRESSION (photo capture parity): before the fix, server.ts's
+  // message:photo handler never passed a 4th (attachment) argument to
+  // handleInbound, so an async-captured photo idea persisted with
+  // kind:'text' and NO attachment_file_id — an unrecoverable empty husk
+  // (Bot API exposes no history to retry from). Unlike voice, a photo is
+  // immediately 'ready' (no transcription step blocks it) — it just also
+  // carries the file_id, exactly like document/audio/video already do.
+  test('photo idea persists as status:ready WITH attachment_file_id (P0 — must never be a bare "(photo)" husk)', () => {
+    const rec = persistIdea(dir, {
+      chat_id: SUPERGROUP,
+      message_id: 102,
+      from_user_id: ARTEM,
+      thread_id: IDEAS_THREAD,
+      kind: 'photo',
+      text: '(photo)',
+      attachment_file_id: 'AgACAgIAphoto123',
+    })
+    expect(rec.kind).toBe('photo')
+    expect(rec.status).toBe('ready')
+    expect(rec.attachment_file_id).toBe('AgACAgIAphoto123')
+    expect(rec.text).toBe('(photo)')
   })
 
   test('creates attachments/ and transcripts/ subdirs', () => {
@@ -315,6 +341,27 @@ describe('dispatchIdeaRoute — no-interrupt guarantee (AC3) [REAL seam]', () =>
     for (let i = 0; i < 5; i++) dispatchIdeaRoute(route, 600 + i, h.baseInput, h.fx)
     expect(h.calls.notify).toBe(0)
     expect(h.calls.persist).toBe(5)
+  })
+
+  // P0 REGRESSION (photo capture parity): drives dispatchIdeaRoute with the
+  // EXACT input shape server.ts's handleInbound now builds for a photo
+  // (kind: attachment?.kind ?? 'text', attachment_file_id: attachment?.file_id)
+  // — proves an async-routed photo idea is durably persisted WITH its kind and
+  // file_id intact, not silently downgraded to a bare kind:'text' husk.
+  test('Ideas topic (async) photo => persisted with kind:photo + attachment_file_id, notify NOT called', () => {
+    const h = harness()
+    const route = classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true)
+    const outcome = dispatchIdeaRoute(
+      route,
+      610,
+      { ...h.baseInput, kind: 'photo', text: '(photo)', attachment_file_id: 'AgACAgIAphoto610' },
+      h.fx,
+    )
+    expect(outcome).toBe('persisted')
+    expect(h.calls.notify).toBe(0)
+    const rec = findIdea(join(dir, 'inbox.jsonl'), ideaId(SUPERGROUP, 610))!
+    expect(rec.kind).toBe('photo')
+    expect(rec.attachment_file_id).toBe('AgACAgIAphoto610')
   })
 
   // FIX C2: a missing message_id must NEVER be coerced to a 0-id. The async
@@ -760,5 +807,111 @@ describe('transcribeVoiceIdea — failure-safe on-capture transcription', () => 
     const outcome = await transcribeVoiceIdea(true, fx)
     expect(outcome).toBe('failed')
     expect(calls.replyTranscript).toBe(1) // user still gets the transcript
+  })
+})
+
+// ── downloadIdeaAttachment orchestrator (P0 fix — photo capture parity) ──────
+// The function server.ts fires (fire-and-forget) after a photo idea persists
+// async, mirroring transcribeVoiceIdea's seam/test pattern. Effects are spied;
+// the store patch uses the REAL patchIdea against a temp dir. No real network.
+// Asserts the failure-safe invariant: attachment_file_id (already persisted
+// before this ever runs) is NEVER lost on a download/store failure — only
+// attachment_path is best-effort.
+describe('downloadIdeaAttachment — failure-safe attachment-bytes orchestrator', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'idea-attachment-'))
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  const id = ideaId(SUPERGROUP, 400)
+  const recordOf = (): IdeaRecord => findIdea(join(dir, 'inbox.jsonl'), id)!
+
+  function persistPhoto() {
+    persistIdea(dir, {
+      chat_id: SUPERGROUP, message_id: 400, from_user_id: ARTEM, thread_id: IDEAS_THREAD,
+      kind: 'photo', text: '(photo)', attachment_file_id: 'AgAC-photo400',
+    })
+  }
+
+  // A spy harness; onSuccess wired to the REAL patchIdea so the store patch is
+  // exercised end-to-end (download stays mocked, no real network/bot).
+  function harness(opts: { download?: () => Promise<string | undefined> } = {}) {
+    const calls = { download: 0, onSuccess: 0, logError: 0 }
+    const fx: DownloadAttachmentEffects = {
+      download: async () => { calls.download++; return (opts.download ?? (async () => '/tmp/photo-400.jpg'))() },
+      onSuccess: attachmentPath => {
+        calls.onSuccess++
+        return patchIdea(join(dir, 'inbox.jsonl'), id, { attachment_path: attachmentPath })
+      },
+      logError: () => { calls.logError++ },
+    }
+    return { fx, calls }
+  }
+
+  // SUCCESS: attachment_path lands on the record, attachment_file_id untouched.
+  test('success => record gets attachment_path, attachment_file_id retained, outcome saved', async () => {
+    persistPhoto()
+    const h = harness()
+    const outcome = await downloadIdeaAttachment(h.fx)
+    expect(outcome).toBe('saved')
+    expect(recordOf().attachment_path).toBe('/tmp/photo-400.jpg')
+    expect(recordOf().attachment_file_id).toBe('AgAC-photo400')
+    expect(h.calls.logError).toBe(0)
+  })
+
+  // FAILURE (download resolves undefined, e.g. expired / over the size cap):
+  // outcome 'failed', NO onSuccess call, file_id untouched, loud log.
+  test('download returns undefined => failed, no store patch, file_id retained, loud log', async () => {
+    persistPhoto()
+    const h = harness({ download: async () => undefined })
+    const outcome = await downloadIdeaAttachment(h.fx)
+    expect(outcome).toBe('failed')
+    expect(h.calls.onSuccess).toBe(0)
+    expect(recordOf().attachment_path).toBeUndefined()
+    expect(recordOf().attachment_file_id).toBe('AgAC-photo400')
+    expect(h.calls.logError).toBe(1)
+  })
+
+  // FAILURE (download throws, e.g. a network error): same loud failure path.
+  test('download throws => failed, no store patch, file_id retained, loud log', async () => {
+    persistPhoto()
+    const h = harness({ download: async () => { throw new Error('net down') } })
+    const outcome = await downloadIdeaAttachment(h.fx)
+    expect(outcome).toBe('failed')
+    expect(h.calls.onSuccess).toBe(0)
+    expect(recordOf().attachment_path).toBeUndefined()
+    expect(recordOf().attachment_file_id).toBe('AgAC-photo400')
+    expect(h.calls.logError).toBe(1)
+  })
+
+  // FAILURE (store patch returns false — id not found / write raced): bytes
+  // were fetched but never got attached to a record; outcome 'failed', loud log.
+  test('onSuccess (patchIdea) returns false => failed, loud log, file_id untouched', async () => {
+    persistPhoto()
+    const calls = { logError: 0 }
+    const fx: DownloadAttachmentEffects = {
+      download: async () => '/tmp/photo-400.jpg',
+      onSuccess: () => false, // simulate record-not-found / write failure
+      logError: () => { calls.logError++ },
+    }
+    const outcome = await downloadIdeaAttachment(fx)
+    expect(outcome).toBe('failed')
+    expect(calls.logError).toBe(1)
+    expect(recordOf().attachment_file_id).toBe('AgAC-photo400')
+  })
+
+  // FAILURE (store patch throws): same loud failure path, never rejects.
+  test('onSuccess (patchIdea) throws => failed, loud log, never rejects', async () => {
+    persistPhoto()
+    const calls = { logError: 0 }
+    const fx: DownloadAttachmentEffects = {
+      download: async () => '/tmp/photo-400.jpg',
+      onSuccess: () => { throw new Error('disk full') },
+      logError: () => { calls.logError++ },
+    }
+    const outcome = await downloadIdeaAttachment(fx)
+    expect(outcome).toBe('failed')
+    expect(calls.logError).toBe(1)
   })
 })

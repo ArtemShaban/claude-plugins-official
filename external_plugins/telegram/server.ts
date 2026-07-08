@@ -26,8 +26,10 @@ import { join, extname, sep } from 'path'
 import {
   classifyRoute,
   persistIdea,
+  patchIdea,
   ideaInboxDir,
   dispatchIdeaRoute,
+  downloadIdeaAttachment,
   shouldSuppressReaction,
   transcribeCmd,
   transcribeVoiceIdea,
@@ -1189,28 +1191,47 @@ bot.on('message:text', async ctx => {
 
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
+  // Largest size is last in the array. file_id/size are read synchronously —
+  // BEFORE any network call — and always passed as the 4th (attachment) param,
+  // mirroring document/voice/audio/video below. This matters for the idea-inbox
+  // async route: it persists from `attachment` and RETURNS before the eager
+  // downloadImage callback below ever runs (see handleInbound) — without this,
+  // an async-captured photo idea persisted with NO file_id and NO bytes, an
+  // unrecoverable empty husk (Bot API has no history to retry from later).
+  const photos = ctx.message.photo
+  const best = photos[photos.length - 1]
   // Defer download until after the gate approves — any user can send photos,
   // and we don't want to burn API quota or fill the inbox for dropped messages.
-  await handleInbound(ctx, caption, async () => {
-    // Largest size is last in the array.
-    const photos = ctx.message.photo
-    const best = photos[photos.length - 1]
-    try {
-      const file = await ctx.api.getFile(best.file_id)
-      if (!file.file_path) return undefined
-      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-      const res = await fetch(url)
-      const buf = Buffer.from(await res.arrayBuffer())
-      const ext = file.file_path.split('.').pop() ?? 'jpg'
-      const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
-      mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
-      writeFileSync(path, buf)
-      return path
-    } catch (err) {
-      process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
-      return undefined
-    }
-  })
+  // This callback only runs on the 'work' route (image_path for inline Read);
+  // the idea-inbox async route downloads separately, into attachments/, via the
+  // downloadIdeaAttachment block in handleInbound (mirrors the voice transcribe-
+  // on-capture block) so a bare `file_id` is never the only thing that fires.
+  await handleInbound(
+    ctx,
+    caption,
+    async () => {
+      try {
+        const file = await ctx.api.getFile(best.file_id)
+        if (!file.file_path) return undefined
+        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+        const res = await fetch(url)
+        const buf = Buffer.from(await res.arrayBuffer())
+        const ext = file.file_path.split('.').pop() ?? 'jpg'
+        const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
+        mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+        writeFileSync(path, buf)
+        return path
+      } catch (err) {
+        process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
+        return undefined
+      }
+    },
+    {
+      kind: 'photo',
+      file_id: best.file_id,
+      size: best.file_size,
+    },
+  )
 })
 
 bot.on('message:document', async ctx => {
@@ -1401,18 +1422,22 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
-// Download a Telegram voice file by file_id into the idea-inbox attachments/
-// dir. Reuses the getFile + fetch pattern (cf. download_attachment / photo
-// download). Returns the local path, or undefined when no file is available
-// (expired / over the 20MB cap). Throws on a network/HTTP error (the caller's
-// orchestrator catches it and keeps the idea status:'new').
-async function downloadVoiceToInbox(
+// Download a Telegram file by file_id into the idea-inbox attachments/ dir.
+// Reuses the getFile + fetch pattern (cf. download_attachment / the work-route
+// photo download above). Shared by voice (transcribe-on-capture) and photo
+// (downloadIdeaAttachment, below) — kept as ONE function rather than a near-
+// duplicate per kind. Returns the local path, or undefined when no file is
+// available (expired / over the 20MB cap). Throws on a network/HTTP error (the
+// caller's orchestrator catches it and keeps the idea's existing status/
+// attachment_file_id — bytes are a best-effort enrichment, never load-bearing).
+async function downloadFileToInbox(
   file_id: string,
   dir: string,
-  sizeHint?: number,
+  sizeHint: number | undefined,
+  extFallback: string,
 ): Promise<string | undefined> {
   if (sizeHint != null && sizeHint > MAX_DOWNLOAD_BYTES) {
-    safeStderr(`telegram channel: voice ${file_id} is ${sizeHint}B > 20MB cap — skipping download\n`)
+    safeStderr(`telegram channel: file ${file_id} is ${sizeHint}B > 20MB cap — skipping download\n`)
     return undefined
   }
   const file = await bot.api.getFile(file_id)
@@ -1420,12 +1445,12 @@ async function downloadVoiceToInbox(
   if (file.file_size != null && file.file_size > MAX_DOWNLOAD_BYTES) return undefined
   const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
   const res = await fetch(url)
-  if (!res.ok) throw new Error(`voice download failed: HTTP ${res.status}`)
+  if (!res.ok) throw new Error(`file download failed: HTTP ${res.status}`)
   const buf = Buffer.from(await res.arrayBuffer())
   // file_path is Telegram-controlled (trusted) but strip to safe chars anyway.
-  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'oga'
-  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'oga'
-  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'voice'
+  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : extFallback
+  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || extFallback
+  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'file'
   const attachDir = join(dir, 'attachments')
   mkdirSync(attachDir, { recursive: true })
   const path = join(attachDir, `${Date.now()}-${uniqueId}.${ext}`)
@@ -1627,7 +1652,7 @@ async function handleInbound(
       reply_parameters: { message_id: msgId },
     }
     void transcribeVoiceIdea(TRANSCRIBE_CMD != null, {
-      download: () => downloadVoiceToInbox(fileId, voiceDir, sizeHint),
+      download: () => downloadFileToInbox(fileId, voiceDir, sizeHint, 'oga'),
       transcribe: audioPath => runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, 'ru'),
       onSuccess: (transcript, audioPath) => recordTranscript(voiceDir, recId, transcript, audioPath),
       replyTranscript: async transcript => {
@@ -1643,6 +1668,35 @@ async function handleInbound(
       logError: reason => safeStderr(`telegram channel: voice transcribe: ${reason}\n`),
       logNotice: reason => safeStderr(`telegram channel: voice transcribe: ${reason}\n`),
     }).catch(err => safeStderr(`telegram channel: voice transcribe crashed: ${err}\n`))
+  }
+
+  // Photo ideas: download bytes into attachments/ on capture (mirrors the voice
+  // block above). FIRE-AND-FORGET — never awaited, so a slow/failed download
+  // can't block or break the inbound capture path (the ✍ ack already fired
+  // inside dispatchIdeaRoute, and the record is ALREADY durable with its
+  // attachment_file_id at this point). FAIL-OPEN: downloadIdeaAttachment never
+  // touches attachment_file_id — a download/store failure just leaves the
+  // record without attachment_path, so a later triage pass can still retry the
+  // download from the file_id (never a total loss, unlike the pre-fix bug this
+  // whole block + the attachment param above fix). Only runs for a
+  // successfully-persisted async photo capture.
+  if (
+    ideaOutcome === 'persisted' &&
+    attachment?.kind === 'photo' &&
+    attachment.file_id &&
+    dir != null &&
+    msgId != null
+  ) {
+    const fileId = attachment.file_id
+    const sizeHint = attachment.size
+    const photoDir = dir
+    const recId = ideaId(chat_id, msgId)
+    void downloadIdeaAttachment({
+      download: () => downloadFileToInbox(fileId, photoDir, sizeHint, 'jpg'),
+      onSuccess: attachmentPath =>
+        patchIdea(join(photoDir, 'inbox.jsonl'), recId, { attachment_path: attachmentPath }),
+      logError: reason => safeStderr(`telegram channel: photo attachment: ${reason}\n`),
+    }).catch(err => safeStderr(`telegram channel: photo attachment download crashed: ${err}\n`))
   }
 
   if (!workRoute) return // async / persist-failed / ignored => session NOT woken
