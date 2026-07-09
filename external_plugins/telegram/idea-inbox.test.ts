@@ -36,6 +36,7 @@ import {
   VoiceReplyEffects,
   voiceSendOpts,
 } from './idea-inbox'
+import { ReactionQueue, type ReactionJob } from './reaction-queue'
 
 const ARTEM = '378650081'
 const SUPERGROUP = '-1001234567890'
@@ -430,6 +431,109 @@ describe('dispatchIdeaRoute — no-interrupt guarantee (AC3) [REAL seam]', () =>
     const outcome = dispatchIdeaRoute('ignore', 800, h.baseInput, h.fx)
     expect(outcome).toBe('ignored')
     expect(h.calls).toEqual({ persist: 0, react: 0, warnUser: 0, logError: 0, notify: 0 })
+  })
+})
+
+// ── idea-capture ✍ ack — reaction-queue wiring (only-idea-path invariant) ────
+//
+// server.ts's real binding is `react: () => { if (msgId != null)
+// ideaAckQueue.enqueue({ chat_id, message_id: msgId, emoji: IDEA_ACK_EMOJI })
+// }` (see reaction-queue.ts). These tests wire the REAL ReactionQueue class
+// through dispatchIdeaRoute exactly like server.ts does, so what's asserted
+// here is the actual production wiring, not a replica: a job must be enqueued
+// for every async+persisted capture (text/photo/voice alike) and for NOTHING
+// else — not 'work' topics, not DMs, not a persist failure, not 'ignore'.
+describe('idea-capture ✍ ack — reaction-queue wiring (only-idea-path invariant)', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'idea-inbox-ackqueue-'))
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  function fxWithQueue(queue: ReactionQueue, msgId: number, persistThrows = false): IdeaRouteEffects {
+    return {
+      persist: input => {
+        if (persistThrows) throw new Error('disk full')
+        persistIdea(dir, input)
+      },
+      react: () => queue.enqueue({ chat_id: SUPERGROUP, message_id: msgId, emoji: '✍' }),
+      warnUser: () => {},
+      logError: () => {},
+      notify: () => {},
+    }
+  }
+
+  // NOTE on timing: enqueue() is synchronous and dispatches the FIRST queued
+  // job's send() call within that very call stack (see reaction-queue.ts's
+  // spacing design — a lone/leading job sends with zero delay). Since this
+  // loop's three dispatchIdeaRoute calls run back-to-back with no `await`
+  // between them, we must wait for the queue to fully drain (via `onIdle`)
+  // before asserting `sent` — asserting synchronously right after the loop
+  // would only observe the first job.
+  test('async+persisted enqueues exactly one ✍ job per capture, for text/photo/voice alike', async () => {
+    const sent: ReactionJob[] = []
+    await new Promise<void>(resolve => {
+      const queue = new ReactionQueue({
+        send: async j => { sent.push(j); return { ok: true } },
+        sleep: async () => {},
+        logError: () => {},
+        onIdle: resolve,
+      })
+      const route = classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true)
+      for (const { kind, msgId } of [
+        { kind: 'text', msgId: 900 },
+        { kind: 'photo', msgId: 901 },
+        { kind: 'voice', msgId: 902 },
+      ]) {
+        const outcome = dispatchIdeaRoute(
+          route,
+          msgId,
+          { chat_id: SUPERGROUP, from_user_id: ARTEM, thread_id: IDEAS_THREAD, kind, text: 'x' },
+          fxWithQueue(queue, msgId),
+        )
+        expect(outcome).toBe('persisted')
+      }
+    })
+    expect(sent.length).toBe(3)
+    expect(sent.map(j => j.message_id)).toEqual([900, 901, 902])
+    expect(sent.every(j => j.emoji === '✍')).toBe(true)
+  })
+
+  test('work topic / DM / ignore / persist-failed NEVER enqueue a reaction job', () => {
+    const sent: ReactionJob[] = []
+    const queue = new ReactionQueue({
+      send: async j => { sent.push(j); return { ok: true } },
+      sleep: async () => {},
+      logError: () => {},
+    })
+    const baseInput = { chat_id: SUPERGROUP, from_user_id: ARTEM, thread_id: WORK_THREAD, kind: 'text', text: 'x' }
+
+    // work topic (named non-async thread)
+    dispatchIdeaRoute(
+      classifyRoute(access, SUPERGROUP, WORK_THREAD, true),
+      910,
+      baseInput,
+      fxWithQueue(queue, 910),
+    )
+    // DM — always 'work', never async
+    dispatchIdeaRoute(
+      classifyRoute(access, ARTEM, undefined, true),
+      911,
+      { ...baseInput, chat_id: ARTEM, thread_id: undefined },
+      fxWithQueue(queue, 911),
+    )
+    // ignore route (unconfigured chat)
+    dispatchIdeaRoute('ignore', 912, baseInput, fxWithQueue(queue, 912))
+    // async route but persist throws => persist-failed, no false ✍
+    dispatchIdeaRoute(
+      classifyRoute(access, SUPERGROUP, IDEAS_THREAD, true),
+      913,
+      { ...baseInput, thread_id: IDEAS_THREAD },
+      fxWithQueue(queue, 913, true),
+    )
+
+    expect(sent.length).toBe(0)
+    expect(queue.pending).toBe(0)
   })
 })
 

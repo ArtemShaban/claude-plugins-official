@@ -39,6 +39,7 @@ import {
   sendVoiceReply,
   voiceSendOpts,
 } from './idea-inbox'
+import { ReactionQueue, type ReactionJob } from './reaction-queue'
 import { checkOutboundAllowed, recordSeenGroup, type SeenGroup } from './group-access'
 import {
   appendToGroupBuffer,
@@ -296,6 +297,39 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
+
+// Idea-capture ✍ ack queue (reaction-queue.ts). Replaces the old direct,
+// unbounded `bot.api.setMessageReaction` fire-and-forget call in the
+// idea-inbox `react:` binding below: when Артём mass-forwards ~30 ideas into
+// the ideas group, that many concurrent reaction calls used to race
+// Telegram's ~20 reactions/min throttle and silently drop most of them (owner
+// bug-report msg 2806). Routing every idea-capture ack through this single
+// serial queue paces sends and retries a 429 once — see reaction-queue.ts.
+// Emoji is configurable (TG_IDEA_ACK_EMOJI) so a deploy can change the ack
+// glyph without a code change; default matches the prior hardcoded '✍'.
+const IDEA_ACK_EMOJI = process.env.TG_IDEA_ACK_EMOJI?.trim() || '✍'
+
+const ideaAckQueue = new ReactionQueue({
+  send: async (job: ReactionJob) => {
+    try {
+      await bot.api.setMessageReaction(job.chat_id, job.message_id, [
+        { type: 'emoji', emoji: job.emoji as ReactionTypeEmoji['emoji'] },
+      ])
+      return { ok: true } as const
+    } catch (err) {
+      if (err instanceof GrammyError && err.error_code === 429) {
+        return { ok: false, retryAfterSec: err.parameters?.retry_after, error: err } as const
+      }
+      return { ok: false, error: err } as const
+    }
+  },
+  sleep: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
+  // Fail-open (CLAUDE.md §0): a dropped ✍ ack is a cosmetic receipt, never
+  // worth breaking the idea-capture path over — this is a one-line log, not a
+  // thrown error and not a user-facing warning (unlike a real persist failure,
+  // which already gets warnUser() in idea-inbox.ts's dispatchIdeaRoute).
+  logError: reason => process.stderr.write(`telegram channel: ${reason}\n`),
+})
 
 type PendingEntry = {
   senderId: string
@@ -1606,13 +1640,12 @@ async function handleInbound(
       persist: input => persistIdea(dir!, input),
       // Quiet ✍ ack via a reaction (NOT a new message, so no push ping).
       // dispatchIdeaRoute only calls react() when msgId is proven non-null.
+      // Enqueued (not sent directly) — see the ideaAckQueue comment above and
+      // reaction-queue.ts: a burst of mass-forwarded ideas must not fire N
+      // concurrent setMessageReaction calls that race Telegram's rate limit.
       react: () => {
         if (msgId != null) {
-          void bot.api
-            .setMessageReaction(chat_id, msgId, [
-              { type: 'emoji', emoji: '✍' as ReactionTypeEmoji['emoji'] },
-            ])
-            .catch(() => {})
+          ideaAckQueue.enqueue({ chat_id, message_id: msgId, emoji: IDEA_ACK_EMOJI })
         }
       },
       warnUser: () => {
