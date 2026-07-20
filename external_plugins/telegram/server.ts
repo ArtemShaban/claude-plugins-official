@@ -51,6 +51,14 @@ import {
   type BufferEntry,
 } from './group-buffer'
 import { sendWithAutoFormat } from './telegram-format'
+import {
+  buildChecklist,
+  applyToggle,
+  renderChecklist,
+  buttonLabel,
+  parseCallbackData as parseChecklistCallbackData,
+  type ChecklistItem,
+} from './checklist'
 import { spawn } from 'child_process'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -757,6 +765,36 @@ const mcp = new Server(
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
+// Checklist state cache (chat_id:message_id → last known header+items) —
+// same category as pendingPermissions above: in-process, ephemeral, NOT a
+// database. checklist.ts's state design is "re-parse from the message
+// itself" precisely so a bot restart never bricks an old checklist (see its
+// module doc comment) — this cache is layered ON TOP purely to close a
+// narrower gap that re-parsing alone can't: Telegram bakes
+// `callback_query.message` into the update AT TAP TIME, so two very fast
+// taps generated a few ms apart can both carry the SAME pre-edit snapshot
+// even though grammY's bot.start() (no @grammyjs/runner here — see
+// package.json) processes updates one at a time. Preferring this cache when
+// present (and always refreshing it after a successful edit) makes toggles
+// correct while the process has been running continuously; a cache MISS
+// (bot just restarted) falls straight back to re-parsing the message, so
+// old checklists keep working — the cache is a pure optimization, never a
+// correctness requirement.
+const CHECKLIST_CACHE_MAX = 500
+const checklistCache = new Map<string, { header: string; items: ChecklistItem[] }>()
+function checklistCacheKey(chatId: string | number, messageId: number): string {
+  return `${chatId}:${messageId}`
+}
+function rememberChecklist(chatId: string | number, messageId: number, header: string, items: ChecklistItem[]): void {
+  const key = checklistCacheKey(chatId, messageId)
+  checklistCache.delete(key) // re-insert to move to the end (poor man's LRU)
+  checklistCache.set(key, { header, items })
+  if (checklistCache.size > CHECKLIST_CACHE_MAX) {
+    const oldest = checklistCache.keys().next().value
+    if (oldest !== undefined) checklistCache.delete(oldest)
+  }
+}
+
 // Receive permission_request from CC → format → send to all allowlisted DMs.
 // Groups are intentionally excluded — the security thread resolution was
 // "single-user mode for official plugins." Anyone in access.allowFrom
@@ -793,7 +831,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id (forum topic) to land the reply in the right topic, files (absolute paths) to attach images or documents, and voice:true to ALSO send a voice bubble (TTS of the same text) in addition to the text.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id (forum topic) to land the reply in the right topic, files (absolute paths) to attach images or documents, voice:true to ALSO send a voice bubble (TTS of the same text) in addition to the text, and checklist (array of item strings) to send a tappable checklist instead of a plain reply.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -820,6 +858,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           voice: {
             type: 'boolean',
             description: 'When true, AFTER sending the text reply, ALSO send a Telegram voice bubble (TTS of the same text). Best-effort: if TTS is unavailable or fails, the text reply still succeeds (the bubble is silently dropped). No effect when text is empty.',
+          },
+          checklist: {
+            type: 'array',
+            items: { type: 'string' },
+            description: "Optional. When provided (non-empty), sends `text` as a header followed by one tappable inline button per item instead of a plain reply — tapping an item toggles it (☐/✅ on the button, struck-through in the message text) with no server-side database; state is re-derived from the message itself, so it survives a bot restart. Cannot be combined with files or voice (send those as a separate reply). Max ~100 items (Telegram's inline-button limit); each item renders as a single line (embedded newlines are flattened).",
           },
         },
         required: ['chat_id', 'text'],
@@ -896,6 +939,47 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           message_thread_id != null ? { message_thread_id } : {}
 
         assertAllowedChat(chat_id)
+
+        // Opt-in checklist path (owner msg 5347, 2026-07-20). Absent/empty
+        // `checklist` falls straight through to the unchanged code below —
+        // this branch always `return`s, so it can never affect the plain-
+        // reply path's behavior. See checklist.ts for the render/parse/
+        // toggle logic and its "no database" state design.
+        if (args.checklist != null) {
+          const checklistRaw = args.checklist
+          if (!Array.isArray(checklistRaw) || !checklistRaw.every(x => typeof x === 'string')) {
+            throw new Error('checklist must be an array of strings')
+          }
+          if (checklistRaw.length > 0 && (files.length > 0 || args.voice === true)) {
+            throw new Error('checklist cannot be combined with files or voice — send those as a separate reply')
+          }
+          if (checklistRaw.length === 0) {
+            // Explicit empty array: treat as "no checklist" rather than a
+            // hard error, so a caller that computes an empty list at
+            // runtime degrades to a plain reply instead of throwing.
+          } else {
+            const built = buildChecklist(text, checklistRaw)
+            const checklistSendOpts = {
+              ...threadOpt,
+              ...(reply_to != null ? { reply_parameters: { message_id: reply_to } } : {}),
+              reply_markup: { inline_keyboard: built.keyboard },
+            }
+            const sent = await sendWithAutoFormat(
+              (chunkText, chunkParseMode) =>
+                bot.api.sendMessage(chat_id, chunkText, {
+                  ...checklistSendOpts,
+                  ...(chunkParseMode ? { parse_mode: chunkParseMode } : {}),
+                }),
+              built.text,
+            )
+            rememberChecklist(chat_id, sent.message_id, built.header, built.items)
+            return {
+              content: [
+                { type: 'text', text: `sent checklist (id: ${sent.message_id}, ${built.items.length} items)` },
+              ],
+            }
+          }
+        }
 
         for (const f of files) {
           assertSendable(f)
@@ -1160,11 +1244,91 @@ bot.command('status', async ctx => {
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
 
-// Inline-button handler for permission requests. Callback data is
-// `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
+// Inline-button handler for permission requests AND checklist toggles.
+// Checklist callback data is `chk:<idx>` — see checklist.ts for the
+// render/parse/toggle logic and its "state lives in the message, not a
+// database" design, and the checklistCache comment above for the narrow
+// race it additionally guards against. Permission callback data is
+// `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>` (unchanged).
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+
+  const chkIdx = parseChecklistCallbackData(data)
+  if (chkIdx != null) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+
+    const msg = ctx.callbackQuery.message
+    if (msg == null) {
+      await ctx.answerCallbackQuery({ text: 'Checklist no longer available.' }).catch(() => {})
+      return
+    }
+    const chatId = msg.chat.id
+    const hasLiveKeyboard = 'text' in msg && !!msg.text && msg.reply_markup != null
+    const liveKeyboard = hasLiveKeyboard ? msg.reply_markup!.inline_keyboard : null
+    const liveText = hasLiveKeyboard ? (msg as { text: string }).text : null
+
+    const key = checklistCacheKey(chatId, msg.message_id)
+    const cached = checklistCache.get(key)
+    // Trust the cache only if it still agrees with what's ACTUALLY on the
+    // message right now (cheap single-button check) — guards against an
+    // out-of-band edit (the owner editing the message himself, or anything
+    // else) landing between our last write and this tap; see the
+    // checklistCache comment above for why the cache exists at all. A stale
+    // or absent cache falls through to a full re-parse via applyToggle,
+    // which independently cross-validates the whole message and fails safe.
+    const cacheIsFresh =
+      cached != null &&
+      liveKeyboard != null &&
+      chkIdx >= 0 &&
+      chkIdx < cached.items.length &&
+      liveKeyboard[chkIdx]?.length === 1 &&
+      liveKeyboard[chkIdx][0].text === buttonLabel(cached.items[chkIdx].text, cached.items[chkIdx].checked)
+
+    let header: string
+    let items: ChecklistItem[]
+    if (cached && cacheIsFresh) {
+      header = cached.header
+      items = cached.items.map((it, i) => (i === chkIdx ? { ...it, checked: !it.checked } : it))
+    } else {
+      if (liveText == null || liveKeyboard == null) {
+        await ctx.answerCallbackQuery({ text: 'Checklist no longer available.' }).catch(() => {})
+        return
+      }
+      const result = applyToggle(liveText, liveKeyboard, chkIdx)
+      if (!result.ok) {
+        await ctx.answerCallbackQuery({ text: `Can't update: ${result.reason}` }).catch(() => {})
+        return
+      }
+      header = result.built.header
+      items = result.built.items
+    }
+
+    const built = renderChecklist(header, items)
+    try {
+      await sendWithAutoFormat(
+        (text, parseMode) =>
+          ctx.editMessageText(text, {
+            reply_markup: { inline_keyboard: built.keyboard },
+            ...(parseMode ? { parse_mode: parseMode } : {}),
+          }),
+        built.text,
+      )
+    } catch {
+      await ctx.answerCallbackQuery({ text: 'Update failed — try again.' }).catch(() => {})
+      return
+    }
+    rememberChecklist(chatId, msg.message_id, built.header, built.items)
+    const label = built.keyboard[chkIdx]?.[0]?.text
+    await ctx.answerCallbackQuery(label ? { text: label } : undefined).catch(() => {})
+    return
+  }
+
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})
