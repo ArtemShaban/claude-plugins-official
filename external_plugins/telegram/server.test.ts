@@ -665,3 +665,88 @@ console.log(JSON.stringify(dispatchInput))
     }
   })
 })
+
+// The 'reply' tool's checklist guard (2026-07-20, owner msg 5347) is NOT
+// exported — server.ts requires a real bot token to import (see the
+// message:photo section's comment above for why every server.ts-internal
+// test in this file uses this reproduction pattern instead). This
+// reproduces the guard VERBATIM from the 'reply' case: absent/empty
+// `checklist` must fall through to the SAME 'plain reply, unchanged' marker
+// every existing caller already reaches; a non-empty checklist takes the
+// new early-return path and never reaches that marker; checklist+files (or
+// +voice) throws rather than silently combining them.
+describe("reply tool's checklist param — absent-path parity + opt-in dispatch", () => {
+  function checklistGuardScript(checklistJson: string, filesJson: string, voiceJson: string): string {
+    const checklistModule = JSON.stringify(join(import.meta.dir, 'checklist.ts'))
+    return /* js */ `
+import { buildChecklist } from ${checklistModule}
+
+const text = 'header'
+const files = ${filesJson}
+const args = { checklist: ${checklistJson}, voice: ${voiceJson} }
+
+// ---- verbatim copy of the 'reply' case's checklist guard (server.ts) ----
+let path = 'OLD_PLAIN_REPLY_PATH' // what every existing caller reaches today
+if (args.checklist != null) {
+  const checklistRaw = args.checklist
+  if (!Array.isArray(checklistRaw) || !checklistRaw.every(x => typeof x === 'string')) {
+    throw new Error('checklist must be an array of strings')
+  }
+  if (checklistRaw.length > 0 && (files.length > 0 || args.voice === true)) {
+    throw new Error('checklist cannot be combined with files or voice — send those as a separate reply')
+  }
+  if (checklistRaw.length === 0) {
+    // fall through to the plain-reply path below (unchanged)
+  } else {
+    const built = buildChecklist(text, checklistRaw)
+    path = 'CHECKLIST_PATH:' + built.items.length
+  }
+}
+// ---------------------------------------------------------------------
+
+console.log(JSON.stringify({ path }))
+`
+  }
+
+  function runGuard(checklistJson: string, filesJson = '[]', voiceJson = 'undefined'): { status: number | null; stdout: string; stderr: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'checklist-guard-'))
+    try {
+      const scriptPath = join(dir, 'guard.mjs')
+      writeFileSync(scriptPath, checklistGuardScript(checklistJson, filesJson, voiceJson))
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      return { status: result.status, stdout: result.stdout, stderr: result.stderr }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  test('checklist ABSENT (undefined) reaches the exact same plain-reply marker every caller reaches today', () => {
+    const { status, stdout, stderr } = runGuard('undefined')
+    expect(status, `script failed: ${stderr}`).toBe(0)
+    expect(JSON.parse(stdout.trim()).path).toBe('OLD_PLAIN_REPLY_PATH')
+  })
+
+  test('checklist as an explicit empty array ALSO falls through to the plain-reply marker (degrades, does not throw)', () => {
+    const { status, stdout, stderr } = runGuard('[]')
+    expect(status, `script failed: ${stderr}`).toBe(0)
+    expect(JSON.parse(stdout.trim()).path).toBe('OLD_PLAIN_REPLY_PATH')
+  })
+
+  test('a non-empty checklist takes the NEW path and never reaches the plain-reply marker', () => {
+    const { status, stdout, stderr } = runGuard(JSON.stringify(['buy milk', 'buy eggs']))
+    expect(status, `script failed: ${stderr}`).toBe(0)
+    expect(JSON.parse(stdout.trim()).path).toBe('CHECKLIST_PATH:2')
+  })
+
+  test('checklist + files throws instead of silently combining them', () => {
+    const { status, stderr } = runGuard(JSON.stringify(['a']), JSON.stringify(['/tmp/x.png']))
+    expect(status).not.toBe(0)
+    expect(stderr).toMatch(/cannot be combined with files or voice/)
+  })
+
+  test('checklist + voice:true throws instead of silently combining them', () => {
+    const { status, stderr } = runGuard(JSON.stringify(['a']), '[]', 'true')
+    expect(status).not.toBe(0)
+    expect(stderr).toMatch(/cannot be combined with files or voice/)
+  })
+})
