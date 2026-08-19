@@ -750,3 +750,141 @@ console.log(JSON.stringify({ path }))
     expect(stderr).toMatch(/cannot be combined with files or voice/)
   })
 })
+
+// ── reply tool's voice:true path — ONE message (sendVoice+caption) when it ──
+// fits, falling back to the original text+voice pair otherwise (owner order
+// tg 10360, 2026-08-19: voice:true used to always fire TWO messages — the
+// text reply, then a separate TTS bubble seconds later).
+//
+// Same subprocess-script idiom as the checklist guard above: server.ts can't
+// be imported directly (top-level `bot.start()` polling with a real token),
+// so this reproduces the reply case's new combined-voice control flow
+// VERBATIM, importing the REAL buildVoiceCaption (telegram-format.ts) and
+// sendVoiceReply (idea-inbox.ts) — only the Telegram API boundary
+// (bot.api.sendMessage / bot.api.sendVoice) is mocked.
+describe("reply tool's voice:true path — combined caption vs. text+voice pair", () => {
+  function combinedVoiceScript(textJson: string, ttsConfiguredJson: string, ttsShouldFailJson: string): string {
+    const telegramFormatModule = JSON.stringify(join(import.meta.dir, 'telegram-format.ts'))
+    const ideaInboxModule = JSON.stringify(join(import.meta.dir, 'idea-inbox.ts'))
+    return /* js */ `
+import { buildVoiceCaption } from ${telegramFormatModule}
+import { sendVoiceReply } from ${ideaInboxModule}
+
+const text = ${textJson}
+const format = 'auto'
+const ttsConfigured = ${ttsConfiguredJson}
+const ttsShouldFail = ${ttsShouldFailJson}
+const calls = { sendMessage: 0, sendVoice: 0, sendVoiceHadCaption: false }
+
+// ---- verbatim copy of the 'reply' case's combined-voice control flow (server.ts) ----
+// args.voice === true && text.trim() && files.length === 0 (always true here)
+let voiceNote = ''
+let combinedVoiceSent = false
+{
+  const captionCandidate = buildVoiceCaption(text, format)
+  if (captionCandidate != null && ttsConfigured) {
+    const outcome = await sendVoiceReply(true, '/tmp/combined.ogg', {
+      synthesize: async () => { if (ttsShouldFail) throw new Error('tts boom') },
+      sendVoice: async () => {
+        calls.sendVoice++
+        calls.sendVoiceHadCaption = true
+      },
+      cleanup: () => {},
+      logError: () => {},
+    })
+    if (outcome === 'sent') {
+      combinedVoiceSent = true
+      voiceNote = ' +voice'
+    }
+  }
+}
+
+if (!combinedVoiceSent) {
+  // the plain-text sendMessage path
+  calls.sendMessage++
+
+  // the OLD best-effort voice-bubble block (unchanged), still guarded by
+  // args.voice === true && text.trim()
+  const outcome = await sendVoiceReply(ttsConfigured, '/tmp/pair.ogg', {
+    synthesize: async () => { if (ttsShouldFail) throw new Error('tts boom') },
+    sendVoice: async () => { calls.sendVoice++ },
+    cleanup: () => {},
+    logError: () => {},
+  })
+  voiceNote =
+    outcome === 'sent' ? ' +voice' : outcome === 'failed' ? ' (voice bubble failed; text sent)' : ''
+}
+// ---------------------------------------------------------------------------
+
+console.log(JSON.stringify({ calls, voiceNote, combinedVoiceSent }))
+`
+  }
+
+  function runCombinedVoice(
+    text: string,
+    ttsConfigured: boolean,
+    ttsShouldFail: boolean,
+  ): { status: number | null; stdout: string; stderr: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'combined-voice-'))
+    try {
+      const scriptPath = join(dir, 'guard.mjs')
+      writeFileSync(
+        scriptPath,
+        combinedVoiceScript(JSON.stringify(text), JSON.stringify(ttsConfigured), JSON.stringify(ttsShouldFail)),
+      )
+      const result = spawnSync('bun', ['run', scriptPath], { encoding: 'utf8', timeout: 5000 })
+      return { status: result.status, stdout: result.stdout, stderr: result.stderr }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  test('(a) text <=1024 chars + TTS ok => exactly ONE sendVoice call with caption, ZERO sendMessage', () => {
+    const shortText = 'a'.repeat(500)
+    const { status, stdout, stderr } = runCombinedVoice(shortText, true, false)
+    expect(status, `script failed: ${stderr}`).toBe(0)
+    const out = JSON.parse(stdout.trim())
+    expect(out.calls).toEqual({ sendMessage: 0, sendVoice: 1, sendVoiceHadCaption: true })
+    expect(out.combinedVoiceSent).toBe(true)
+    expect(out.voiceNote).toBe(' +voice')
+  })
+
+  test('(b) text >1024 chars => falls back to the current text+voice pair (one sendMessage, one plain sendVoice)', () => {
+    const longText = 'a'.repeat(1025)
+    const { status, stdout, stderr } = runCombinedVoice(longText, true, false)
+    expect(status, `script failed: ${stderr}`).toBe(0)
+    const out = JSON.parse(stdout.trim())
+    expect(out.calls).toEqual({ sendMessage: 1, sendVoice: 1, sendVoiceHadCaption: false })
+    expect(out.combinedVoiceSent).toBe(false)
+    expect(out.voiceNote).toBe(' +voice')
+  })
+
+  test('(c) TTS synthesis failure => text-only sendMessage, no sendVoice call at all, text never lost', () => {
+    const shortText = 'a'.repeat(500)
+    const { status, stdout, stderr } = runCombinedVoice(shortText, true, true)
+    expect(status, `script failed: ${stderr}`).toBe(0)
+    const out = JSON.parse(stdout.trim())
+    expect(out.calls).toEqual({ sendMessage: 1, sendVoice: 0, sendVoiceHadCaption: false })
+    expect(out.combinedVoiceSent).toBe(false)
+    expect(out.voiceNote).toBe(' (voice bubble failed; text sent)')
+  })
+
+  test('TTS not configured at all => text-only sendMessage, skips gracefully (no crash, no sendVoice)', () => {
+    const shortText = 'a'.repeat(500)
+    const { status, stdout, stderr } = runCombinedVoice(shortText, false, false)
+    expect(status, `script failed: ${stderr}`).toBe(0)
+    const out = JSON.parse(stdout.trim())
+    expect(out.calls).toEqual({ sendMessage: 1, sendVoice: 0, sendVoiceHadCaption: false })
+    expect(out.combinedVoiceSent).toBe(false)
+    expect(out.voiceNote).toBe('')
+  })
+
+  test('boundary: exactly 1024 chars (auto format, plain ASCII => HTML output same length) still combines', () => {
+    const boundaryText = 'a'.repeat(1024)
+    const { status, stdout, stderr } = runCombinedVoice(boundaryText, true, false)
+    expect(status, `script failed: ${stderr}`).toBe(0)
+    const out = JSON.parse(stdout.trim())
+    expect(out.combinedVoiceSent).toBe(true)
+    expect(out.calls.sendMessage).toBe(0)
+  })
+})

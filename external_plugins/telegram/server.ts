@@ -50,7 +50,7 @@ import {
   writeContextBufferFile,
   type BufferEntry,
 } from './group-buffer'
-import { sendWithAutoFormat } from './telegram-format'
+import { sendWithAutoFormat, buildVoiceCaption } from './telegram-format'
 import {
   buildChecklist,
   applyToggle,
@@ -989,82 +989,132 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
-        const access = loadAccess()
-        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-        const mode = access.chunkMode ?? 'length'
-        const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
-
-        try {
-          for (let i = 0; i < chunks.length; i++) {
-            const shouldReplyTo =
-              reply_to != null &&
-              replyMode !== 'off' &&
-              (replyMode === 'all' || i === 0)
-            const sendOpts = {
-              ...threadOpt,
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-            }
-            const sent =
-              format === 'auto'
-                ? await sendWithAutoFormat(
-                    (chunkText, chunkParseMode) =>
-                      bot.api.sendMessage(chat_id, chunkText, {
-                        ...sendOpts,
-                        ...(chunkParseMode ? { parse_mode: chunkParseMode } : {}),
-                      }),
-                    chunks[i],
-                  )
-                : await bot.api.sendMessage(chat_id, chunks[i], {
-                    ...sendOpts,
-                    ...(parseMode ? { parse_mode: parseMode } : {}),
-                  })
-            sentIds.push(sent.message_id)
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(
-            `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
-          )
-        }
-
-        // Files go as separate messages (Telegram doesn't mix text+file in one
-        // sendMessage call). Thread under reply_to if present.
-        for (const f of files) {
-          const ext = extname(f).toLowerCase()
-          const input = new InputFile(f)
-          const opts = {
-            ...threadOpt,
-            ...(reply_to != null && replyMode !== 'off'
-              ? { reply_parameters: { message_id: reply_to } }
-              : {}),
-          }
-          if (PHOTO_EXTS.has(ext)) {
-            const sent = await bot.api.sendPhoto(chat_id, input, opts)
-            sentIds.push(sent.message_id)
-          } else {
-            const sent = await bot.api.sendDocument(chat_id, input, opts)
-            sentIds.push(sent.message_id)
-          }
-        }
-
-        // Voice bubble (voice:true): the TEXT is already delivered above; this is
-        // a BEST-EFFORT extra — sendVoiceReply swallows every failure so a TTS /
-        // sendVoice error can never turn the successful text reply into an error.
         let voiceNote = ''
-        if (args.voice === true && text.trim()) {
-          const oggPath = join(tmpdir(), `tg-voice-${randomBytes(6).toString('hex')}.ogg`)
-          const outcome = await sendVoiceReply(TTS_CMD != null, oggPath, {
-            synthesize: out => runTtsCmd(TTS_CMD!, text, out, 'ru'),
-            sendVoice: async ogg => {
-              await bot.api.sendVoice(chat_id, new InputFile(ogg), voiceSendOpts(message_thread_id, reply_to))
-            },
-            cleanup: ogg => { try { unlinkSync(ogg) } catch {} },
-            logError: reason => safeStderr(`telegram channel: voice reply: ${reason}\n`),
-          })
-          voiceNote =
-            outcome === 'sent' ? ' +voice' : outcome === 'failed' ? ' (voice bubble failed; text sent)' : ''
+
+        // Combined voice+caption path (owner order tg 10360, 2026-08-19): the
+        // OLD behavior always sent TWO messages for voice:true — the text
+        // reply, then a separate TTS voice bubble seconds later. When the
+        // rendered text fits Telegram's caption cap (buildVoiceCaption / 1024
+        // chars) and TTS is configured, send ONE message instead — the voice
+        // bubble WITH the text as its caption — and skip the plain-text
+        // sendMessage below entirely. Restricted to the no-files case (files
+        // already send as their own separate messages; combining caption +
+        // files + voice into one turn hasn't been asked for and adds
+        // combinatorial risk for no requested benefit).
+        //
+        // ANY disqualifier — text too long, no TTS configured, TTS synthesis
+        // failure, or the sendVoice-with-caption call itself throwing — falls
+        // straight through (combinedVoiceSent stays false) to the ORIGINAL,
+        // untouched pair-of-messages code below. That is deliberate: the
+        // "text always sends even if voice fails" contract must never depend
+        // on this new path succeeding.
+        let combinedVoiceSent = false
+        if (args.voice === true && text.trim() && files.length === 0) {
+          const captionCandidate = buildVoiceCaption(text, format)
+          if (captionCandidate != null && TTS_CMD != null) {
+            const oggPath = join(tmpdir(), `tg-voice-${randomBytes(6).toString('hex')}.ogg`)
+            const outcome = await sendVoiceReply(true, oggPath, {
+              synthesize: out => runTtsCmd(TTS_CMD!, text, out, 'ru'),
+              sendVoice: async ogg => {
+                const sendOpts = {
+                  ...voiceSendOpts(message_thread_id, reply_to),
+                  caption: captionCandidate.text,
+                  ...(captionCandidate.parseMode ? { parse_mode: captionCandidate.parseMode } : {}),
+                }
+                const sent = await bot.api.sendVoice(chat_id, new InputFile(ogg), sendOpts)
+                sentIds.push(sent.message_id)
+              },
+              cleanup: ogg => { try { unlinkSync(ogg) } catch {} },
+              logError: reason => safeStderr(`telegram channel: voice+caption combined: ${reason}\n`),
+            })
+            if (outcome === 'sent') {
+              combinedVoiceSent = true
+              voiceNote = ' +voice'
+            } else {
+              // 'failed': the combined attempt already consumed sentIds only
+              // on success, so nothing to unwind — fall through below.
+              safeStderr('telegram channel: voice+caption combined send failed, falling back to text+voice pair\n')
+            }
+          }
+        }
+
+        if (!combinedVoiceSent) {
+          const access = loadAccess()
+          const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+          const mode = access.chunkMode ?? 'length'
+          const replyMode = access.replyToMode ?? 'first'
+          const chunks = chunk(text, limit, mode)
+
+          try {
+            for (let i = 0; i < chunks.length; i++) {
+              const shouldReplyTo =
+                reply_to != null &&
+                replyMode !== 'off' &&
+                (replyMode === 'all' || i === 0)
+              const sendOpts = {
+                ...threadOpt,
+                ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+              }
+              const sent =
+                format === 'auto'
+                  ? await sendWithAutoFormat(
+                      (chunkText, chunkParseMode) =>
+                        bot.api.sendMessage(chat_id, chunkText, {
+                          ...sendOpts,
+                          ...(chunkParseMode ? { parse_mode: chunkParseMode } : {}),
+                        }),
+                      chunks[i],
+                    )
+                  : await bot.api.sendMessage(chat_id, chunks[i], {
+                      ...sendOpts,
+                      ...(parseMode ? { parse_mode: parseMode } : {}),
+                    })
+              sentIds.push(sent.message_id)
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            throw new Error(
+              `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
+            )
+          }
+
+          // Files go as separate messages (Telegram doesn't mix text+file in one
+          // sendMessage call). Thread under reply_to if present.
+          for (const f of files) {
+            const ext = extname(f).toLowerCase()
+            const input = new InputFile(f)
+            const opts = {
+              ...threadOpt,
+              ...(reply_to != null && replyMode !== 'off'
+                ? { reply_parameters: { message_id: reply_to } }
+                : {}),
+            }
+            if (PHOTO_EXTS.has(ext)) {
+              const sent = await bot.api.sendPhoto(chat_id, input, opts)
+              sentIds.push(sent.message_id)
+            } else {
+              const sent = await bot.api.sendDocument(chat_id, input, opts)
+              sentIds.push(sent.message_id)
+            }
+          }
+
+          // Voice bubble (voice:true): the TEXT is already delivered above; this is
+          // a BEST-EFFORT extra — sendVoiceReply swallows every failure so a TTS /
+          // sendVoice error can never turn the successful text reply into an error.
+          if (args.voice === true && text.trim()) {
+            const oggPath = join(tmpdir(), `tg-voice-${randomBytes(6).toString('hex')}.ogg`)
+            const outcome = await sendVoiceReply(TTS_CMD != null, oggPath, {
+              synthesize: out => runTtsCmd(TTS_CMD!, text, out, 'ru'),
+              sendVoice: async ogg => {
+                await bot.api.sendVoice(chat_id, new InputFile(ogg), voiceSendOpts(message_thread_id, reply_to))
+              },
+              cleanup: ogg => { try { unlinkSync(ogg) } catch {} },
+              logError: reason => safeStderr(`telegram channel: voice reply: ${reason}\n`),
+            })
+            voiceNote =
+              outcome === 'sent' ? ' +voice' : outcome === 'failed' ? ' (voice bubble failed; text sent)' : ''
+          }
         }
 
         const result =
