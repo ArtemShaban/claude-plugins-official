@@ -227,6 +227,65 @@ export function markdownToTelegramHtml(source: string): string {
   return text
 }
 
+// ── voice-reply caption combining (owner order tg 10360, 2026-08-19) ─────────
+//
+// PROBLEM: voice:true previously always produced TWO Telegram messages — the
+// text reply, then a separate TTS voice bubble seconds later. Telegram lets a
+// sendVoice call carry a `caption` (same as sendPhoto/sendDocument), capped at
+// 1024 chars — far below sendMessage's 4096. When the rendered text fits, the
+// reply tool can send ONE message: the voice bubble WITH the text attached.
+//
+// buildVoiceCaption() is the pure decision: given the same `text` + `format`
+// the plain-text path would have used, does a single-message caption fit, and
+// in what already-rendered form (so the caption LOOKS like what the text
+// reply would have shown — same HTML/MarkdownV2/plain rendering)? Returns
+// undefined when it doesn't fit or the converter throws — the caller (server.
+// ts) falls back to the original pair-of-messages path in that case, so the
+// "text always sends" invariant never depends on this function succeeding.
+
+/** Telegram Bot API's hard cap on media captions (sendVoice/sendPhoto/
+ * sendDocument/...) — independent of, and much smaller than, sendMessage's
+ * 4096-char text limit. */
+export const CAPTION_MAX = 1024
+
+export type VoiceCaptionCandidate = { text: string; parseMode: 'HTML' | 'MarkdownV2' | undefined }
+
+/**
+ * Decide whether `rawText` can ride along as a Telegram sendVoice caption
+ * instead of a separate sendMessage, mirroring the reply tool's own `format`
+ * handling (auto/text/markdownv2) so the caption renders identically to what
+ * the plain-text reply would have shown:
+ *  - 'markdownv2': caller-pre-escaped text, checked as-is (no conversion).
+ *  - 'text':       fully literal text, checked as-is (no conversion).
+ *  - 'auto' (default): run the markdown->HTML converter, check the HTML
+ *    output's length (that's what Telegram would actually receive).
+ * Returns undefined (no candidate — fall back) when the checked text exceeds
+ * CAPTION_MAX, or ('auto' only) the converter throws.
+ */
+export function buildVoiceCaption(
+  rawText: string,
+  format: string,
+  convert: (s: string) => string = markdownToTelegramHtml,
+): VoiceCaptionCandidate | undefined {
+  if (format === 'markdownv2') {
+    return rawText.length <= CAPTION_MAX ? { text: rawText, parseMode: 'MarkdownV2' } : undefined
+  }
+  if (format === 'text') {
+    return rawText.length <= CAPTION_MAX ? { text: rawText, parseMode: undefined } : undefined
+  }
+  // 'auto' — markdownToTelegramHtml doesn't throw by contract (malformed
+  // markdown falls through as literal escaped text), but guard anyway: a
+  // converter bug must degrade to the safe pair-of-messages path, never crash
+  // the reply.
+  let html: string
+  try {
+    html = convert(rawText)
+  } catch {
+    return undefined
+  }
+  return html.length <= CAPTION_MAX ? { text: html, parseMode: 'HTML' } : undefined
+}
+
 /**
  * Send (or edit) with auto-formatting AND a mandatory plain-text fallback.
  *
