@@ -224,8 +224,14 @@ describe('transcribeFlags', () => {
     ])
   })
 
-  test('non-owner sender => only --no-recall, no owner-log flags at all', () => {
-    expect(transcribeFlags(false, 42, -100555)).toEqual(['--no-recall'])
+  test('non-owner sender => --no-save + --no-recall, no owner-log flags at all (F3 fix — analysis/2026-09-17-voice-bridge-u3-verdict.md: a stranger/forwarded transcript must never be archived under a filename that reads as the owner\'s own words)', () => {
+    const flags = transcribeFlags(false, 42, -100555)
+    expect([...flags].sort()).toEqual(['--no-recall', '--no-save'])
+    expect(flags).toContain('--no-save')
+  })
+
+  test('owner-sent message never carries --no-save', () => {
+    expect(transcribeFlags(true, 42, -100555)).not.toContain('--no-save')
   })
 
   test('owner-sent but non-digit msg-id/chat-id are dropped (defensive — never reachable via real Telegram ids)', () => {
@@ -339,5 +345,92 @@ describe('deliverVoiceTranscript — fail-open (A13)', () => {
       logNotice: () => {},
     })
     expect('voice_author_id' in r.meta).toBe(false)
+  })
+})
+
+// ── F4 fix (analysis/2026-09-17-voice-bridge-u3-verdict.md) ─────────────────
+//
+// deliverVoiceTranscript's own try/catch only covers download/transcribe
+// REJECTING or resolving falsy — it never bounds a download that simply
+// never settles (server.ts's real downloadFileToInbox is a bare `fetch`
+// with no timeout). Before the fix, that hang propagated straight through
+// `await deliverVoiceTranscript(...)` in server.ts's per-chat `serialize`
+// block, wedging that chat's chain (and every message queued behind it)
+// forever. The fix wraps the WHOLE deliverVoiceTranscript(...) call in the
+// already-tested `withTimeout`, ceiling = timeoutMs + a fixed download
+// budget, and on timeout falls through to the same placeholder envelope an
+// ordinary download failure already produces.
+//
+// server.ts itself can't be imported (F16), so this mirrors the exact
+// composition server.ts's voice branch now uses — real `withTimeout` +
+// `deliverVoiceTranscript` + `serialize`, nothing stubbed.
+describe('F4 fix — a hung download is bounded (timeoutMs + download budget), not wedged forever', () => {
+  test('download that never settles: envelope falls through to the baseline placeholder within the bound, exactly one logNotice fires, and the per-chat serialize key is released for the next task', async () => {
+    const chatKey = 'chat:F4-test-1004336259518'
+    const author: VoiceAuthorResult = {
+      voice_author: 'stranger',
+      voice_author_origin: 'sender',
+      voice_trust: 'data',
+    }
+    const timeoutMs = 30 // stand-in for whisperTimeoutMs(...), kept small for test speed
+    const downloadBudgetMs = 20 // stand-in for voice-delivery.ts's DOWNLOAD_TIMEOUT_MS
+    const caption: string | undefined = undefined
+    const outerLogs: string[] = []
+    const innerLogs: string[] = []
+
+    // Enqueue the (would-be-hung) voice delivery FIRST.
+    const task1 = serialize(chatKey, async () => {
+      const envelope = await withTimeout(
+        deliverVoiceTranscript(true, caption, author, {
+          download: () => new Promise<string | undefined>(() => {}), // never settles
+          transcribe: async () => 'unreachable — download never resolves',
+          logNotice: reason => innerLogs.push(reason),
+        }),
+        timeoutMs + downloadBudgetMs,
+        () => outerLogs.push(`voice envelope timed out after ${timeoutMs + downloadBudgetMs}ms`),
+      ).catch(() => ({ text: caption ?? '(voice message)', meta: {} }))
+      return envelope
+    })
+
+    // Enqueue a SECOND task on the SAME key WHILE task1 is still pending —
+    // the actual regression: pre-fix, task1 never settles, so this would
+    // wait behind it forever.
+    let task2Ran = false
+    const task2 = serialize(chatKey, async () => {
+      task2Ran = true
+    })
+
+    const envelope = await task1
+    await task2
+
+    expect(envelope).toEqual({ text: '(voice message)', meta: {} })
+    // exactly one notice — the OUTER timeout, not the inner one (the inner
+    // deliverVoiceTranscript never gets to log anything: its own await never
+    // returns, because the download it's waiting on never settles).
+    expect(innerLogs.length).toBe(0)
+    expect(outerLogs.length).toBe(1)
+    expect(outerLogs[0]).toContain('timed out')
+    expect(task2Ran).toBe(true)
+  }, 800)
+
+  test('a caption is preserved in the timeout placeholder, same as an ordinary download failure', async () => {
+    const chatKey = 'chat:F4-test-caption'
+    const author: VoiceAuthorResult = { voice_author: 'stranger', voice_author_origin: 'sender', voice_trust: 'data' }
+    const timeoutMs = 20
+    const downloadBudgetMs = 15
+    const caption = 'a caption'
+
+    const envelope = await serialize(chatKey, async () =>
+      withTimeout(
+        deliverVoiceTranscript(true, caption, author, {
+          download: () => new Promise<string | undefined>(() => {}),
+          transcribe: async () => 'unreachable',
+          logNotice: () => {},
+        }),
+        timeoutMs + downloadBudgetMs,
+        () => {},
+      ).catch(() => ({ text: caption ?? '(voice message)', meta: {} })),
+    )
+    expect(envelope).toEqual({ text: 'a caption', meta: {} })
   })
 })

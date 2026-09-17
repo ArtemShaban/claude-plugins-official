@@ -105,6 +105,19 @@ export function whisperTimeoutMs(durationSeconds: number): number {
   return Math.max(MIN_WHISPER_TIMEOUT_MS, Math.round(durationSeconds * 1000))
 }
 
+// ── download budget (F4 fix — analysis/2026-09-17-voice-bridge-u3-verdict.md)
+// ───────────────────────────────────────────────────────────────────────────
+// runTranscribeCmd's `withTimeout` only bounds the WHISPER leg, once the
+// mutex is granted — the download that happens BEFORE it (a bare `fetch` in
+// server.ts's downloadFileToInbox, and the pre-existing photo downloadImage
+// leg) had no bound at all: a stalled TCP connection to api.telegram.org
+// wedged that chat's per-key `serialize` chain forever (every message queued
+// behind it, and behind it in the shared 'whisper' key too). A fixed budget,
+// not scaled by attachment size/duration — Telegram's own 20MB cap already
+// bounds transfer size, so this only needs to cover ordinary network
+// slowness, not a large-file allowance.
+export const DOWNLOAD_TIMEOUT_MS = 30_000
+
 // ── voice author + trust (OB-05/06/07/08, §6.1/§6.5) ───────────────────────
 
 export type VoiceAuthorOrigin =
@@ -213,6 +226,14 @@ export function transcribeFlags(
     if (DIGITS_RE.test(msgIdStr)) flags.push('--msg-id', msgIdStr)
     if (DIGITS_RE.test(chatIdStr)) flags.push('--chat-id', chatIdStr)
     flags.push('--source', 'telegram')
+  } else {
+    // F3 fix (analysis/2026-09-17-voice-bridge-u3-verdict.md): a non-owner
+    // transcript must never be archived under a filename that reads as the
+    // owner's own words (tools/transcribe.sh only gates the archive on the
+    // download path, which is the same for every sender/chat — A9/OB-07
+    // widened coverage to all chats/authors, so every stranger's/forwarded
+    // voice needs this explicitly).
+    flags.push('--no-save')
   }
   flags.push('--no-recall')
   return flags

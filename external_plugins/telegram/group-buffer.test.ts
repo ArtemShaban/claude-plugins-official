@@ -24,6 +24,7 @@ import {
   sanitizeForBlock,
   writeContextBufferFile,
 } from './group-buffer'
+import { serialize } from './voice-delivery'
 
 const GROUP = '-1004336259518'
 
@@ -382,6 +383,110 @@ describe('deliverWakeWithBuffer (wake-delivery seam)', () => {
       expect(notified[0]!.content).toContain('как дела')
       expect(notified[0]!.content).toContain('@bot что нового')
       expect(readGroupBuffer(dir, GROUP)).toEqual([]) // reset after successful delivery
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// ── F1 fix (analysis/2026-09-17-voice-bridge-u3-verdict.md): the buffer
+// append must never race a wake's read→notify→reset window ─────────────────
+//
+// Server.ts's real wake block is: readGroupBuffer() -> await notify() (the
+// slow leg — a genuine mcp.notification / transcription round-trip) ->
+// reset(). Before the fix, a non-mention message's buffer append ran
+// SYNCHRONOUSLY (a bare `appendToGroupBuffer` call, not routed through the
+// per-chat `serialize` chain) — an append landing in the read()->reset()
+// window was written to the buffer file and then immediately unlinked by
+// the wake's own reset(), with nobody ever having read it: lost, not
+// reordered (§16 "потерянных сообщений: 0"). The fix routes the append
+// through the SAME `serialize(chat:<id>, ...)` chain the wake uses, so an
+// append enqueued while a wake is in flight is FORCED to wait until that
+// wake (including its reset) has fully settled — it can then never land in
+// the gap, and survives to be picked up by the NEXT wake instead.
+//
+// server.ts itself is not importable here (F16 — top-level side effects),
+// so this test exercises the real `serialize` (voice-delivery.ts) composed
+// with the real group-buffer functions in exactly the shape server.ts's
+// `handleInbound`/wake block now uses — the same mirrored-reproduction
+// convention server.test.ts already uses for logic that can't be imported
+// directly.
+describe('F1 fix — buffer append routed through the per-chat serialize chain', () => {
+  test('an append enqueued WHILE a wake is mid-flight (inside its slow notify) is not lost — it survives to the NEXT wake', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'group-buffer-f1-'))
+    const chatId = '-1004336259518'
+    const chatKey = `chat:${chatId}`
+    try {
+      appendToGroupBuffer(dir, chatId, { ts: 't0', senderName: 'A', text: 'buffered-before-wake' })
+
+      const notifiedWake1: string[] = []
+      // WAKE-1: mirrors server.ts's real wake block exactly — read, then a
+      // SLOW notify (stands in for the real mcp.notification/transcription
+      // round-trip), then reset. Enqueued first, so it holds the chain.
+      const wake1 = serialize(chatKey, async () => {
+        const entries = readGroupBuffer(dir, chatId)
+        await deliverWakeWithBuffer(
+          entries,
+          '@bot wake-1',
+          formatted => writeContextBufferFile(dir, chatId, formatted),
+          {
+            notify: async content => {
+              await new Promise(r => setTimeout(r, 40)) // the race window
+              notifiedWake1.push(content)
+            },
+            reset: () => resetGroupBuffer(dir, chatId),
+            logError: () => {},
+          },
+        )
+      })
+
+      // Let wake1 actually start (enter its read()) before the racing
+      // append below is enqueued — mirrors "a non-mention message arrives
+      // while a mention-captioned voice is transcribing" from the verdict.
+      await new Promise(r => setTimeout(r, 5))
+
+      // THE FIX under test: the append goes through the SAME chain/key as
+      // wake1, so it is forced to queue behind it.
+      const racedEntry: BufferEntry = { ts: 't1', senderName: 'B', text: 'raced-message' }
+      const appendDone = serialize(chatKey, async () => {
+        appendToGroupBuffer(dir, chatId, racedEntry)
+      })
+
+      await wake1
+      await appendDone
+
+      // wake1's own payload genuinely predates the race — it must NOT
+      // contain the raced message (that would be a different bug: reading
+      // a message that hadn't arrived yet).
+      expect(notifiedWake1.length).toBe(1)
+      expect(notifiedWake1[0]).not.toContain('raced-message')
+
+      // The critical assertion (the actual F1 defect): the raced entry is
+      // NOT absent — it survived wake1's reset and is readable now, ready
+      // to ride the next wake. Under the pre-fix (unserialized, synchronous
+      // append) code this assertion fails: the append lands inside wake1's
+      // read()->reset() window and reset() unlinks it, losing it for good.
+      const survivors = readGroupBuffer(dir, chatId)
+      expect(survivors.some(e => e.text === 'raced-message')).toBe(true)
+
+      // And a genuine WAKE-2 actually delivers it — end-to-end proof, not
+      // just "the file still has bytes in it".
+      const notifiedWake2: string[] = []
+      await serialize(chatKey, async () => {
+        const entries2 = readGroupBuffer(dir, chatId)
+        await deliverWakeWithBuffer(
+          entries2,
+          '@bot wake-2',
+          formatted => writeContextBufferFile(dir, chatId, formatted),
+          {
+            notify: async content => { notifiedWake2.push(content) },
+            reset: () => resetGroupBuffer(dir, chatId),
+            logError: () => {},
+          },
+        )
+      })
+      expect(notifiedWake2.length).toBe(1)
+      expect(notifiedWake2[0]).toContain('raced-message')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

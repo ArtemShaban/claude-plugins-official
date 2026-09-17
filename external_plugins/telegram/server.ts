@@ -61,6 +61,7 @@ import {
 } from './checklist'
 import {
   deliverVoiceTranscript,
+  DOWNLOAD_TIMEOUT_MS,
   serialize,
   transcribeFlags,
   voiceAuthor,
@@ -1750,6 +1751,19 @@ async function downloadFileToInbox(
 // rejects via withTimeout, a pure/unit-tested wrapper. Omitted entirely for
 // the idea-inbox call site => `raw` is returned untouched, identical to the
 // pre-existing behaviour (A14).
+//
+// M1 (minor, analysis/2026-09-17-voice-bridge-u3-verdict.md): `child.kill()`
+// only signals the immediate `sh -c` process — if the real whisper-cli
+// binary it launched has already forked its own grandchild by the time the
+// timeout fires, that grandchild can survive the kill (whisper-cli is
+// ~1.5GB RSS on this 16GB miniK, so a second one surviving alongside a live
+// one is a real memory-pressure risk, not just a stray process). The
+// 'whisper' serialize() mutex above is released as soon as THIS promise
+// settles (on the SIGKILL, not on the real binary actually exiting) — so a
+// surviving grandchild can run concurrently with the NEXT whisper job the
+// mutex just admitted. Not chased here (owner's "чем проще чем лучше" order,
+// tg 17096, mirrors the NAMED LIMITATION above) — flagged so this consequence
+// is explicit rather than assumed away.
 function runTranscribeCmd(
   cmd: string,
   audioPath: string,
@@ -1816,16 +1830,29 @@ async function handleInbound(
     // the buffer-delivery block near the end of this function). Best-effort:
     // a write failure is logged but must never crash the poller or reply to
     // the sender (this message was never going to get a reply either way).
+    //
+    // F1 fix (analysis/2026-09-17-voice-bridge-u3-verdict.md): routed through
+    // the SAME per-chat `serialize` chain the wake path below uses. Before
+    // this fix the append ran synchronously, un-serialized, so it could land
+    // between a wake's readGroupBuffer() snapshot and its resetGroupBuffer()
+    // call — the appended entry was then unlinked by the reset without ever
+    // being delivered (lost, not just reordered; §16 "потерянных сообщений:
+    // 0"). Queuing the append on `chat:<id>` makes it impossible for it to
+    // interleave with that chat's read→notify→reset sequence.
     const bufferFrom = ctx.from!
-    try {
-      appendToGroupBuffer(GROUP_BUFFER_DIR, String(ctx.chat!.id), {
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        senderName: bufferFrom.username ?? String(bufferFrom.id),
-        text,
-      })
-    } catch (err) {
-      safeStderr(`telegram channel: group-buffer append failed: ${err}\n`)
+    const bufferChatId = String(ctx.chat!.id)
+    const bufferEntry = {
+      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+      senderName: bufferFrom.username ?? String(bufferFrom.id),
+      text,
     }
+    void serialize(`chat:${bufferChatId}`, async () => {
+      try {
+        appendToGroupBuffer(GROUP_BUFFER_DIR, bufferChatId, bufferEntry)
+      } catch (err) {
+        safeStderr(`telegram channel: group-buffer append failed: ${err}\n`)
+      }
+    })
     return
   }
 
@@ -2027,6 +2054,20 @@ async function handleInbound(
     let imagePath: string | undefined
     let voiceMeta: Record<string, string> = {}
 
+    // F4 fix (analysis/2026-09-17-voice-bridge-u3-verdict.md): every leg that
+    // can hang (the voice envelope's own download, which has NO bound of its
+    // own — a bare `fetch` in downloadFileToInbox — and the pre-existing
+    // photo downloadImage() leg) is wrapped in the already-tested
+    // `withTimeout` so this chain SLOT is always bounded and this chat's
+    // `serialize` key can never wedge behind a stalled TCP connection to
+    // api.telegram.org. `runTranscribeCmd`'s own withTimeout (inside
+    // deliverVoiceTranscript's `transcribe` fx below) only bounds the whisper
+    // leg once the mutex is granted — it never covered the download that
+    // happens first, which is exactly what this outer wrap adds. On timeout
+    // both legs fall through to the SAME placeholder/no-image outcome an
+    // ordinary download failure already produces (deliverVoiceTranscript's
+    // own `fallback`, and the pre-existing "no image" state) — never a hung
+    // or dropped delivery.
     if (attachment?.kind === 'voice') {
       const ownerSent = OWNER_TG_ID != null && String(from.id) === OWNER_TG_ID
       const author = voiceAuthor({ from: ctx.from, forwardOrigin: ctx.message?.forward_origin }, OWNER_TG_ID)
@@ -2034,27 +2075,49 @@ async function handleInbound(
       const timeoutMs = whisperTimeoutMs(attachment.duration ?? 0)
       const fileId = attachment.file_id
       const sizeHint = attachment.size
-      const envelope = await deliverVoiceTranscript(TRANSCRIBE_CMD != null, ctx.message?.caption, author, {
-        download: () => downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga'),
-        // Whisper mutex (§6.3, EXTRAS(2)): the SAME serialize() keyed on a
-        // fixed 'whisper' key bounds concurrent whisper runs to 1 across ALL
-        // chats (whisper is ~1.5GB RSS on a 16GB miniK) — a slow voice in
-        // chat B still waits behind chat A's transcription here, even though
-        // the two chats' TEXT delivery never waits on each other above.
-        transcribe: audioPath =>
-          serialize('whisper', () =>
-            runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, lang, {
-              timeoutMs,
-              extraArgs: transcribeFlags(ownerSent, msgId, chat_id),
-            }),
-          ),
-        logNotice: reason =>
-          safeStderr(`telegram channel: voice transcribe (chat=${chat_id} msg=${msgId ?? '?'}): ${reason}\n`),
-      })
+      const voiceLogNotice = (reason: string) =>
+        safeStderr(`telegram channel: voice transcribe (chat=${chat_id} msg=${msgId ?? '?'}): ${reason}\n`)
+      const envelope = await withTimeout(
+        deliverVoiceTranscript(TRANSCRIBE_CMD != null, ctx.message?.caption, author, {
+          download: () => downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga'),
+          // Whisper mutex (§6.3, EXTRAS(2)): the SAME serialize() keyed on a
+          // fixed 'whisper' key bounds concurrent whisper runs to 1 across ALL
+          // chats (whisper is ~1.5GB RSS on a 16GB miniK) — a slow voice in
+          // chat B still waits behind chat A's transcription here, even though
+          // the two chats' TEXT delivery never waits on each other above.
+          transcribe: audioPath =>
+            serialize('whisper', () =>
+              runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, lang, {
+                timeoutMs,
+                extraArgs: transcribeFlags(ownerSent, msgId, chat_id),
+              }),
+            ),
+          logNotice: voiceLogNotice,
+        }),
+        // Ceiling = the whisper budget (already sized to whisper's own
+        // worst case) PLUS a fixed download budget — covers BOTH legs
+        // deliverVoiceTranscript can spend time on (download, then
+        // transcribe), since this outer timer runs concurrently with, not
+        // instead of, runTranscribeCmd's own inner one.
+        timeoutMs + DOWNLOAD_TIMEOUT_MS,
+        // NAMED LIMITATION (mirrors voice-delivery.ts's withTimeout doc +
+        // M1's whisper-kill comment): there is no handle to abort the
+        // underlying `fetch` in downloadFileToInbox (no AbortController
+        // wired through), so onTimeout here only unblocks THIS chain slot —
+        // the dangling network request is abandoned, not killed. Acceptable
+        // per the owner's "чем проще чем лучше" order (tg 17096): it bounds
+        // the chain, which is the actual failure mode (a permanently wedged
+        // chat), not a resource leak on an already-rare stalled connection.
+        () => voiceLogNotice(`voice envelope timed out after ${timeoutMs + DOWNLOAD_TIMEOUT_MS}ms`),
+      ).catch(() => ({ text: ctx.message?.caption ?? '(voice message)', meta: {} }))
       bodyText = envelope.text
       voiceMeta = envelope.meta
     } else if (downloadImage) {
-      imagePath = await downloadImage()
+      imagePath = await withTimeout(
+        downloadImage(),
+        DOWNLOAD_TIMEOUT_MS,
+        () => safeStderr(`telegram channel: image download (chat=${chat_id} msg=${msgId ?? '?'}) timed out after ${DOWNLOAD_TIMEOUT_MS}ms\n`),
+      ).catch(() => undefined)
     }
 
     // Reply context — Telegram's Bot API exposes the message being replied to
