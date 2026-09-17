@@ -59,6 +59,15 @@ import {
   parseCallbackData as parseChecklistCallbackData,
   type ChecklistItem,
 } from './checklist'
+import {
+  deliverVoiceTranscript,
+  DOWNLOAD_TIMEOUT_MS,
+  serialize,
+  transcribeFlags,
+  voiceAuthor,
+  whisperTimeoutMs,
+  withTimeout,
+} from './voice-delivery'
 import { spawn } from 'child_process'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -163,6 +172,21 @@ const IDEA_INBOX_DIR = ideaInboxDir(process.env)
 // — NOT hardcoded). Unset => transcription is disabled and the voice idea stays
 // status:'new' with its file_id (deferred to triage). See transcribeVoiceIdea.
 const TRANSCRIBE_CMD = transcribeCmd(process.env)
+
+// Owner identity for voice-trust decisions on the WORK route (OB-06/OB-07 —
+// SemenAssistant analysis/2026-09-17-bridge-voice-spec-FINAL.md §6.5). Wired
+// by tools/start-semen.sh, derived from the canonical
+// tools/delivery_oracle.py::OWNER_CHAT_ID — deliberately NOT
+// SAM_WA_APPROVAL_OWNER_ID (F10 in the spec: that one is unset in the live
+// bridge; reusing it here would silently mark every voice as someone else's,
+// forever). Unset => fail-safe: every voice becomes voice_trust='data', never
+// mistakenly 'owner'.
+const OWNER_TG_ID = process.env.SEMEN_OWNER_TG_ID
+if (!OWNER_TG_ID) {
+  safeStderr(
+    'telegram channel: SEMEN_OWNER_TG_ID not set — every voice message will get voice_trust="data" (fail-safe)\n',
+  )
+}
 
 // Text-to-speech command for the reply tool's voice:true option (synthesize an
 // Opus .ogg voice bubble of the reply text). Wired by the orchestrator (or
@@ -1503,6 +1527,7 @@ bot.on('message:voice', async ctx => {
     file_id: voice.file_id,
     size: voice.file_size,
     mime: voice.mime_type,
+    duration: voice.duration,
   })
 })
 
@@ -1661,6 +1686,9 @@ type AttachmentMeta = {
   size?: number
   mime?: string
   name?: string
+  // Voice only (seconds, as reported by Telegram) — feeds the whisper
+  // timeout budget (§6.3). Absent for every other kind.
+  duration?: number
 }
 
 // Filenames and titles are uploader-controlled. They land inside the <channel>
@@ -1707,15 +1735,46 @@ async function downloadFileToInbox(
 }
 
 // Run the configured transcribe command. Contract: CMD receives the audio path
-// as $1 and the language as $2 and prints the transcript to stdout. We invoke
-// `sh -c '<CMD> "$1" "$2"' sh <audio> <lang>` so CMD may be a bare executable
-// (args appended) OR a pipeline referencing $1/$2. Rejects on spawn error or a
-// non-zero exit (the orchestrator catches => idea stays status:'new').
-function runTranscribeCmd(cmd: string, audioPath: string, lang: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('sh', ['-c', `${cmd} "$1" "$2"`, 'sh', audioPath, lang], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
+// as $1 and the language as $2 (plus any extraArgs appended as $3, $4, ... —
+// tools/transcribe.sh accepts its --msg-id/--chat-id/--source/--no-recall
+// flags in any position, §6.7) and prints the transcript to stdout. We invoke
+// `sh -c '<CMD> "$@"' sh <audio> <lang> [...extraArgs]` so CMD may be a bare
+// executable (args appended) OR a pipeline referencing $1/$2 — `"$@"` expands
+// to exactly `"$1" "$2"` when there are only two positional args, so the
+// idea-inbox call site (no extraArgs, no timeout) is byte-for-byte unchanged.
+// Rejects on spawn error or a non-zero exit (the orchestrator catches => idea
+// stays status:'new' / the work-route falls back to the placeholder).
+//
+// opts.timeoutMs (§6.3, work-route only): bounds a hung whisper run. Kills
+// the immediate spawned process on timeout (NAMED LIMITATION: does not chase
+// a process tree — see voice-delivery.ts's withTimeout doc comment) and
+// rejects via withTimeout, a pure/unit-tested wrapper. Omitted entirely for
+// the idea-inbox call site => `raw` is returned untouched, identical to the
+// pre-existing behaviour (A14).
+//
+// M1 (minor, analysis/2026-09-17-voice-bridge-u3-verdict.md): `child.kill()`
+// only signals the immediate `sh -c` process — if the real whisper-cli
+// binary it launched has already forked its own grandchild by the time the
+// timeout fires, that grandchild can survive the kill (whisper-cli is
+// ~1.5GB RSS on this 16GB miniK, so a second one surviving alongside a live
+// one is a real memory-pressure risk, not just a stray process). The
+// 'whisper' serialize() mutex above is released as soon as THIS promise
+// settles (on the SIGKILL, not on the real binary actually exiting) — so a
+// surviving grandchild can run concurrently with the NEXT whisper job the
+// mutex just admitted. Not chased here (owner's "чем проще чем лучше" order,
+// tg 17096, mirrors the NAMED LIMITATION above) — flagged so this consequence
+// is explicit rather than assumed away.
+function runTranscribeCmd(
+  cmd: string,
+  audioPath: string,
+  lang: string,
+  opts?: { timeoutMs?: number; extraArgs?: readonly string[] },
+): Promise<string> {
+  const extraArgs = opts?.extraArgs ?? []
+  const child = spawn('sh', ['-c', `${cmd} "$@"`, 'sh', audioPath, lang, ...extraArgs], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const raw = new Promise<string>((resolve, reject) => {
     let out = ''
     let err = ''
     child.stdout.on('data', (d: Buffer) => { out += d.toString() })
@@ -1726,6 +1785,9 @@ function runTranscribeCmd(cmd: string, audioPath: string, lang: string): Promise
       else reject(new Error(`transcribe cmd exited ${code}: ${err.slice(0, 500)}`))
     })
   })
+  return opts?.timeoutMs != null
+    ? withTimeout(raw, opts.timeoutMs, () => child.kill('SIGKILL'))
+    : raw
 }
 
 // Run the configured TTS command to synthesize an Opus .ogg voice bubble.
@@ -1768,16 +1830,29 @@ async function handleInbound(
     // the buffer-delivery block near the end of this function). Best-effort:
     // a write failure is logged but must never crash the poller or reply to
     // the sender (this message was never going to get a reply either way).
+    //
+    // F1 fix (analysis/2026-09-17-voice-bridge-u3-verdict.md): routed through
+    // the SAME per-chat `serialize` chain the wake path below uses. Before
+    // this fix the append ran synchronously, un-serialized, so it could land
+    // between a wake's readGroupBuffer() snapshot and its resetGroupBuffer()
+    // call — the appended entry was then unlinked by the reset without ever
+    // being delivered (lost, not just reordered; §16 "потерянных сообщений:
+    // 0"). Queuing the append on `chat:<id>` makes it impossible for it to
+    // interleave with that chat's read→notify→reset sequence.
     const bufferFrom = ctx.from!
-    try {
-      appendToGroupBuffer(GROUP_BUFFER_DIR, String(ctx.chat!.id), {
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        senderName: bufferFrom.username ?? String(bufferFrom.id),
-        text,
-      })
-    } catch (err) {
-      safeStderr(`telegram channel: group-buffer append failed: ${err}\n`)
+    const bufferChatId = String(ctx.chat!.id)
+    const bufferEntry = {
+      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+      senderName: bufferFrom.username ?? String(bufferFrom.id),
+      text,
     }
+    void serialize(`chat:${bufferChatId}`, async () => {
+      try {
+        appendToGroupBuffer(GROUP_BUFFER_DIR, bufferChatId, bufferEntry)
+      } catch (err) {
+        safeStderr(`telegram channel: group-buffer append failed: ${err}\n`)
+      }
+    })
     return
   }
 
@@ -1962,98 +2037,185 @@ async function handleInbound(
       .catch(() => {})
   }
 
-  const imagePath = downloadImage ? await downloadImage() : undefined
+  // ── serialized delivery block (OB-09 — SemenAssistant analysis/2026-09-17-
+  // bridge-voice-spec-FINAL.md §6.2) ─────────────────────────────────────
+  // Everything from "fetch the attachment's bytes" (photo's existing
+  // downloadImage / voice's new transcribe-on-the-work-route) through the
+  // SOLE deliverWakeWithBuffer call site is ONE per-chat FIFO block. Enqueued
+  // WITHOUT awaiting here (`void serialize`) so handleInbound returns
+  // immediately — grammY has no @grammyjs/runner (F14: it awaits each
+  // handler before fetching the NEXT Telegram update), so awaiting the whole
+  // chain here would stall reading updates for EVERY chat, not just this
+  // one. Ordering across text/photo/voice within ONE chat is guaranteed by
+  // enqueue order + the chain; different chats never wait on each other
+  // (separate Map keys in voice-delivery.ts).
+  void serialize(`chat:${chat_id}`, async () => {
+    let bodyText = text
+    let imagePath: string | undefined
+    let voiceMeta: Record<string, string> = {}
 
-  // Reply context — Telegram's Bot API exposes the message being replied to
-  // (reply_to_message) and, since Bot API 7.0, a `quote` for a partial
-  // selection. Surface it in meta so Claude knows which earlier message the
-  // sender is responding to. Snippets are sanitized + truncated (uploader-
-  // controlled text could otherwise break out of the <channel> tag).
-  const repliedTo = ctx.message?.reply_to_message
-  const replyMeta: Record<string, string> = {}
-  if (repliedTo != null) {
-    replyMeta.reply_to_message_id = String(repliedTo.message_id)
-    const repliedSnippet = safeName(repliedTo.text ?? repliedTo.caption)?.slice(0, 300)
-    if (repliedSnippet) replyMeta.reply_to_text = repliedSnippet
-    if (repliedTo.from) replyMeta.reply_to_user = repliedTo.from.username ?? String(repliedTo.from.id)
-  }
-  const quotedSnippet = safeName(ctx.message?.quote?.text)?.slice(0, 300)
-  if (quotedSnippet) replyMeta.reply_to_quote = quotedSnippet
-
-  // Group context-buffer delivery (group-buffer.ts): a configured group with
-  // contextBuffer:true accumulates non-mention messages instead of dropping
-  // them (see the gate() 'buffer' branch + the handleInbound branch above).
-  // This IS the genuine wake (workRoute is true here), so attach everything
-  // buffered since the last successful wake, then reset. DEFAULT-SAFE / byte-
-  // identical: a DM, or any group without the flag, never has
-  // contextBufferEnabled(...) true, so bufferedEntries stays [] and
-  // deliverWakeWithBuffer sends `text` unchanged with no extra meta — exactly
-  // today's payload.
-  const groupPolicy = access.groups[chat_id]
-  const bufferedEntries: BufferEntry[] = contextBufferEnabled(groupPolicy)
-    ? readGroupBuffer(GROUP_BUFFER_DIR, chat_id)
-    : []
-
-  // image_path goes in meta only — an in-content "[image attached — read: PATH]"
-  // annotation is forgeable by any allowlisted sender typing that string.
-  // Fire-and-forget (not awaited), matching the previous mcp.notification
-  // call exactly — deliverWakeWithBuffer resolves once notify() settles, but
-  // handleInbound doesn't wait on it.
-  void deliverWakeWithBuffer(
-    bufferedEntries,
-    text,
-    formatted => writeContextBufferFile(GROUP_BUFFER_DIR, chat_id, formatted),
-    {
-      notify: (content, extraMeta) =>
-        mcp.notification({
-          method: 'notifications/claude/channel',
-          params: {
-            content,
-            meta: {
-              chat_id,
-              ...(msgId != null ? { message_id: String(msgId) } : {}),
-              user: from.username ?? String(from.id),
-              user_id: String(from.id),
-              ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-              // Forum topic of the inbound message (R-OUT): surface it so Claude can
-              // pass message_thread_id back to the reply tool and land the answer in
-              // the same topic. Absent for General / DM.
-              ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
-              ...replyMeta,
-              ...(imagePath ? { image_path: imagePath } : {}),
-              ...(attachment ? {
-                attachment_kind: attachment.kind,
-                attachment_file_id: attachment.file_id,
-                ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-                ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-                ...(attachment.name ? { attachment_name: attachment.name } : {}),
-              } : {}),
-              ...extraMeta,
-            },
-          },
+    // F4 fix (analysis/2026-09-17-voice-bridge-u3-verdict.md): every leg that
+    // can hang (the voice envelope's own download, which has NO bound of its
+    // own — a bare `fetch` in downloadFileToInbox — and the pre-existing
+    // photo downloadImage() leg) is wrapped in the already-tested
+    // `withTimeout` so this chain SLOT is always bounded and this chat's
+    // `serialize` key can never wedge behind a stalled TCP connection to
+    // api.telegram.org. `runTranscribeCmd`'s own withTimeout (inside
+    // deliverVoiceTranscript's `transcribe` fx below) only bounds the whisper
+    // leg once the mutex is granted — it never covered the download that
+    // happens first, which is exactly what this outer wrap adds. On timeout
+    // both legs fall through to the SAME placeholder/no-image outcome an
+    // ordinary download failure already produces (deliverVoiceTranscript's
+    // own `fallback`, and the pre-existing "no image" state) — never a hung
+    // or dropped delivery.
+    if (attachment?.kind === 'voice') {
+      const ownerSent = OWNER_TG_ID != null && String(from.id) === OWNER_TG_ID
+      const author = voiceAuthor({ from: ctx.from, forwardOrigin: ctx.message?.forward_origin }, OWNER_TG_ID)
+      const lang = author.voice_trust === 'owner' ? 'ru' : 'auto'
+      const timeoutMs = whisperTimeoutMs(attachment.duration ?? 0)
+      const fileId = attachment.file_id
+      const sizeHint = attachment.size
+      const voiceLogNotice = (reason: string) =>
+        safeStderr(`telegram channel: voice transcribe (chat=${chat_id} msg=${msgId ?? '?'}): ${reason}\n`)
+      const envelope = await withTimeout(
+        deliverVoiceTranscript(TRANSCRIBE_CMD != null, ctx.message?.caption, author, {
+          download: () => downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga'),
+          // Whisper mutex (§6.3, EXTRAS(2)): the SAME serialize() keyed on a
+          // fixed 'whisper' key bounds concurrent whisper runs to 1 across ALL
+          // chats (whisper is ~1.5GB RSS on a 16GB miniK) — a slow voice in
+          // chat B still waits behind chat A's transcription here, even though
+          // the two chats' TEXT delivery never waits on each other above.
+          transcribe: audioPath =>
+            serialize('whisper', () =>
+              runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, lang, {
+                timeoutMs,
+                extraArgs: transcribeFlags(ownerSent, msgId, chat_id),
+              }),
+            ),
+          logNotice: voiceLogNotice,
         }),
-      reset: () => resetGroupBuffer(GROUP_BUFFER_DIR, chat_id),
-      logError: reason => process.stderr.write(`telegram channel: ${reason}\n`),
-    },
-  )
+        // Ceiling = the whisper budget (already sized to whisper's own
+        // worst case) PLUS a fixed download budget — covers BOTH legs
+        // deliverVoiceTranscript can spend time on (download, then
+        // transcribe), since this outer timer runs concurrently with, not
+        // instead of, runTranscribeCmd's own inner one.
+        timeoutMs + DOWNLOAD_TIMEOUT_MS,
+        // NAMED LIMITATION (mirrors voice-delivery.ts's withTimeout doc +
+        // M1's whisper-kill comment): there is no handle to abort the
+        // underlying `fetch` in downloadFileToInbox (no AbortController
+        // wired through), so onTimeout here only unblocks THIS chain slot —
+        // the dangling network request is abandoned, not killed. Acceptable
+        // per the owner's "чем проще чем лучше" order (tg 17096): it bounds
+        // the chain, which is the actual failure mode (a permanently wedged
+        // chat), not a resource leak on an already-rare stalled connection.
+        () => voiceLogNotice(`voice envelope timed out after ${timeoutMs + DOWNLOAD_TIMEOUT_MS}ms`),
+      ).catch(() => ({ text: ctx.message?.caption ?? '(voice message)', meta: {} }))
+      bodyText = envelope.text
+      voiceMeta = envelope.meta
+    } else if (downloadImage) {
+      imagePath = await withTimeout(
+        downloadImage(),
+        DOWNLOAD_TIMEOUT_MS,
+        () => safeStderr(`telegram channel: image download (chat=${chat_id} msg=${msgId ?? '?'}) timed out after ${DOWNLOAD_TIMEOUT_MS}ms\n`),
+      ).catch(() => undefined)
+    }
+
+    // Reply context — Telegram's Bot API exposes the message being replied to
+    // (reply_to_message) and, since Bot API 7.0, a `quote` for a partial
+    // selection. Surface it in meta so Claude knows which earlier message the
+    // sender is responding to. Snippets are sanitized + truncated (uploader-
+    // controlled text could otherwise break out of the <channel> tag).
+    const repliedTo = ctx.message?.reply_to_message
+    const replyMeta: Record<string, string> = {}
+    if (repliedTo != null) {
+      replyMeta.reply_to_message_id = String(repliedTo.message_id)
+      const repliedSnippet = safeName(repliedTo.text ?? repliedTo.caption)?.slice(0, 300)
+      if (repliedSnippet) replyMeta.reply_to_text = repliedSnippet
+      if (repliedTo.from) replyMeta.reply_to_user = repliedTo.from.username ?? String(repliedTo.from.id)
+    }
+    const quotedSnippet = safeName(ctx.message?.quote?.text)?.slice(0, 300)
+    if (quotedSnippet) replyMeta.reply_to_quote = quotedSnippet
+
+    // Group context-buffer delivery (group-buffer.ts): a configured group with
+    // contextBuffer:true accumulates non-mention messages instead of dropping
+    // them (see the gate() 'buffer' branch + the handleInbound branch above).
+    // This IS the genuine wake (workRoute is true here), so attach everything
+    // buffered since the last successful wake, then reset. DEFAULT-SAFE / byte-
+    // identical: a DM, or any group without the flag, never has
+    // contextBufferEnabled(...) true, so bufferedEntries stays [] and
+    // deliverWakeWithBuffer sends `bodyText` unchanged with no extra meta —
+    // exactly today's payload.
+    const groupPolicy = access.groups[chat_id]
+    const bufferedEntries: BufferEntry[] = contextBufferEnabled(groupPolicy)
+      ? readGroupBuffer(GROUP_BUFFER_DIR, chat_id)
+      : []
+
+    // image_path goes in meta only — an in-content "[image attached — read: PATH]"
+    // annotation is forgeable by any allowlisted sender typing that string.
+    // Awaited (not fire-and-forget): the ORDER Claude sees across this chat's
+    // messages depends on THIS call actually completing before the next
+    // queued block in the chain starts (§6.2 point 3) — a fire-and-forget
+    // here would only guarantee ordering to a microtask, not in practice.
+    await deliverWakeWithBuffer(
+      bufferedEntries,
+      bodyText,
+      formatted => writeContextBufferFile(GROUP_BUFFER_DIR, chat_id, formatted),
+      {
+        notify: (content, extraMeta) =>
+          mcp.notification({
+            method: 'notifications/claude/channel',
+            params: {
+              content,
+              meta: {
+                chat_id,
+                ...(msgId != null ? { message_id: String(msgId) } : {}),
+                user: from.username ?? String(from.id),
+                user_id: String(from.id),
+                ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+                // Forum topic of the inbound message (R-OUT): surface it so Claude can
+                // pass message_thread_id back to the reply tool and land the answer in
+                // the same topic. Absent for General / DM.
+                ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
+                ...replyMeta,
+                ...(imagePath ? { image_path: imagePath } : {}),
+                ...(attachment ? {
+                  attachment_kind: attachment.kind,
+                  attachment_file_id: attachment.file_id,
+                  ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+                  ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+                  ...(attachment.name ? { attachment_name: attachment.name } : {}),
+                } : {}),
+                ...voiceMeta,
+                ...extraMeta,
+              },
+            },
+          }),
+        reset: () => resetGroupBuffer(GROUP_BUFFER_DIR, chat_id),
+        logError: reason => process.stderr.write(`telegram channel: ${reason}\n`),
+      },
+    )
+  }).catch(err => safeStderr(`telegram channel: serialized delivery crashed (chat=${chat_id}): ${err}\n`))
 
   // Route A — additive signed approval-channel emit (step-2 / reply parity).
+  // Deliberately OUTSIDE the serialized block above — this is a side-channel
+  // approval signal, unrelated to inbound-message ORDERING, and must not
+  // wait behind a slow voice transcription elsewhere in the same chat.
   // `gate(ctx)` already dropped non-allowlisted senders above; this
   // additionally requires the CONFIGURED OWNER specifically, a reply (not a
   // fresh message), and the sender's own DM. The reply's typed text lands
   // ONLY in the 0600 side-channel — never logged, never re-echoed in the
-  // mcp.notification above (which is unchanged). repliedTo/chat_id/from/msgId
-  // are all already in scope from the work-route relay just above.
+  // mcp.notification above (which is unchanged).
+  const approvalReplyTo = ctx.message?.reply_to_message
   if (
     APPROVAL_OWNER_ID && String(from.id) === APPROVAL_OWNER_ID &&
-    repliedTo != null && chat_id === String(from.id) && msgId != null
+    approvalReplyTo != null && chat_id === String(from.id) && msgId != null
   ) {
     emitApprovalSignal({
       kind: 'reply',
       owner_id: String(from.id),
       chat_id,
       message_id: String(msgId),
-      reply_to_message_id: String(repliedTo.message_id),
+      reply_to_message_id: String(approvalReplyTo.message_id),
       payload: text,
       nonce: randomBytes(16).toString('hex'),
       issued_at_ms: Date.now(),
