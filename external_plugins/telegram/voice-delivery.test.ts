@@ -5,6 +5,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   deliverVoiceTranscript,
+  forwardOriginMeta,
   serialize,
   transcribeFlags,
   voiceAuthor,
@@ -207,6 +208,83 @@ describe('voiceAuthor', () => {
     const r = voiceAuthor({ from: dirty, forwardOrigin: undefined }, undefined)
     expect(r.voice_author).not.toMatch(/[<>[\]\r\n;]/)
     expect(r.voice_author).toBe('Evil_name__x____Break')
+  })
+})
+
+// ── forwardOriginMeta — non-voice forward labels (owner tg 18168/18170) ─────
+describe('forwardOriginMeta (non-voice envelope)', () => {
+  const alice = { id: 555, is_bot: false, username: 'alice_h', first_name: 'Alice' }
+
+  test('not forwarded => {} (text envelope byte-identical to today)', () => {
+    expect(forwardOriginMeta(undefined)).toEqual({})
+    expect(forwardOriginMeta(undefined, 'photo')).toEqual({})
+  })
+
+  test('text forward, type=user => forward_user + author + id', () => {
+    expect(forwardOriginMeta({ type: 'user', date: 0, sender_user: alice })).toEqual({
+      forward_origin: 'forward_user',
+      forward_author: 'alice_h',
+      forward_author_id: '555',
+    })
+  })
+
+  test('text forward, type=hidden_user => forward_hidden_user, name only, NO id', () => {
+    expect(forwardOriginMeta({ type: 'hidden_user', date: 0, sender_user_name: 'Sam Assistant For Tom' })).toEqual({
+      forward_origin: 'forward_hidden_user',
+      forward_author: 'Sam Assistant For Tom',
+    })
+  })
+
+  test('hidden_user with an empty name => forward_origin only, author never guessed', () => {
+    expect(forwardOriginMeta({ type: 'hidden_user', date: 0, sender_user_name: '' })).toEqual({
+      forward_origin: 'forward_hidden_user',
+    })
+  })
+
+  test('text forward, type=chat => forward_chat with chat title + id', () => {
+    expect(
+      forwardOriginMeta({
+        type: 'chat',
+        date: 0,
+        sender_chat: { id: -100123, type: 'group', title: 'Family Group' } as never,
+      }),
+    ).toEqual({ forward_origin: 'forward_chat', forward_author: 'Family Group', forward_author_id: '-100123' })
+  })
+
+  test('text forward, type=channel => forward_channel with username + id', () => {
+    expect(
+      forwardOriginMeta({
+        type: 'channel',
+        date: 0,
+        message_id: 1,
+        chat: { id: -1009, type: 'channel', title: 'News Channel', username: 'newschan' } as never,
+      }),
+    ).toEqual({ forward_origin: 'forward_channel', forward_author: 'newschan', forward_author_id: '-1009' })
+  })
+
+  test('photo and document forwards are labelled the same way', () => {
+    const origin = { type: 'user', date: 0, sender_user: alice } as const
+    const expected = { forward_origin: 'forward_user', forward_author: 'alice_h', forward_author_id: '555' }
+    expect(forwardOriginMeta(origin, 'photo')).toEqual(expected)
+    expect(forwardOriginMeta(origin, 'document')).toEqual(expected)
+  })
+
+  test('voice => {} (voice keeps its own voice_author_* attributes, unchanged)', () => {
+    expect(forwardOriginMeta({ type: 'user', date: 0, sender_user: alice }, 'voice')).toEqual({})
+  })
+
+  test('author name is sanitized against envelope-delimiter chars', () => {
+    const r = forwardOriginMeta({ type: 'hidden_user', date: 0, sender_user_name: 'Evil<n>[x];\r\nB' })
+    expect(r.forward_author).toBe('Evil_n__x____B')
+  })
+
+  test('forward_origin agrees with voiceAuthor for the same origin (one shared mapping)', () => {
+    const origin = { type: 'user', date: 0, sender_user: alice } as const
+    const v = voiceAuthor({ from: undefined, forwardOrigin: origin }, undefined)
+    const f = forwardOriginMeta(origin)
+    expect(f.forward_origin).toBe(v.voice_author_origin)
+    expect(f.forward_author).toBe(v.voice_author)
+    expect(f.forward_author_id).toBe(v.voice_author_id)
   })
 })
 

@@ -153,6 +153,54 @@ function chatDisplayName(chat: Chat | Chat.ChannelChat): string {
   return chat.username ?? chat.title ?? String(chat.id)
 }
 
+// ── shared forward-origin mapping (voice AND non-voice inbound) ─────────────
+// ONE mapping of Telegram's 4 MessageOrigin variants onto our origin tags +
+// author name/id. voiceAuthor (below) and forwardOriginMeta (non-voice
+// envelope labels) both call it, so the two paths cannot drift apart.
+export type ForwardOriginTag = Exclude<VoiceAuthorOrigin, 'sender'>
+
+export type ForwardAuthor = {
+  origin: ForwardOriginTag
+  name: string
+  id?: string
+}
+
+export function forwardAuthor(origin: MessageOrigin): ForwardAuthor {
+  if (origin.type === 'user') {
+    const u = origin.sender_user
+    return { origin: 'forward_user', name: u.username ?? u.first_name ?? String(u.id), id: String(u.id) }
+  }
+  if (origin.type === 'hidden_user') {
+    // Telegram itself withholds the id here (OB-08) — never guessed.
+    return { origin: 'forward_hidden_user', name: origin.sender_user_name }
+  }
+  if (origin.type === 'chat') {
+    return { origin: 'forward_chat', name: chatDisplayName(origin.sender_chat), id: String(origin.sender_chat.id) }
+  }
+  return { origin: 'forward_channel', name: chatDisplayName(origin.chat), id: String(origin.chat.id) }
+}
+
+// Envelope labels for a NON-voice inbound message (owner tg 18168/18170: a
+// forwarded text/photo/document arrived looking like the owner's own words).
+// Labels only — no trust decision here. Not forwarded => {} (envelope stays
+// byte-identical). forward_author is omitted when Telegram gives no name
+// (hidden user with an empty name) — never guessed.
+// `attachmentKind === 'voice'` => {} — voice carries its own voice_author_*
+// attributes (unchanged); this is the single switch server.ts calls.
+export function forwardOriginMeta(
+  origin: MessageOrigin | undefined,
+  attachmentKind?: string,
+): Record<string, string> {
+  if (origin == null || attachmentKind === 'voice') return {}
+  const a = forwardAuthor(origin)
+  const name = sanitizeAuthorName(a.name ?? '')
+  return {
+    forward_origin: a.origin,
+    ...(name.trim() ? { forward_author: name } : {}),
+    ...(a.id != null ? { forward_author_id: a.id } : {}),
+  }
+}
+
 // voice_author_origin covers exactly the 5 forms named in the spec (A6): no
 // forward_origin at all => 'sender' (ctx.from IS the author); one of
 // Telegram's 4 MessageOrigin variants when forwarded. `voice_author_id` is
@@ -169,22 +217,11 @@ export function voiceAuthor(input: VoiceAuthorInput, ownerId: string | undefined
     const u = input.from
     id = u ? String(u.id) : undefined
     name = u ? u.username ?? u.first_name ?? String(u.id) : 'unknown'
-  } else if (origin.type === 'user') {
-    originTag = 'forward_user'
-    id = String(origin.sender_user.id)
-    name = origin.sender_user.username ?? origin.sender_user.first_name ?? String(origin.sender_user.id)
-  } else if (origin.type === 'hidden_user') {
-    originTag = 'forward_hidden_user'
-    id = undefined
-    name = origin.sender_user_name
-  } else if (origin.type === 'chat') {
-    originTag = 'forward_chat'
-    id = String(origin.sender_chat.id)
-    name = chatDisplayName(origin.sender_chat)
   } else {
-    originTag = 'forward_channel'
-    id = String(origin.chat.id)
-    name = chatDisplayName(origin.chat)
+    const a = forwardAuthor(origin)
+    originTag = a.origin
+    id = a.id
+    name = a.name
   }
 
   // A7: owner trust requires BOTH a non-forwarded message AND the author id
