@@ -62,6 +62,7 @@ import {
 import {
   deliverVoiceTranscript,
   DOWNLOAD_TIMEOUT_MS,
+  forwardOriginMeta,
   serialize,
   transcribeFlags,
   voiceAuthor,
@@ -2136,6 +2137,12 @@ async function handleInbound(
     const quotedSnippet = safeName(ctx.message?.quote?.text)?.slice(0, 300)
     if (quotedSnippet) replyMeta.reply_to_quote = quotedSnippet
 
+    // Forward origin for NON-voice messages (owner tg 18168/18170): a
+    // forwarded text/photo/document must not look like the sender's own
+    // words. Same mapping as voiceAuthor (shared in voice-delivery.ts); voice
+    // keeps its own voice_author_* attributes unchanged. Not forwarded => {}.
+    const forwardMeta = forwardOriginMeta(ctx.message?.forward_origin, attachment?.kind)
+
     // Group context-buffer delivery (group-buffer.ts): a configured group with
     // contextBuffer:true accumulates non-mention messages instead of dropping
     // them (see the gate() 'buffer' branch + the handleInbound branch above).
@@ -2177,6 +2184,7 @@ async function handleInbound(
                 // the same topic. Absent for General / DM.
                 ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
                 ...replyMeta,
+                ...forwardMeta,
                 ...(imagePath ? { image_path: imagePath } : {}),
                 ...(attachment ? {
                   attachment_kind: attachment.kind,
