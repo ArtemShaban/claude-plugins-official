@@ -888,3 +888,122 @@ console.log(JSON.stringify({ calls, voiceNote, combinedVoiceSent }))
     expect(out.calls.sendMessage).toBe(0)
   })
 })
+
+// ─── DM /start, /help, /status pass through the ordinary gate ───────────────
+// End-to-end: spawns the REAL server.ts (not an extracted copy) with a preload
+// that swaps grammY's fetch for an in-process fake Bot API. The fake serves one
+// queued update, then empty long-polls, and logs every Bot API method called.
+// The MCP side is read from the child's stdout (JSON-RPC notifications).
+// State isolation: HOME and TELEGRAM_STATE_DIR both point into a mkdtemp dir;
+// the child env carries only PATH + those two + a dummy token.
+describe('DM /start, /help, /status reach the session through gate()', () => {
+  const ALLOWED_ID = 111
+  const STRANGER_ID = 222
+
+  function makePreload(dir: string, update: unknown): { preload: string; callsLog: string } {
+    const callsLog = join(dir, 'calls.log')
+    const preload = join(dir, 'fake-bot-api.ts')
+    writeFileSync(preload, /* ts */ `
+import { appendFileSync } from 'fs'
+const CALLS_LOG = ${JSON.stringify(callsLog)}
+let served = false
+const fake = async (url: any, init?: any) => {
+  const method = String(url).split('/').pop()!
+  appendFileSync(CALLS_LOG, method + '\\n')
+  let result: unknown = true
+  if (method === 'getMe') result = { id: 1, is_bot: true, first_name: 'bot', username: 'test_bot' }
+  else if (method === 'getUpdates') {
+    if (!served) { served = true; result = [${JSON.stringify(update)}] }
+    else { await new Promise(r => setTimeout(r, 300)); result = [] }
+  } else if (method.startsWith('send')) result = { message_id: 99, date: 0, chat: { id: 1, type: 'private' } }
+  return new Response(JSON.stringify({ ok: true, result }), { headers: { 'content-type': 'application/json' } })
+}
+globalThis.fetch = fake as any
+require('node-fetch').default = fake
+`)
+    writeFileSync(callsLog, '')
+    return { preload, callsLog }
+  }
+
+  async function runWithCommand(
+    senderId: number,
+    text: string,
+    access: Record<string, unknown>,
+  ): Promise<{ notifications: string[]; calls: string[]; stderr: string }> {
+    const dir = mkdtempSync(join(tmpdir(), 'tg-cmd-'))
+    try {
+      const stateDir = join(dir, 'state')
+      mkdirSync(stateDir, { recursive: true })
+      writeFileSync(join(stateDir, 'access.json'), JSON.stringify(access))
+      const update = {
+        update_id: 1,
+        message: {
+          message_id: 10,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: senderId, type: 'private' },
+          from: { id: senderId, is_bot: false, first_name: 'u', username: 'u' + senderId },
+          text,
+          entities: [{ type: 'bot_command', offset: 0, length: text.length }],
+        },
+      }
+      const { preload, callsLog } = makePreload(dir, update)
+      const child = Bun.spawn(['bun', '--preload', preload, join(import.meta.dir, 'server.ts')], {
+        cwd: import.meta.dir,
+        env: {
+          PATH: process.env.PATH ?? '/usr/bin:/bin',
+          HOME: dir,
+          TELEGRAM_STATE_DIR: stateDir,
+          TELEGRAM_BOT_TOKEN: '1:test',
+        },
+        stdin: 'pipe',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      await new Promise(r => setTimeout(r, 2500))
+      child.kill()
+      const [out, err] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ])
+      const notifications: string[] = []
+      for (const line of out.split('\n')) {
+        if (!line.trim()) continue
+        try {
+          const msg = JSON.parse(line)
+          if (msg.method === 'notifications/claude/channel') notifications.push(msg.params.content)
+        } catch {}
+      }
+      const calls = readFileSync(callsLog, 'utf8').split('\n').filter(Boolean)
+      return { notifications, calls, stderr: err }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  const allowlist = { dmPolicy: 'allowlist', allowFrom: [String(ALLOWED_ID)], groups: {}, pending: {} }
+  // Any Bot API method that puts a message in front of the sender.
+  const botReplies = (calls: string[]) =>
+    calls.filter(m => m.startsWith('send') && m !== 'sendChatAction')
+
+  for (const cmd of ['/start', '/help', '/status']) {
+    test(`${cmd} from an allowlisted DM sender -> one session notification, zero bot replies`, async () => {
+      const r = await runWithCommand(ALLOWED_ID, cmd, allowlist)
+      expect(r.calls, `server never polled: ${r.stderr}`).toContain('getUpdates')
+      expect(r.notifications).toEqual([cmd])
+      expect(botReplies(r.calls)).toEqual([])
+    }, 15000)
+
+    test(`${cmd} from a non-allowlisted DM sender (dmPolicy allowlist) -> no notification, no bot reply`, async () => {
+      const r = await runWithCommand(STRANGER_ID, cmd, allowlist)
+      expect(r.calls, `server never polled: ${r.stderr}`).toContain('getUpdates')
+      expect(r.notifications).toEqual([])
+      expect(botReplies(r.calls)).toEqual([])
+    }, 15000)
+  }
+
+  test('no command menu is registered with Telegram on start', async () => {
+    const r = await runWithCommand(STRANGER_ID, '/start', allowlist)
+    expect(r.calls).toContain('getUpdates')
+    expect(r.calls).not.toContain('setMyCommands')
+  }, 15000)
+})

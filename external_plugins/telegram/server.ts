@@ -626,23 +626,10 @@ function gate(ctx: Context): GateResult {
   return { action: 'drop' }
 }
 
-// Like gate() but for bot commands: no pairing side effects, just allow/drop.
-function dmCommandGate(ctx: Context): { access: Access; senderId: string } | null {
-  if (ctx.chat?.type !== 'private') return null
-  if (!ctx.from) return null
-  const senderId = String(ctx.from.id)
-  const access = loadAccess()
-  const pruned = pruneExpired(access)
-  if (pruned) saveAccess(access)
-  if (access.dmPolicy === 'disabled') return null
-  if (access.dmPolicy === 'allowlist' && !access.allowFrom.includes(senderId)) return null
-  return { access, senderId }
-}
-
 // Gate for message_reaction updates: allow/drop only, never pairing.
 // A reaction is not a message — it must not mint pairing codes or send any
-// reply, so this is intentionally side-effect-free (mirrors dmCommandGate's
-// shape, not gate()'s). Returns the reacting user's id when allowed.
+// reply, so this is intentionally side-effect-free (allow/drop only, unlike
+// gate()). Returns the reacting user's id when allowed.
 //
 // Anonymous reactions arrive with actor_chat set and `from` (messageReaction.user)
 // absent — we can't authenticate the actor against the user allowlist, so we
@@ -1269,55 +1256,6 @@ setInterval(() => {
     shutdown(`orphan-watchdog: ${detail}`)
   }
 }, 5000).unref()
-
-// Commands are DM-only. Responding in groups would: (1) leak pairing codes via
-// /status to other group members, (2) confirm bot presence in non-allowlisted
-// groups, (3) spam channels the operator never approved. Silent drop matches
-// the gate's behavior for unrecognized groups.
-
-bot.command('start', async ctx => {
-  if (!dmCommandGate(ctx)) return
-  await ctx.reply(
-    `This bot bridges Telegram to a Claude Code session.\n\n` +
-    `To pair:\n` +
-    `1. DM me anything — you'll get a 6-char code\n` +
-    `2. In Claude Code: /telegram:access pair <code>\n\n` +
-    `After that, DMs here reach that session.`
-  )
-})
-
-bot.command('help', async ctx => {
-  if (!dmCommandGate(ctx)) return
-  await ctx.reply(
-    `Messages you send here route to a paired Claude Code session. ` +
-    `Text and photos are forwarded; replies and reactions come back.\n\n` +
-    `/start — pairing instructions\n` +
-    `/status — check your pairing state`
-  )
-})
-
-bot.command('status', async ctx => {
-  const gated = dmCommandGate(ctx)
-  if (!gated) return
-  const { access, senderId } = gated
-
-  if (access.allowFrom.includes(senderId)) {
-    const name = ctx.from!.username ? `@${ctx.from!.username}` : senderId
-    await ctx.reply(`Paired as ${name}.`)
-    return
-  }
-
-  for (const [code, p] of Object.entries(access.pending)) {
-    if (p.senderId === senderId) {
-      await ctx.reply(
-        `Pending pairing — run in Claude Code:\n\n/telegram:access pair ${code}`
-      )
-      return
-    }
-  }
-
-  await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
-})
 
 // Inline-button handler for permission requests AND checklist toggles.
 // Checklist callback data is `chk:<idx>` — see checklist.ts for the
@@ -2257,14 +2195,6 @@ void (async () => {
           attempt = 0
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
-          void bot.api.setMyCommands(
-            [
-              { command: 'start', description: 'Welcome and setup guide' },
-              { command: 'help', description: 'What this bot can do' },
-              { command: 'status', description: 'Check your pairing status' },
-            ],
-            { scope: { type: 'all_private_chats' } },
-          ).catch(() => {})
         },
       })
       return // bot.stop() was called — clean exit from the loop
