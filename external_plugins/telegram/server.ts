@@ -68,6 +68,7 @@ import {
 import {
   deliverVoiceTranscript,
   DOWNLOAD_TIMEOUT_MS,
+  ownerTgId,
   serialize,
   transcribeFlags,
   voiceAuthor,
@@ -99,7 +100,7 @@ try {
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 
-// Route A (SemenAssistant analysis/routea-spec-FINAL.md — authenticated owner-
+// Route A (sam-data dev/analysis/routea-spec-FINAL.md — authenticated owner-
 // approval side-channel). The plugin ADDITIVELY appends a signed, structured
 // approval event to a 0600 JSONL file whenever the CONFIGURED OWNER reacts/
 // replies in their own DM — the bridge (a separate, non-LLM process) tails +
@@ -169,28 +170,28 @@ function emitApprovalSignal(f: ApprovalFields): void {
 // idea-inbox (async topic capture). Directory comes from IDEA_INBOX_DIR (env or
 // the channel .env). Unset => async routing is DISABLED and every message routes
 // 'work' (fail-safe: the channel keeps its current behaviour). NOT hardcoded so
-// the store lives in Семён's repo (e.g. <repo>/tasks/idea-inbox) without baking
+// the store lives in Sam's repo (e.g. <repo>/tasks/idea-inbox) without baking
 // an absolute path into the plugin. See idea-inbox.ts / the idea-inbox spec.
 const IDEA_INBOX_DIR = ideaInboxDir(process.env)
 
 // Voice ideas captured into an async (Ideas) topic are transcribed on capture
-// via this command (whisper wrapper, wired by the orchestrator in start-semen.sh
+// via this command (whisper wrapper, wired by the orchestrator in start-sam.sh
 // — NOT hardcoded). Unset => transcription is disabled and the voice idea stays
 // status:'new' with its file_id (deferred to triage). See transcribeVoiceIdea.
 const TRANSCRIBE_CMD = transcribeCmd(process.env)
 
 // Owner identity for voice-trust decisions on the WORK route (OB-06/OB-07 —
-// SemenAssistant analysis/2026-09-17-bridge-voice-spec-FINAL.md §6.5). Wired
-// by tools/start-semen.sh, derived from the canonical
+// sam-data dev/analysis/2026-09-17-bridge-voice-spec-FINAL.md §6.5). Wired
+// by tools/start-sam.sh, derived from the canonical
 // tools/delivery_oracle.py::OWNER_CHAT_ID — deliberately NOT
 // SAM_WA_APPROVAL_OWNER_ID (F10 in the spec: that one is unset in the live
 // bridge; reusing it here would silently mark every voice as someone else's,
 // forever). Unset => fail-safe: every voice becomes voice_trust='data', never
 // mistakenly 'owner'.
-const OWNER_TG_ID = process.env.SEMEN_OWNER_TG_ID
+const OWNER_TG_ID = ownerTgId(process.env)
 if (!OWNER_TG_ID) {
   safeStderr(
-    'telegram channel: SEMEN_OWNER_TG_ID not set — every voice message will get voice_trust="data" (fail-safe)\n',
+    'telegram channel: SAM_OWNER_TG_ID not set — every voice message will get voice_trust="data" (fail-safe)\n',
   )
 }
 
@@ -1603,7 +1604,7 @@ bot.on('message_reaction', async ctx => {
   // wake the session even though the message itself was captured silently. Map
   // the reacted message_id back to its thread via the durable store and suppress
   // the notification for async threads. DEFAULT-SAFE: an unknown message_id (not
-  // in the store — work messages, Семён's own messages) is never suppressed.
+  // in the store — work messages, Sam's own messages) is never suppressed.
   // See shouldSuppressReaction + the idea-inbox spec.
   if (shouldSuppressReaction(gated.access, IDEA_INBOX_DIR, chat_id, r.message_id)) {
     return
@@ -2043,7 +2044,7 @@ async function handleInbound(
       .catch(() => {})
   }
 
-  // ── serialized delivery block (OB-09 — SemenAssistant analysis/2026-09-17-
+  // ── serialized delivery block (OB-09 — sam-data dev/analysis/2026-09-17-
   // bridge-voice-spec-FINAL.md §6.2) ─────────────────────────────────────
   // Everything from "fetch the attachment's bytes" (photo's existing
   // downloadImage / voice's new transcribe-on-the-work-route) through the

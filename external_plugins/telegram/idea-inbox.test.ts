@@ -571,7 +571,7 @@ describe('shouldSuppressReaction — reaction thread parity', () => {
     expect(shouldSuppressReaction(access, dir, SUPERGROUP, 7777)).toBe(false)
   })
 
-  // Unknown message_id (e.g. a reaction on one of Семён's own messages, or one
+  // Unknown message_id (e.g. a reaction on one of Sam's own messages, or one
   // captured before the store existed) => DEFAULT-SAFE: never drop it.
   test('unknown message_id => let through (false)', () => {
     expect(shouldSuppressReaction(access, dir, SUPERGROUP, 999999)).toBe(false)
@@ -617,29 +617,38 @@ describe('shouldSuppressReaction — reaction thread parity', () => {
   })
 })
 
+// The retired pre-SAM env-name prefix, built so the source never spells it.
+const OLD = String.fromCharCode(83, 69, 77, 69, 78)
+
 // ── transcribeCmd resolver ───────────────────────────────────────────────────
 describe('transcribeCmd', () => {
-  test('returns undefined when SEMEN_TRANSCRIBE_CMD unset/blank', () => {
+  test('returns undefined when SAM_TRANSCRIBE_CMD unset/blank', () => {
     expect(transcribeCmd({} as NodeJS.ProcessEnv)).toBeUndefined()
-    expect(transcribeCmd({ SEMEN_TRANSCRIBE_CMD: '  ' } as NodeJS.ProcessEnv)).toBeUndefined()
+    expect(transcribeCmd({ SAM_TRANSCRIBE_CMD: '  ' } as NodeJS.ProcessEnv)).toBeUndefined()
   })
   test('returns the command when set', () => {
-    expect(transcribeCmd({ SEMEN_TRANSCRIBE_CMD: 'whisper-wrap' } as NodeJS.ProcessEnv)).toBe('whisper-wrap')
+    expect(transcribeCmd({ SAM_TRANSCRIBE_CMD: 'whisper-wrap' } as NodeJS.ProcessEnv)).toBe('whisper-wrap')
+  })
+  test('ignores the retired pre-SAM transcribe name (no fallback)', () => {
+    expect(transcribeCmd({ [OLD + '_TRANSCRIBE_CMD']: 'whisper-wrap' } as NodeJS.ProcessEnv)).toBeUndefined()
   })
 })
 
 // ── ttsCmd resolver (voice-reply TTS command) ────────────────────────────────
 describe('ttsCmd', () => {
-  test('returns undefined when both SEMEN_TTS_CMD and IDEA_INBOX_DIR unset/blank', () => {
+  test('returns undefined when both SAM_TTS_CMD and IDEA_INBOX_DIR unset/blank', () => {
     expect(ttsCmd({} as NodeJS.ProcessEnv)).toBeUndefined()
-    expect(ttsCmd({ SEMEN_TTS_CMD: '   ' } as NodeJS.ProcessEnv)).toBeUndefined()
+    expect(ttsCmd({ SAM_TTS_CMD: '   ' } as NodeJS.ProcessEnv)).toBeUndefined()
     expect(ttsCmd({ IDEA_INBOX_DIR: '  ' } as NodeJS.ProcessEnv)).toBeUndefined()
   })
-  test('returns SEMEN_TTS_CMD verbatim when set (wins over the fallback)', () => {
-    expect(ttsCmd({ SEMEN_TTS_CMD: 'say-it' } as NodeJS.ProcessEnv)).toBe('say-it')
+  test('returns SAM_TTS_CMD verbatim when set (wins over the fallback)', () => {
+    expect(ttsCmd({ SAM_TTS_CMD: 'say-it' } as NodeJS.ProcessEnv)).toBe('say-it')
     expect(
-      ttsCmd({ SEMEN_TTS_CMD: 'say-it', IDEA_INBOX_DIR: '/repo/tasks/idea-inbox' } as NodeJS.ProcessEnv),
+      ttsCmd({ SAM_TTS_CMD: 'say-it', IDEA_INBOX_DIR: '/repo/tasks/idea-inbox' } as NodeJS.ProcessEnv),
     ).toBe('say-it')
+  })
+  test('ignores the retired pre-SAM TTS name (no fallback)', () => {
+    expect(ttsCmd({ [OLD + '_TTS_CMD']: 'say-it' } as NodeJS.ProcessEnv)).toBeUndefined()
   })
   test('derives <repo>/tools/tts.sh from IDEA_INBOX_DIR (=<repo>/tasks/idea-inbox)', () => {
     expect(ttsCmd({ IDEA_INBOX_DIR: '/repo/tasks/idea-inbox' } as NodeJS.ProcessEnv)).toBe(

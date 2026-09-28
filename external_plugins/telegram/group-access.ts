@@ -18,7 +18,7 @@
 //     exactly as before, but reply/react/edit_message refuse to send there
 //     until the owner explicitly flips it to 'open' via /telegram:access.
 //     Default (field absent) is 'open' — every group configured before this
-//     field existed (e.g. the live Семён Group / idea-inbox flow) keeps
+//     field existed (e.g. the live Sam Group / idea-inbox flow) keeps
 //     posting exactly as it does today. This exists because a group with a
 //     third party in it (the assistant reading a friend's group) must never
 //     let the session autonomously post to that third party — per
