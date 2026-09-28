@@ -40,7 +40,13 @@ import {
   voiceSendOpts,
 } from './idea-inbox'
 import { ReactionQueue, type ReactionJob } from './reaction-queue'
-import { checkOutboundAllowed, recordSeenGroup, type SeenGroup } from './group-access'
+import {
+  checkOutboundAllowed,
+  groupMessageDecision,
+  groupReactionAllowed,
+  recordSeenGroup,
+  type SeenGroup,
+} from './group-access'
 import {
   appendToGroupBuffer,
   contextBufferEnabled,
@@ -408,6 +414,14 @@ type GroupPolicy = {
    * contextBufferEnabled() / deliverWakeWithBuffer() in group-buffer.ts.
    */
   contextBuffer?: boolean
+  /**
+   * false — this group NEVER wakes the session: an @mention, a reply to the
+   * bot or a mentionPatterns match is handled like any other message
+   * (buffered if contextBuffer:true, else dropped), and member reactions are
+   * ignored. Default (field absent, or true) = today's behaviour. See
+   * groupMessageDecision() / groupReactionAllowed() in group-access.ts.
+   */
+  wakeOnMention?: boolean
 }
 
 type Access = {
@@ -608,19 +622,12 @@ function gate(ctx: Context): GateResult {
       }
       return { action: 'drop' }
     }
-    const groupAllowFrom = policy.allowFrom ?? []
-    const requireMention = policy.requireMention ?? true
-    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
-      return { action: 'drop' }
-    }
-    if (requireMention && !isMentioned(ctx, access.mentionPatterns)) {
-      // ONLY this branch changes for contextBuffer:true — the allowlist/
-      // mention AUTH decision above is untouched; a sender who wouldn't have
-      // been delivered before still isn't buffered either.
-      if (contextBufferEnabled(policy)) return { action: 'buffer' }
-      return { action: 'drop' }
-    }
-    return { action: 'deliver', access }
+    // allowFrom → mention → contextBuffer / wakeOnMention: group-access.ts.
+    const decision = groupMessageDecision(policy, senderId, () =>
+      isMentioned(ctx, access.mentionPatterns),
+    )
+    if (decision === 'deliver') return { action: 'deliver', access }
+    return { action: decision }
   }
 
   return { action: 'drop' }
@@ -651,9 +658,8 @@ function reactionGate(ctx: Context): { senderId: string; access: Access } | null
   if (chatType === 'group' || chatType === 'supergroup') {
     const policy = access.groups[String(ctx.chat!.id)]
     if (!policy) return null
-    const groupAllowFrom = policy.allowFrom ?? []
-    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return null
-    return { senderId, access }
+    // allowFrom + wakeOnMention:false (never-wake group): group-access.ts.
+    return groupReactionAllowed(policy, senderId) ? { senderId, access } : null
   }
 
   return null

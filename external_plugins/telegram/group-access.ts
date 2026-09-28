@@ -27,6 +27,8 @@
 //     judgment, since group message CONTENT is untrusted input and a prompt
 //     injection inside it must not be able to talk the session into posting.
 
+import { contextBufferEnabled } from './group-buffer'
+
 export type SeenGroup = {
   title?: string
   lastSenderId: string
@@ -101,4 +103,53 @@ export function checkOutboundAllowed(access: PostGateAccess, chat_id: string): P
     }
   }
   return { allowed: true }
+}
+
+// ── Inbound group gating (message + reaction) ───────────────────────────────
+// The group branch of gate() / reactionGate() in server.ts, extracted so it is
+// unit-testable. For every group WITHOUT wakeOnMention:false the decision is
+// exactly what gate()/reactionGate() made before.
+//
+// wakeOnMention:false (default: absent = true) makes a group NEVER wake the
+// session: a mention / reply-to-bot / mentionPatterns match is treated like any
+// other message (buffered if contextBuffer:true, else dropped), and member
+// reactions are ignored. For a group whose members are untrusted (e.g. client
+// agents posting feedback) — their text must only ever reach the buffer file.
+
+/** Minimal shape the inbound group gate needs from a GroupPolicy. */
+export type GroupGatePolicy = {
+  requireMention?: boolean
+  allowFrom?: string[]
+  contextBuffer?: boolean
+  wakeOnMention?: boolean
+}
+
+function groupSenderAllowed(policy: GroupGatePolicy, senderId: string): boolean {
+  const groupAllowFrom = policy.allowFrom ?? []
+  return groupAllowFrom.length === 0 || groupAllowFrom.includes(senderId)
+}
+
+/**
+ * Decide a message in a CONFIGURED group. `isMentioned` is a thunk so mention
+ * detection (needs the bot username) stays in server.ts and runs only when it
+ * matters, as before.
+ */
+export function groupMessageDecision(
+  policy: GroupGatePolicy,
+  senderId: string,
+  isMentioned: () => boolean,
+): 'deliver' | 'buffer' | 'drop' {
+  if (!groupSenderAllowed(policy, senderId)) return 'drop'
+  const requireMention = policy.requireMention ?? true
+  const wakes = policy.wakeOnMention !== false && (!requireMention || isMentioned())
+  if (wakes) return 'deliver'
+  // The allowlist decision above is untouched by contextBuffer: a sender who
+  // wouldn't have been delivered isn't buffered either.
+  return contextBufferEnabled(policy) ? 'buffer' : 'drop'
+}
+
+/** Whether a member's reaction in a CONFIGURED group may reach the session. */
+export function groupReactionAllowed(policy: GroupGatePolicy, senderId: string): boolean {
+  if (policy.wakeOnMention === false) return false
+  return groupSenderAllowed(policy, senderId)
 }
