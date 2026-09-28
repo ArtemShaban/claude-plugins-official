@@ -2,37 +2,97 @@
 // bridge-voice-spec-FINAL.md §11). Pure/effect-injected — no real subprocess,
 // no network, no import of server.ts (F16: server.ts has top-level side
 // effects that would make it unsafe to import from a test file).
-import { describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   deliverVoiceTranscript,
   forwardOriginMeta,
-  ownerTgId,
   serialize,
   transcribeFlags,
+  userVoiceConfig,
   voiceAuthor,
   whisperTimeoutMs,
   withTimeout,
   type VoiceAuthorResult,
 } from './voice-delivery'
 
-// The retired pre-SAM env-name prefix, built so the source never spells it.
-const OLD = String.fromCharCode(83, 69, 77, 69, 78)
+// ── userVoiceConfig — the user's chat id + voice language from sam-data
+// config.json (D-454, D-449), read on a temp home; no env fallback ───────────
+describe('userVoiceConfig', () => {
+  const homes: string[] = []
+  // `config` = the file body (string, written as-is) or undefined = no file.
+  const homeWith = (config: string | undefined): string => {
+    const home = mkdtempSync(join(tmpdir(), 'uvc-'))
+    homes.push(home)
+    const dir = join(home, 'Workspace', 'ClaudeProjects', 'sam-data')
+    mkdirSync(dir, { recursive: true })
+    if (config !== undefined) writeFileSync(join(dir, 'config.json'), config)
+    return home
+  }
+  const cfg = (user: unknown): string => JSON.stringify(user === undefined ? {} : { user })
+  afterAll(() => { for (const h of homes) rmSync(h, { recursive: true, force: true }) })
 
-// ── ownerTgId — reads SAM_OWNER_TG_ID only (no legacy name) ─────────────────
-describe('ownerTgId', () => {
-  test('reads SAM_OWNER_TG_ID', () => {
-    expect(ownerTgId({ SAM_OWNER_TG_ID: '424242424' } as NodeJS.ProcessEnv)).toBe('424242424')
+  // A2 — language comes from user.language
+  test('user.language "ru" => ru', () => {
+    expect(userVoiceConfig(homeWith(cfg({ language: 'ru' }))).lang).toBe('ru')
   })
-  test('ignores the retired pre-SAM owner-id name (no fallback)', () => {
-    expect(ownerTgId({ [OLD + '_OWNER_TG_ID']: '424242424' } as NodeJS.ProcessEnv)).toBeUndefined()
+  test('user.language "en" => en', () => {
+    expect(userVoiceConfig(homeWith(cfg({ language: 'en' }))).lang).toBe('en')
   })
-  test('the retired name alone gives voice_trust=data for the owner', () => {
-    const id = ownerTgId({ [OLD + '_OWNER_TG_ID']: '424242424' } as NodeJS.ProcessEnv)
-    expect(voiceAuthor({ from: { id: 424242424 } as never, forwardOrigin: undefined }, id).voice_trust).toBe('data')
+
+  // A3 — every missing case => auto
+  test('language key absent => auto', () => {
+    expect(userVoiceConfig(homeWith(cfg({ telegram_chat_id: '424242424' }))).lang).toBe('auto')
   })
-  test('the new name gives voice_trust=owner for the same author', () => {
-    const id = ownerTgId({ SAM_OWNER_TG_ID: '424242424' } as NodeJS.ProcessEnv)
-    expect(voiceAuthor({ from: { id: 424242424 } as never, forwardOrigin: undefined }, id).voice_trust).toBe('owner')
+  test('language empty string => auto', () => {
+    expect(userVoiceConfig(homeWith(cfg({ language: '' }))).lang).toBe('auto')
+  })
+  test('user absent => auto', () => {
+    expect(userVoiceConfig(homeWith(cfg(undefined))).lang).toBe('auto')
+  })
+  test('config file missing => auto', () => {
+    expect(userVoiceConfig(homeWith(undefined)).lang).toBe('auto')
+  })
+  test('malformed JSON => auto', () => {
+    expect(userVoiceConfig(homeWith('{ not json')).lang).toBe('auto')
+  })
+
+  // A4 — chat id from user.telegram_chat_id only
+  test('valid telegram_chat_id => that id', () => {
+    expect(userVoiceConfig(homeWith(cfg({ telegram_chat_id: '424242424' }))).chatId).toBe('424242424')
+  })
+  test('chat id key absent => none', () => {
+    expect(userVoiceConfig(homeWith(cfg({ language: 'ru' }))).chatId).toBeUndefined()
+  })
+  test('chat id empty => none', () => {
+    expect(userVoiceConfig(homeWith(cfg({ telegram_chat_id: '' }))).chatId).toBeUndefined()
+  })
+  test('chat id non-numeric => none', () => {
+    expect(userVoiceConfig(homeWith(cfg({ telegram_chat_id: 'abc12345' }))).chatId).toBeUndefined()
+  })
+  test('chat id: config file missing => none', () => {
+    expect(userVoiceConfig(homeWith(undefined)).chatId).toBeUndefined()
+  })
+  test('chat id: malformed JSON => none', () => {
+    expect(userVoiceConfig(homeWith('{ not json')).chatId).toBeUndefined()
+  })
+  test('SAM_OWNER_TG_ID in env and no id in config => none (env ignored)', () => {
+    const prev = process.env.SAM_OWNER_TG_ID
+    process.env.SAM_OWNER_TG_ID = '424242424'
+    try {
+      const { chatId } = userVoiceConfig(homeWith(cfg({ language: 'ru' })))
+      expect(chatId).toBeUndefined()
+      expect(voiceAuthor({ from: { id: 424242424 } as never, forwardOrigin: undefined }, chatId).voice_trust).toBe('data')
+    } finally {
+      if (prev === undefined) delete process.env.SAM_OWNER_TG_ID
+      else process.env.SAM_OWNER_TG_ID = prev
+    }
+  })
+  test('the configured id gives voice_trust=owner for the same author', () => {
+    const { chatId } = userVoiceConfig(homeWith(cfg({ telegram_chat_id: '424242424', language: 'ru' })))
+    expect(voiceAuthor({ from: { id: 424242424 } as never, forwardOrigin: undefined }, chatId).voice_trust).toBe('owner')
   })
 })
 
@@ -162,7 +222,7 @@ describe('voiceAuthor', () => {
     expect(r.voice_author_id).toBe('999')
   })
 
-  test('no forward_origin, owner sent it, but SAM_OWNER_TG_ID is unset => data (fail-safe)', () => {
+  test('no forward_origin, owner sent it, but config.json has no chat id => data (fail-safe)', () => {
     const r = voiceAuthor({ from: owner, forwardOrigin: undefined }, undefined)
     expect(r.voice_trust).toBe('data')
   })

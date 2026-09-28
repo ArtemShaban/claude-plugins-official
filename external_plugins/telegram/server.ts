@@ -69,9 +69,9 @@ import {
   deliverVoiceTranscript,
   DOWNLOAD_TIMEOUT_MS,
   forwardOriginMeta,
-  ownerTgId,
   serialize,
   transcribeFlags,
+  userVoiceConfig,
   voiceAuthor,
   whisperTimeoutMs,
   withTimeout,
@@ -182,18 +182,16 @@ const IDEA_INBOX_DIR = ideaInboxDir(process.env)
 // (deferred to triage). See transcribeVoiceIdea.
 const TRANSCRIBE_CMD = transcribeCmd(process.env)
 
-// Owner identity for voice-trust decisions on the WORK route (OB-06/OB-07 —
-// sam-data dev/analysis/2026-09-17-bridge-voice-spec-FINAL.md §6.5). Wired
-// by tools/start-sam.sh, derived from the canonical
-// tools/delivery_oracle.py::OWNER_CHAT_ID — deliberately NOT
-// SAM_WA_APPROVAL_OWNER_ID (F10 in the spec: that one is unset in the live
-// bridge; reusing it here would silently mark every voice as someone else's,
-// forever). Unset => fail-safe: every voice becomes voice_trust='data', never
-// mistakenly 'owner'.
-const OWNER_TG_ID = ownerTgId(process.env)
+// The user's identity for voice-trust decisions on the WORK route (OB-06/OB-07
+// — sam-data dev/analysis/2026-09-17-bridge-voice-spec-FINAL.md §6.5) and the
+// language of the user's own voice, both read once at start from the user's
+// sam-data config.json (D-454, D-449): user.telegram_chat_id and
+// user.language. No id => fail-safe: every voice becomes voice_trust='data',
+// never mistakenly 'owner'. No language => 'auto' (whisper detects it).
+const { chatId: OWNER_TG_ID, lang: USER_VOICE_LANG } = userVoiceConfig(homedir())
 if (!OWNER_TG_ID) {
   safeStderr(
-    'telegram channel: SAM_OWNER_TG_ID not set — every voice message will get voice_trust="data" (fail-safe)\n',
+    'telegram channel: config.json user.telegram_chat_id not set — every voice message will get voice_trust="data" (fail-safe)\n',
   )
 }
 
@@ -1922,7 +1920,7 @@ async function handleInbound(
     }
     void transcribeVoiceIdea(TRANSCRIBE_CMD != null, {
       download: () => downloadFileToInbox(fileId, voiceDir, sizeHint, 'oga'),
-      transcribe: audioPath => runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, 'ru'),
+      transcribe: audioPath => runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, USER_VOICE_LANG),
       onSuccess: (transcript, audioPath) => recordTranscript(voiceDir, recId, transcript, audioPath),
       replyTranscript: async transcript => {
         await bot.api
@@ -2018,7 +2016,7 @@ async function handleInbound(
     if (attachment?.kind === 'voice') {
       const ownerSent = OWNER_TG_ID != null && String(from.id) === OWNER_TG_ID
       const author = voiceAuthor({ from: ctx.from, forwardOrigin: ctx.message?.forward_origin }, OWNER_TG_ID)
-      const lang = author.voice_trust === 'owner' ? 'ru' : 'auto'
+      const lang = author.voice_trust === 'owner' ? USER_VOICE_LANG : 'auto'
       const timeoutMs = whisperTimeoutMs(attachment.duration ?? 0)
       const fileId = attachment.file_id
       const sizeHint = attachment.size

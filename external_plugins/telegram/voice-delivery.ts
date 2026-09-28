@@ -9,12 +9,14 @@
  * has top-level side effects (reads the bot token off disk, `process.exit(1)`
  * on misconfig) that make it unsafe to import from a test file. This module
  * has none: it only imports TYPES from grammy (erased at compile time, zero
- * runtime footprint). server.ts wires the real I/O (spawn/fetch/fs) and
+ * runtime footprint); userVoiceConfig reads a file only when called. server.ts wires the real I/O (spawn/fetch/fs) and
  * calls into this module's effect-injected orchestrators — the exact same
  * seam idea-inbox.ts already uses for `transcribeVoiceIdea` /
  * `downloadIdeaAttachment`.
  */
 import type { Chat, MessageOrigin, User } from 'grammy/types'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 // ── per-key FIFO serializer (OB-09 — owner tg 17093, "это оч важно": text1 →
 // voice → text2 must reach the session in that same order, even when the
@@ -201,11 +203,34 @@ export function forwardOriginMeta(
   }
 }
 
-// Owner Telegram user id for voice trust, read from SAM_OWNER_TG_ID only (the
-// launcher exports it). Returned raw: undefined or '' means "not configured"
-// and voiceAuthor() then gives every voice voice_trust='data' (fail-safe).
-export function ownerTgId(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  return env.SAM_OWNER_TG_ID
+// The user's own settings, read once at start from sam-data config.json (D-454,
+// D-449): `<home>/Workspace/ClaudeProjects/sam-data/config.json` — the same
+// path rule as sam-core tools/sam_data.py::data_root_of.
+// - chatId: `user.telegram_chat_id`, trimmed, kept only if it is an optional
+//   minus + 5-20 digits (same rule as sam_data.py::telegram_chat_id). Missing,
+//   invalid, unreadable or malformed config => undefined, and voiceAuthor()
+//   then gives every voice voice_trust='data' (fail-safe). No env fallback.
+// - lang: `user.language` when a non-empty string, else 'auto' (whisper
+//   detects the language itself).
+export type UserVoiceConfig = { chatId: string | undefined; lang: string }
+
+export function userVoiceConfig(home: string): UserVoiceConfig {
+  let user: unknown
+  try {
+    const cfg = JSON.parse(readFileSync(join(home, 'Workspace', 'ClaudeProjects', 'sam-data', 'config.json'), 'utf8'))
+    user = cfg != null && typeof cfg === 'object' ? (cfg as Record<string, unknown>).user : undefined
+  } catch {
+    return { chatId: undefined, lang: 'auto' }
+  }
+  if (user == null || typeof user !== 'object') return { chatId: undefined, lang: 'auto' }
+  const u = user as Record<string, unknown>
+  const rawId = u.telegram_chat_id
+  const id = typeof rawId === 'string' || typeof rawId === 'number' ? String(rawId).trim() : ''
+  const lang = typeof u.language === 'string' ? u.language.trim() : ''
+  return {
+    chatId: /^-?[0-9]{5,20}$/.test(id) ? id : undefined,
+    lang: lang || 'auto',
+  }
 }
 
 // voice_author_origin covers exactly the 5 forms named in the spec (A6): no
@@ -232,8 +257,8 @@ export function voiceAuthor(input: VoiceAuthorInput, ownerId: string | undefined
   }
 
   // A7: owner trust requires BOTH a non-forwarded message AND the author id
-  // matching the configured owner id — an empty ownerId (SAM_OWNER_TG_ID
-  // unset) or ANY forwarding (including the owner re-forwarding his own old
+  // matching the configured owner id — an empty ownerId (no valid
+  // user.telegram_chat_id in config.json) or ANY forwarding (including the owner re-forwarding his own old
   // voice) always lands on 'data'. Fail-safe: never mistakenly 'owner'.
   const trust: VoiceTrust = originTag === 'sender' && !!ownerId && id === ownerId ? 'owner' : 'data'
 
