@@ -176,9 +176,10 @@ function emitApprovalSignal(f: ApprovalFields): void {
 const IDEA_INBOX_DIR = ideaInboxDir(process.env)
 
 // Voice ideas captured into an async (Ideas) topic are transcribed on capture
-// via this command (whisper wrapper, wired by the orchestrator in start-sam.sh
-// — NOT hardcoded). Unset => transcription is disabled and the voice idea stays
-// status:'new' with its file_id (deferred to triage). See transcribeVoiceIdea.
+// via this command (whisper wrapper, wired by the launcher as SAM_TRANSCRIBE_CMD
+// — the ONLY source; the plugin never guesses a path). Unset => transcription
+// is disabled and the voice idea stays status:'new' with its file_id
+// (deferred to triage). See transcribeVoiceIdea.
 const TRANSCRIBE_CMD = transcribeCmd(process.env)
 
 // Owner identity for voice-trust decisions on the WORK route (OB-06/OB-07 —
@@ -197,8 +198,8 @@ if (!OWNER_TG_ID) {
 }
 
 // Text-to-speech command for the reply tool's voice:true option (synthesize an
-// Opus .ogg voice bubble of the reply text). Wired by the orchestrator (or
-// derived from IDEA_INBOX_DIR as <repo>/tools/tts.sh) — NOT hardcoded. Unset =>
+// Opus .ogg voice bubble of the reply text). Wired by the launcher as
+// SAM_TTS_CMD — the ONLY source; the plugin never guesses a path. Unset =>
 // voice replies are skipped gracefully; the text reply is unaffected. See
 // sendVoiceReply / ttsCmd.
 const TTS_CMD = ttsCmd(process.env)

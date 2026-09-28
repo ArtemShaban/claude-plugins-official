@@ -314,7 +314,7 @@ export async function deliverVoiceTranscript(
   const fallback: VoiceEnvelope = { text: caption ?? '(voice message)', meta: {} }
 
   if (!cmdConfigured) {
-    fx.logNotice('TRANSCRIBE_CMD unset — delivering (voice message) placeholder')
+    fx.logNotice('SAM_TRANSCRIBE_CMD unset — delivering (voice message) placeholder')
     return fallback
   }
 

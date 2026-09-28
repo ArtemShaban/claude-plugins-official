@@ -632,16 +632,24 @@ describe('transcribeCmd', () => {
   test('ignores the retired pre-SAM transcribe name (no fallback)', () => {
     expect(transcribeCmd({ [OLD + '_TRANSCRIBE_CMD']: 'whisper-wrap' } as NodeJS.ProcessEnv)).toBeUndefined()
   })
+  test('never derives a command from IDEA_INBOX_DIR (no guessed path)', () => {
+    expect(transcribeCmd({ IDEA_INBOX_DIR: '/repo/tasks/idea-inbox' } as NodeJS.ProcessEnv)).toBeUndefined()
+  })
+  test('SAM_TRANSCRIBE_CMD wins verbatim even with IDEA_INBOX_DIR set', () => {
+    expect(
+      transcribeCmd({ SAM_TRANSCRIBE_CMD: 'whisper-wrap', IDEA_INBOX_DIR: '/repo/tasks/idea-inbox' } as NodeJS.ProcessEnv),
+    ).toBe('whisper-wrap')
+  })
 })
 
 // ── ttsCmd resolver (voice-reply TTS command) ────────────────────────────────
 describe('ttsCmd', () => {
-  test('returns undefined when both SAM_TTS_CMD and IDEA_INBOX_DIR unset/blank', () => {
+  test('returns undefined when SAM_TTS_CMD unset/blank', () => {
     expect(ttsCmd({} as NodeJS.ProcessEnv)).toBeUndefined()
     expect(ttsCmd({ SAM_TTS_CMD: '   ' } as NodeJS.ProcessEnv)).toBeUndefined()
     expect(ttsCmd({ IDEA_INBOX_DIR: '  ' } as NodeJS.ProcessEnv)).toBeUndefined()
   })
-  test('returns SAM_TTS_CMD verbatim when set (wins over the fallback)', () => {
+  test('returns SAM_TTS_CMD verbatim when set', () => {
     expect(ttsCmd({ SAM_TTS_CMD: 'say-it' } as NodeJS.ProcessEnv)).toBe('say-it')
     expect(
       ttsCmd({ SAM_TTS_CMD: 'say-it', IDEA_INBOX_DIR: '/repo/tasks/idea-inbox' } as NodeJS.ProcessEnv),
@@ -650,10 +658,8 @@ describe('ttsCmd', () => {
   test('ignores the retired pre-SAM TTS name (no fallback)', () => {
     expect(ttsCmd({ [OLD + '_TTS_CMD']: 'say-it' } as NodeJS.ProcessEnv)).toBeUndefined()
   })
-  test('derives <repo>/tools/tts.sh from IDEA_INBOX_DIR (=<repo>/tasks/idea-inbox)', () => {
-    expect(ttsCmd({ IDEA_INBOX_DIR: '/repo/tasks/idea-inbox' } as NodeJS.ProcessEnv)).toBe(
-      '/repo/tools/tts.sh',
-    )
+  test('never derives a command from IDEA_INBOX_DIR (no guessed path)', () => {
+    expect(ttsCmd({ IDEA_INBOX_DIR: '/repo/tasks/idea-inbox' } as NodeJS.ProcessEnv)).toBeUndefined()
   })
 })
 

@@ -12,7 +12,7 @@
 // forum topic ids.
 
 import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
-import { dirname, join } from 'path'
+import { join } from 'path'
 
 export type Route = 'work' | 'async' | 'ignore'
 
@@ -118,35 +118,25 @@ export function ideaInboxDir(env: NodeJS.ProcessEnv = process.env): string | und
  * transcript to stdout.
  */
 export function transcribeCmd(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  // The ONLY source is SAM_TRANSCRIBE_CMD. The plugin never guesses or locates
+  // a transcription program itself (no path derived from IDEA_INBOX_DIR or any
+  // other directory) — owner tg 21986/21987.
   const c = env.SAM_TRANSCRIBE_CMD
-  if (c && c.trim()) return c
-  // Fallback (so voice-transcribe works without a separate env wire / session
-  // restart): derive the repo's tools/transcribe.sh from IDEA_INBOX_DIR, which is
-  // `<repo>/tasks/idea-inbox`. Still overridable via SAM_TRANSCRIBE_CMD.
-  const inbox = env.IDEA_INBOX_DIR
-  if (inbox && inbox.trim()) {
-    return join(dirname(dirname(inbox)), 'tools', 'transcribe.sh')
-  }
-  return undefined
+  return c && c.trim() ? c : undefined
 }
 
 /**
  * Resolve the text-to-speech command (used by the reply tool's voice:true
- * option to synthesize a Telegram voice bubble). Returns undefined when neither
- * SAM_TTS_CMD nor IDEA_INBOX_DIR is set — the caller treats that as "voice
- * disabled" (fail-safe: the text reply is unaffected; the voice bubble is simply
- * skipped). Mirrors transcribeCmd exactly: SAM_TTS_CMD wins, else derive the
- * repo's tools/tts.sh from IDEA_INBOX_DIR (which is `<repo>/tasks/idea-inbox`),
- * else undefined. Contract: `<cmd> "<text>" <out.ogg> ru` writes an Opus .ogg.
+ * option to synthesize a Telegram voice bubble). Returns undefined when
+ * SAM_TTS_CMD is unset/blank — the caller treats that as "voice disabled"
+ * (fail-safe: the text reply is unaffected; the voice bubble is simply
+ * skipped). Mirrors transcribeCmd exactly: SAM_TTS_CMD is the ONLY source, the
+ * plugin never guesses a TTS program. Contract: `<cmd> "<text>" <out.ogg> ru`
+ * writes an Opus .ogg.
  */
 export function ttsCmd(env: NodeJS.ProcessEnv = process.env): string | undefined {
   const c = env.SAM_TTS_CMD
-  if (c && c.trim()) return c
-  const inbox = env.IDEA_INBOX_DIR
-  if (inbox && inbox.trim()) {
-    return join(dirname(dirname(inbox)), 'tools', 'tts.sh')
-  }
-  return undefined
+  return c && c.trim() ? c : undefined
 }
 
 export type IdeaRecord = {
@@ -655,7 +645,7 @@ export async function sendVoiceReply(
   fx: VoiceReplyEffects,
 ): Promise<VoiceReplyOutcome> {
   if (!cmdConfigured) {
-    fx.logError('SAM_TTS_CMD unset (and no IDEA_INBOX_DIR fallback) — voice bubble skipped, text already sent')
+    fx.logError('SAM_TTS_CMD unset — voice bubble skipped, text already sent')
     return 'skipped'
   }
   try {
