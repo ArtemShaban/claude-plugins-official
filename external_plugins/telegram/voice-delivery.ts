@@ -1,6 +1,6 @@
 /**
  * Telegram-bridge voice transcription (variant A) — pure / effect-injected
- * building blocks. SemenAssistant analysis/2026-09-17-bridge-voice-spec-
+ * building blocks. sam-data dev/analysis/2026-09-17-bridge-voice-spec-
  * FINAL.md is the SSOT for scope + acceptance criteria; this module carries
  * only the parts that need to be UNIT-testable.
  *
@@ -201,6 +201,13 @@ export function forwardOriginMeta(
   }
 }
 
+// Owner Telegram user id for voice trust, read from SAM_OWNER_TG_ID only (the
+// launcher exports it). Returned raw: undefined or '' means "not configured"
+// and voiceAuthor() then gives every voice voice_trust='data' (fail-safe).
+export function ownerTgId(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return env.SAM_OWNER_TG_ID
+}
+
 // voice_author_origin covers exactly the 5 forms named in the spec (A6): no
 // forward_origin at all => 'sender' (ctx.from IS the author); one of
 // Telegram's 4 MessageOrigin variants when forwarded. `voice_author_id` is
@@ -225,7 +232,7 @@ export function voiceAuthor(input: VoiceAuthorInput, ownerId: string | undefined
   }
 
   // A7: owner trust requires BOTH a non-forwarded message AND the author id
-  // matching the configured owner id — an empty ownerId (SEMEN_OWNER_TG_ID
+  // matching the configured owner id — an empty ownerId (SAM_OWNER_TG_ID
   // unset) or ANY forwarding (including the owner re-forwarding his own old
   // voice) always lands on 'data'. Fail-safe: never mistakenly 'owner'.
   const trust: VoiceTrust = originTag === 'sender' && !!ownerId && id === ownerId ? 'owner' : 'data'

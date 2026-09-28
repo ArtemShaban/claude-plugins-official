@@ -306,7 +306,7 @@ process.exit(0)
   })
 })
 
-// ── Route A — signed approval-channel emit (SemenAssistant analysis/routea-
+// ── Route A — signed approval-channel emit (sam-data dev/analysis/routea-
 // spec-FINAL.md M3) ──────────────────────────────────────────────────────────
 //
 // signApproval/emitApprovalSignal are pure module-level functions in server.ts

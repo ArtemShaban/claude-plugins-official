@@ -92,7 +92,7 @@ describe('checkOutboundAllowed (post-gating)', () => {
     if (!result.allowed) expect(result.reason).toContain('not allowlisted')
   })
 
-  test('a configured group with NO postPolicy field (pre-existing groups, e.g. Семён Group) is allowed — zero regression', () => {
+  test('a configured group with NO postPolicy field (pre-existing groups, e.g. Sam Group) is allowed — zero regression', () => {
     const access: PostGateAccess = { allowFrom: [], groups: { '-1004348136128': {} } }
     expect(checkOutboundAllowed(access, '-1004348136128')).toEqual({ allowed: true })
   })

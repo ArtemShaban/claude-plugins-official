@@ -1,4 +1,4 @@
-// Unit tests for voice-delivery.ts (SemenAssistant analysis/2026-09-17-
+// Unit tests for voice-delivery.ts (sam-data dev/analysis/2026-09-17-
 // bridge-voice-spec-FINAL.md §11). Pure/effect-injected — no real subprocess,
 // no network, no import of server.ts (F16: server.ts has top-level side
 // effects that would make it unsafe to import from a test file).
@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   deliverVoiceTranscript,
   forwardOriginMeta,
+  ownerTgId,
   serialize,
   transcribeFlags,
   voiceAuthor,
@@ -13,6 +14,27 @@ import {
   withTimeout,
   type VoiceAuthorResult,
 } from './voice-delivery'
+
+// The retired pre-SAM env-name prefix, built so the source never spells it.
+const OLD = String.fromCharCode(83, 69, 77, 69, 78)
+
+// ── ownerTgId — reads SAM_OWNER_TG_ID only (no legacy name) ─────────────────
+describe('ownerTgId', () => {
+  test('reads SAM_OWNER_TG_ID', () => {
+    expect(ownerTgId({ SAM_OWNER_TG_ID: '424242424' } as NodeJS.ProcessEnv)).toBe('424242424')
+  })
+  test('ignores the retired pre-SAM owner-id name (no fallback)', () => {
+    expect(ownerTgId({ [OLD + '_OWNER_TG_ID']: '424242424' } as NodeJS.ProcessEnv)).toBeUndefined()
+  })
+  test('the retired name alone gives voice_trust=data for the owner', () => {
+    const id = ownerTgId({ [OLD + '_OWNER_TG_ID']: '424242424' } as NodeJS.ProcessEnv)
+    expect(voiceAuthor({ from: { id: 424242424 } as never, forwardOrigin: undefined }, id).voice_trust).toBe('data')
+  })
+  test('the new name gives voice_trust=owner for the same author', () => {
+    const id = ownerTgId({ SAM_OWNER_TG_ID: '424242424' } as NodeJS.ProcessEnv)
+    expect(voiceAuthor({ from: { id: 424242424 } as never, forwardOrigin: undefined }, id).voice_trust).toBe('owner')
+  })
+})
 
 // ── §11.1 — serialize ───────────────────────────────────────────────────────
 describe('serialize — per-key FIFO chain', () => {
@@ -140,7 +162,7 @@ describe('voiceAuthor', () => {
     expect(r.voice_author_id).toBe('999')
   })
 
-  test('no forward_origin, owner sent it, but SEMEN_OWNER_TG_ID is unset => data (fail-safe)', () => {
+  test('no forward_origin, owner sent it, but SAM_OWNER_TG_ID is unset => data (fail-safe)', () => {
     const r = voiceAuthor({ from: owner, forwardOrigin: undefined }, undefined)
     expect(r.voice_trust).toBe('data')
   })
