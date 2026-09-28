@@ -181,7 +181,11 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
       "postPolicy": "open",
       // true: buffer non-mention messages instead of dropping them — see
       // Context buffer above. Default (field omittable) = silent drop.
-      "contextBuffer": true
+      "contextBuffer": true,
+      // false: this group never wakes the assistant — mentions and replies are
+      // buffered like any other message (dropped without contextBuffer), member
+      // reactions are ignored. Default (field omittable) = true.
+      "wakeOnMention": true
     }
   },
 

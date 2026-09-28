@@ -2,7 +2,15 @@
 // post-gating decision. Pure functions, no fs/bot/network involved.
 
 import { describe, expect, test } from 'bun:test'
-import { checkOutboundAllowed, recordSeenGroup, type PostGateAccess, type SeenGroup } from './group-access'
+import {
+  checkOutboundAllowed,
+  groupMessageDecision,
+  groupReactionAllowed,
+  recordSeenGroup,
+  type GroupGatePolicy,
+  type PostGateAccess,
+  type SeenGroup,
+} from './group-access'
 
 describe('recordSeenGroup (discovery breadcrumb)', () => {
   test('first sighting of an unconfigured group creates one entry', () => {
@@ -110,5 +118,71 @@ describe('checkOutboundAllowed (post-gating)', () => {
     // collide, but the precedence must be deterministic), the DM allow wins.
     const access: PostGateAccess = { allowFrom: ['-100777'], groups: { '-100777': { postPolicy: 'gated' } } }
     expect(checkOutboundAllowed(access, '-100777')).toEqual({ allowed: true })
+  })
+})
+
+describe('groupMessageDecision / groupReactionAllowed (wakeOnMention:false — never-wake group)', () => {
+  const yes = () => true
+  const no = () => false
+  // The feedback-group shape: any member, mention required, buffer on, never wake.
+  const noWake: GroupGatePolicy = { requireMention: true, allowFrom: [], contextBuffer: true, wakeOnMention: false }
+
+  test('flag set: an @mention is buffered, not delivered (no wake)', () => {
+    expect(groupMessageDecision(noWake, '555', yes)).toBe('buffer')
+  })
+
+  test('flag set: a reply-to-bot (isMentioned true via reply) is buffered, not delivered', () => {
+    // isMentioned() counts a reply to the bot as a mention — same boolean in.
+    expect(groupMessageDecision(noWake, '555', yes)).toBe('buffer')
+  })
+
+  test('flag set: a plain non-mention message is still buffered (unchanged)', () => {
+    expect(groupMessageDecision(noWake, '555', no)).toBe('buffer')
+  })
+
+  test('flag set + requireMention:false: still never delivers', () => {
+    expect(groupMessageDecision({ ...noWake, requireMention: false }, '555', no)).toBe('buffer')
+  })
+
+  test('flag set without contextBuffer: a mention is dropped (buffer semantics stay tied to contextBuffer)', () => {
+    expect(groupMessageDecision({ requireMention: true, allowFrom: [], wakeOnMention: false }, '555', yes)).toBe('drop')
+  })
+
+  test('flag set: the allowFrom gate still runs first — a non-listed sender is dropped, not buffered', () => {
+    expect(groupMessageDecision({ ...noWake, allowFrom: ['111'] }, '555', yes)).toBe('drop')
+  })
+
+  test('flag set: a reaction is refused (null path)', () => {
+    expect(groupReactionAllowed(noWake, '555')).toBe(false)
+  })
+
+  test('no flag: mention delivers, non-mention buffers/drops, reactions pass — unchanged', () => {
+    const buf: GroupGatePolicy = { requireMention: true, allowFrom: [], contextBuffer: true }
+    const plain: GroupGatePolicy = { requireMention: true, allowFrom: [] }
+    expect(groupMessageDecision(buf, '555', yes)).toBe('deliver')
+    expect(groupMessageDecision(buf, '555', no)).toBe('buffer')
+    expect(groupMessageDecision(plain, '555', no)).toBe('drop')
+    expect(groupMessageDecision({ requireMention: false, allowFrom: [] }, '555', no)).toBe('deliver')
+    expect(groupMessageDecision({ requireMention: true, allowFrom: ['111'] }, '555', yes)).toBe('drop')
+    expect(groupReactionAllowed(buf, '555')).toBe(true)
+    expect(groupReactionAllowed({ requireMention: true, allowFrom: ['111'] }, '555')).toBe(false)
+    expect(groupReactionAllowed({ requireMention: true, allowFrom: ['111'] }, '111')).toBe(true)
+  })
+
+  test('wakeOnMention:true is the same as absent', () => {
+    const p: GroupGatePolicy = { requireMention: true, allowFrom: [], contextBuffer: true, wakeOnMention: true }
+    expect(groupMessageDecision(p, '555', yes)).toBe('deliver')
+    expect(groupReactionAllowed(p, '555')).toBe(true)
+  })
+
+  test('requireMention absent defaults to true (matches gate())', () => {
+    expect(groupMessageDecision({ allowFrom: [] }, '555', no)).toBe('drop')
+    expect(groupMessageDecision({ allowFrom: [] }, '555', yes)).toBe('deliver')
+  })
+
+  test('isMentioned is not evaluated when the sender is dropped by allowFrom (lazy, as before)', () => {
+    let called = false
+    groupMessageDecision({ requireMention: true, allowFrom: ['111'] }, '555', () => { called = true; return true })
+    expect(called).toBe(false)
   })
 })
