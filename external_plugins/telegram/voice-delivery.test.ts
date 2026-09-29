@@ -11,6 +11,7 @@ import {
   forwardOriginMeta,
   serialize,
   transcribeFlags,
+  ttsLang,
   userVoiceConfig,
   voiceAuthor,
   whisperTimeoutMs,
@@ -94,6 +95,16 @@ describe('userVoiceConfig', () => {
     const { chatId } = userVoiceConfig(homeWith(cfg({ telegram_chat_id: '424242424', language: 'ru' })))
     expect(voiceAuthor({ from: { id: 424242424 } as never, forwardOrigin: undefined }, chatId).voice_trust).toBe('owner')
   })
+})
+
+// ── ttsLang — the TTS language from the user's config language (D-454,
+// tg 23375/23379): a configured language passes through; none ('auto' /
+// empty) → 'ru'.
+describe('ttsLang', () => {
+  test("'ru' → ru", () => expect(ttsLang('ru')).toBe('ru'))
+  test("'en' → en", () => expect(ttsLang('en')).toBe('en'))
+  test("'auto' → ru", () => expect(ttsLang('auto')).toBe('ru'))
+  test("'' → ru", () => expect(ttsLang('')).toBe('ru'))
 })
 
 // ── §11.1 — serialize ───────────────────────────────────────────────────────

@@ -131,7 +131,7 @@ export function transcribeCmd(env: NodeJS.ProcessEnv = process.env): string | un
  * SAM_TTS_CMD is unset/blank — the caller treats that as "voice disabled"
  * (fail-safe: the text reply is unaffected; the voice bubble is simply
  * skipped). Mirrors transcribeCmd exactly: SAM_TTS_CMD is the ONLY source, the
- * plugin never guesses a TTS program. Contract: `<cmd> "<text>" <out.ogg> ru`
+ * plugin never guesses a TTS program. Contract: `<cmd> "<text>" <out.ogg> <lang>`
  * writes an Opus .ogg.
  */
 export function ttsCmd(env: NodeJS.ProcessEnv = process.env): string | undefined {

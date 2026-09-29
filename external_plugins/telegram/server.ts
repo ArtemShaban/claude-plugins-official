@@ -71,6 +71,7 @@ import {
   forwardOriginMeta,
   serialize,
   transcribeFlags,
+  ttsLang,
   userVoiceConfig,
   voiceAuthor,
   whisperTimeoutMs,
@@ -189,6 +190,8 @@ const TRANSCRIBE_CMD = transcribeCmd(process.env)
 // user.language. No id => fail-safe: every voice becomes voice_trust='data',
 // never mistakenly 'owner'. No language => 'auto' (whisper detects it).
 const { chatId: OWNER_TG_ID, lang: USER_VOICE_LANG } = userVoiceConfig(homedir())
+// Language of voice-reply bubbles: the same config language; none => 'ru'.
+const TTS_LANG = ttsLang(USER_VOICE_LANG)
 if (!OWNER_TG_ID) {
   safeStderr(
     'telegram channel: config.json user.telegram_chat_id not set — every voice message will get voice_trust="data" (fail-safe)\n',
@@ -1033,7 +1036,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           if (captionCandidate != null && TTS_CMD != null) {
             const oggPath = join(tmpdir(), `tg-voice-${randomBytes(6).toString('hex')}.ogg`)
             const outcome = await sendVoiceReply(true, oggPath, {
-              synthesize: out => runTtsCmd(TTS_CMD!, text, out, 'ru'),
+              synthesize: out => runTtsCmd(TTS_CMD!, text, out, TTS_LANG),
               sendVoice: async ogg => {
                 const sendOpts = {
                   ...voiceSendOpts(message_thread_id, reply_to),
@@ -1123,7 +1126,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           if (args.voice === true && text.trim()) {
             const oggPath = join(tmpdir(), `tg-voice-${randomBytes(6).toString('hex')}.ogg`)
             const outcome = await sendVoiceReply(TTS_CMD != null, oggPath, {
-              synthesize: out => runTtsCmd(TTS_CMD!, text, out, 'ru'),
+              synthesize: out => runTtsCmd(TTS_CMD!, text, out, TTS_LANG),
               sendVoice: async ogg => {
                 await bot.api.sendVoice(chat_id, new InputFile(ogg), voiceSendOpts(message_thread_id, reply_to))
               },

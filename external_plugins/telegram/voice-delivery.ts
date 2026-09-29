@@ -233,6 +233,13 @@ export function userVoiceConfig(home: string): UserVoiceConfig {
   }
 }
 
+// TTS language from the config language (D-454, tg 23375/23379): the user's
+// language passes through; none ('auto' / empty) → 'ru' — TTS needs a
+// concrete language, 'auto' means something only to whisper.
+export function ttsLang(lang: string): string {
+  return !lang || lang === 'auto' ? 'ru' : lang
+}
+
 // voice_author_origin covers exactly the 5 forms named in the spec (A6): no
 // forward_origin at all => 'sender' (ctx.from IS the author); one of
 // Telegram's 4 MessageOrigin variants when forwarded. `voice_author_id` is
