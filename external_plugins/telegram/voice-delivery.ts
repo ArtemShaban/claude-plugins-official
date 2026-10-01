@@ -214,10 +214,17 @@ export function forwardOriginMeta(
 //   detects the language itself).
 export type UserVoiceConfig = { chatId: string | undefined; lang: string }
 
+// The install's sam-data folder, derived from HOME only (D-314) — the ONE place
+// the plugin derives it; config.json here and the inbound archive (tg-archive.ts,
+// D-520) both build on it.
+export function samDataDir(home: string): string {
+  return join(home, 'Workspace', 'ClaudeProjects', 'sam-data')
+}
+
 export function userVoiceConfig(home: string): UserVoiceConfig {
   let user: unknown
   try {
-    const cfg = JSON.parse(readFileSync(join(home, 'Workspace', 'ClaudeProjects', 'sam-data', 'config.json'), 'utf8'))
+    const cfg = JSON.parse(readFileSync(join(samDataDir(home), 'config.json'), 'utf8'))
     user = cfg != null && typeof cfg === 'object' ? (cfg as Record<string, unknown>).user : undefined
   } catch {
     return { chatId: undefined, lang: 'auto' }

@@ -44,6 +44,7 @@ import {
   checkOutboundAllowed,
   groupMessageDecision,
   groupReactionAllowed,
+  groupSenderAllowed,
   recordSeenGroup,
   type SeenGroup,
 } from './group-access'
@@ -57,6 +58,7 @@ import {
   type BufferEntry,
 } from './group-buffer'
 import { sendWithAutoFormat, buildVoiceCaption } from './telegram-format'
+import { appendArchive, archiveRoot } from './tg-archive'
 import {
   buildChecklist,
   applyToggle,
@@ -190,6 +192,14 @@ const TRANSCRIBE_CMD = transcribeCmd(process.env)
 // user.language. No id => fail-safe: every voice becomes voice_trust='data',
 // never mistakenly 'owner'. No language => 'auto' (whisper detects it).
 const { chatId: OWNER_TG_ID, lang: USER_VOICE_LANG } = userVoiceConfig(homedir())
+// Inbound archive (tg-archive.ts, D-520): every message from an allowed DM
+// person or allowed group member is appended to the install's sam-data
+// state/tg-archive/. No sam-data folder => archive off, one line here, never
+// one per message.
+const ARCHIVE_ROOT = archiveRoot(homedir())
+if (!ARCHIVE_ROOT) {
+  safeStderr('telegram channel: tg-archive off — no sam-data folder under HOME\n')
+}
 // Language of voice-reply bubbles: the same config language; none => 'ru'.
 const TTS_LANG = ttsLang(USER_VOICE_LANG)
 if (!OWNER_TG_ID) {
@@ -558,7 +568,9 @@ function pruneExpired(a: Access): boolean {
 
 type GateResult =
   | { action: 'deliver'; access: Access }
-  | { action: 'drop' }
+  // allowed:true = a configured group's allowed sender whose message is not
+  // delivered or buffered (no mention, no contextBuffer) — archived only (D-520).
+  | { action: 'drop'; allowed?: true }
   // Configured group + contextBuffer:true + would-otherwise-drop-for-no-
   // mention — see the group-chatType branch in gate() below and group-buffer.ts.
   | { action: 'buffer' }
@@ -630,6 +642,7 @@ function gate(ctx: Context): GateResult {
       isMentioned(ctx, access.mentionPatterns),
     )
     if (decision === 'deliver') return { action: 'deliver', access }
+    if (decision === 'drop' && groupSenderAllowed(policy, senderId)) return { action: 'drop', allowed: true }
     return { action: decision }
   }
 
@@ -1760,6 +1773,18 @@ function runTtsCmd(cmd: string, text: string, outPath: string, lang: string): Pr
   })
 }
 
+// The buffer entry's ts / senderName / text — ONE computation shared by the
+// group buffer and the archive (D-520 OB-08: equal values keep feedback-intake
+// ids stable across the switch from buffer to archive).
+function bufferEntryOf(ctx: Context, text: string): BufferEntry {
+  const from = ctx.from!
+  return {
+    ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+    senderName: from.username ?? String(from.id),
+    text,
+  }
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -1767,6 +1792,30 @@ async function handleInbound(
   attachment?: AttachmentMeta,
 ): Promise<void> {
   const result = gate(ctx)
+
+  // Archive every allowed message (D-520) BEFORE any branch: delivered,
+  // buffered, or allowed-but-not-woken. Fail-open (owner channel, dev-rules §6):
+  // an archive error is one stderr line, delivery below carries on unchanged.
+  if (
+    ARCHIVE_ROOT &&
+    (result.action === 'deliver' || result.action === 'buffer' || (result.action === 'drop' && result.allowed))
+  ) {
+    try {
+      const msg = ctx.message
+      const threadId = msg?.message_thread_id
+      appendArchive(ARCHIVE_ROOT, {
+        ...bufferEntryOf(ctx, text),
+        chat_id: String(ctx.chat!.id),
+        ...(msg?.message_id != null ? { msg_id: msg.message_id } : {}),
+        sender_id: String(ctx.from!.id),
+        kind: attachment?.kind ?? 'text',
+        ...(threadId != null ? { thread_id: threadId } : {}),
+        ...(attachment?.file_id ? { file_id: attachment.file_id } : {}),
+      })
+    } catch (err) {
+      safeStderr(`telegram channel: tg-archive append failed (${ARCHIVE_ROOT}): ${err}\n`)
+    }
+  }
 
   if (result.action === 'drop') return
 
@@ -1787,13 +1836,8 @@ async function handleInbound(
     // being delivered (lost, not just reordered; §16 "потерянных сообщений:
     // 0"). Queuing the append on `chat:<id>` makes it impossible for it to
     // interleave with that chat's read→notify→reset sequence.
-    const bufferFrom = ctx.from!
     const bufferChatId = String(ctx.chat!.id)
-    const bufferEntry = {
-      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-      senderName: bufferFrom.username ?? String(bufferFrom.id),
-      text,
-    }
+    const bufferEntry = bufferEntryOf(ctx, text)
     void serialize(`chat:${bufferChatId}`, async () => {
       try {
         appendToGroupBuffer(GROUP_BUFFER_DIR, bufferChatId, bufferEntry)

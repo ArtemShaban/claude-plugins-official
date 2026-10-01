@@ -124,7 +124,9 @@ export type GroupGatePolicy = {
   wakeOnMention?: boolean
 }
 
-function groupSenderAllowed(policy: GroupGatePolicy, senderId: string): boolean {
+// Exported for gate()'s archive signal (D-520): a configured group's message from
+// an allowed sender is archived even when groupMessageDecision() drops it.
+export function groupSenderAllowed(policy: GroupGatePolicy, senderId: string): boolean {
   const groupAllowFrom = policy.allowFrom ?? []
   return groupAllowFrom.length === 0 || groupAllowFrom.includes(senderId)
 }

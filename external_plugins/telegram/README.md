@@ -96,3 +96,15 @@ assistant needs earlier context, it will ask you to paste or summarize.
 This also means there's no `download_attachment` tool for historical messages
 — photos are downloaded eagerly on arrival since there's no way to fetch them
 later.
+
+## Inbound archive (this fork, D-520)
+
+Every message from an allowed DM person or an allowed group member — delivered,
+buffered, or allowed but not woken (no mention, no `contextBuffer`) — is appended
+as one JSON line to `~/Workspace/ClaudeProjects/sam-data/state/tg-archive/<chat>/<YYYY-MM>.jsonl`
+(`tg-archive.ts`; fields `ts`, `chat_id`, `msg_id`, `sender_id`, `senderName`, `kind`,
+`text`, optional `thread_id`, `file_id` — text and labels only, no media bytes).
+Append-only, no cap; dir 0700, files 0600; the folder holds a `.gitignore` of `*`
+so it never enters git. Senders the gate does not allow leave nothing. No
+sam-data folder → archive off (one stderr line at start); a write error → one
+stderr line, delivery unchanged.
