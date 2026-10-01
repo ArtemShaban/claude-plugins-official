@@ -78,8 +78,7 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 | `react` | Add an emoji reaction to a message by ID. **Only Telegram's fixed whitelist** is accepted (👍 👎 ❤ 🔥 👀 etc). |
 | `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
 
-Inbound messages trigger a typing indicator automatically — Telegram shows
-"botname is typing…" while the assistant works on a response.
+The plugin sends no typing indicator on receipt; in this fork "typing…" is driven from outside the plugin.
 
 ## Photos
 

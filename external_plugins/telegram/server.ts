@@ -1842,7 +1842,7 @@ async function handleInbound(
   // ── idea-inbox topic routing (CRUX: async capture WITHOUT waking session) ──
   // Branch on the forum topic. An async topic (config'd asyncThreads, only when
   // IDEA_INBOX_DIR is set) is persisted to the durable store and returned ON THE
-  // SPOT — BEFORE the typing indicator and, critically, before mcp.notification.
+  // SPOT — BEFORE the ack reaction and, critically, before mcp.notification.
   // That is the ONLY thing that prevents this update from waking the main Claude
   // session. Default ('work', incl. General / DM / any non-async topic) falls
   // through to the existing behaviour below. classifyRoute is unit-tested.
