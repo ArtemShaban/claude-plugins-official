@@ -1536,6 +1536,32 @@ bot.on('message:sticker', async ctx => {
   })
 })
 
+// Location / contact / poll (D-520 Q1, spec addendum A1): no file, so no
+// AttachmentMeta (the envelope must not tell the session to download one) —
+// the kind is threaded to the archive line only. The label is the message body,
+// exactly like a typed text: third-party names, phones and poll text are DATA,
+// passed and archived word for word; nothing here parses or acts on them.
+// A venue arrives through message:location too (Bot API sets both fields).
+// Edits (live-location updates) have no handler and stay dropped, as every edit.
+bot.on('message:location', async ctx => {
+  const { latitude, longitude } = ctx.message.location
+  const venue = ctx.message.venue
+  const place = venue ? `${venue.title} — ${venue.address} — ` : ''
+  await handleInbound(ctx, `(location: ${place}${latitude}, ${longitude})`, undefined, undefined, 'location')
+})
+
+bot.on('message:contact', async ctx => {
+  const c = ctx.message.contact
+  const name = [c.first_name, c.last_name].filter(Boolean).join(' ')
+  await handleInbound(ctx, `(contact: ${name}, ${c.phone_number})`, undefined, undefined, 'contact')
+})
+
+bot.on('message:poll', async ctx => {
+  const p = ctx.message.poll
+  const options = p.options.map(o => o.text).join(' | ')
+  await handleInbound(ctx, `(poll: ${p.question} — ${options})`, undefined, undefined, 'poll')
+})
+
 // Emoji reactions arrive as message_reaction updates (enabled via
 // allowed_updates in bot.start). Surface them to Claude as a structured
 // channel event so a reaction can drive, e.g., a binary approve/reject —
@@ -1790,6 +1816,9 @@ async function handleInbound(
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
+  // Archive-line kind for a file-less non-text message (location/contact/poll).
+  // Used ONLY for the archive line below; envelope meta stays as for a text.
+  archiveKind?: string,
 ): Promise<void> {
   const result = gate(ctx)
 
@@ -1808,7 +1837,7 @@ async function handleInbound(
         chat_id: String(ctx.chat!.id),
         ...(msg?.message_id != null ? { msg_id: msg.message_id } : {}),
         sender_id: String(ctx.from!.id),
-        kind: attachment?.kind ?? 'text',
+        kind: attachment?.kind ?? archiveKind ?? 'text',
         ...(threadId != null ? { thread_id: threadId } : {}),
         ...(attachment?.file_id ? { file_id: attachment.file_id } : {}),
       })
