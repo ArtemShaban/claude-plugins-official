@@ -136,3 +136,9 @@ Business → Chatbots (no login of the assistant into his account, no new secret
   byte-for-byte, no parse mode, once (`sending` is saved before the call), then
   «Отправил: <name>.» or «Не ушло: <reason>. Ничего не отправлено.» under the
   preview. The business path uses only `getBusinessConnection` and `sendMessage`.
+  Chat, text and status of the send come from the plugin's own memory (filled
+  only when it showed the preview), never from `state.json`, which is a record
+  only; the connection is re-checked with `getBusinessConnection` right before
+  the send. A chat removed from the list → «Не ушло: <name> больше нет в списке».
+  After a plugin restart an old preview is stale: his 👍 / «да» sends nothing
+  and he is told once to make a new draft.

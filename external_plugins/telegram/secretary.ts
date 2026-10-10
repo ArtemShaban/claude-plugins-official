@@ -23,6 +23,9 @@
 // - Every Bot API call of this path goes through `SecretaryApi`, which has
 //   exactly two methods: getBusinessConnection and sendMessage (OB-11).
 // - Other people's messages are stored as DATA; nothing here acts on them.
+// - WHAT is sent, to WHOM, comes only from this process's memory (filled by
+//   draft()); state.json is session-writable, so it is a record, never the
+//   authority. The connection is re-checked right before each send.
 //
 // Pure fs + injected effects (no grammy import), so it is unit-testable.
 
@@ -297,6 +300,19 @@ export function createSecretary(deps: SecretaryDeps) {
     }
   }
 
+  // Drafts this process showed him, keyed by preview id — filled ONLY by draft().
+  // The send takes chat, text and status from here, never from state.json: the
+  // file is session-writable, so it is the record, not the authority (security F1).
+  // Entries are never removed, so a preview stays un-editable in this process.
+  const shown = new Map<string, { chat_id: string; text: string; name: string; status: Draft['status'] }>()
+
+  /** Re-read state.json and replace only this draft's entry (no await between load and save — review F1). */
+  function saveDraft(previewId: string, d: Draft): void {
+    const st = loadSecretaryState(deps.home)
+    st.drafts[previewId] = d
+    saveSecretaryState(deps.home, st)
+  }
+
   /** (C) draft. Throws on every refusal (nothing sent, no draft). Returns the preview message id. */
   async function draft(a: DraftArgs): Promise<number> {
     const cfg = config()
@@ -313,14 +329,18 @@ export function createSecretary(deps: SecretaryDeps) {
     const st = loadSecretaryState(deps.home)
     if (!st.connection?.id) throw new Error('as_owner_to: no verified Business connection yet (no message from it has arrived)')
     const sent = await deps.api.sendMessage(deps.ownerId, preview)
-    st.drafts[String(sent.message_id)] = {
-      chat_id: String(a.as_owner_to),
-      text: a.text,
-      created: now().toISOString(),
-      status: 'pending',
-    }
-    saveSecretaryState(deps.home, st)
+    const key = String(sent.message_id)
+    shown.set(key, { chat_id: String(a.as_owner_to), text: a.text, name, status: 'pending' })
+    saveDraft(key, { chat_id: String(a.as_owner_to), text: a.text, created: now().toISOString(), status: 'pending' })
     return sent.message_id
+  }
+
+  async function tell(previewId: number, report: string, status: string): Promise<void> {
+    try {
+      await deps.api.sendMessage(deps.ownerId!, report, { reply_parameters: { message_id: previewId } })
+    } catch (err) {
+      deps.log(`telegram secretary: outcome reply failed (${status}): ${err}`)
+    }
   }
 
   async function approve(previewId: number, kind: '👍' | 'да'): Promise<void> {
@@ -328,32 +348,53 @@ export function createSecretary(deps: SecretaryDeps) {
     await serialize('telegram-secretary-approve', async () => {
       const cfg = config()
       if (!cfg.on || !deps.ownerId) return
-      const st = loadSecretaryState(deps.home)
-      const d = st.drafts[String(previewId)]
-      if (!d || d.status !== 'pending') return
-      const name = cfg.chats.get(d.chat_id)
-      if (name === undefined) return // delisted since the draft: nothing goes out
-      d.status = 'sending'
+      const key = String(previewId)
+      const m = shown.get(key)
+      if (!m) {
+        // Known only from the file (a restart, or a record this process never made): never sent.
+        const rec = loadSecretaryState(deps.home).drafts[key]
+        if (!rec || rec.status !== 'pending') return
+        saveDraft(key, { ...rec, status: 'failed', error: 'stale: not shown by this plugin process' })
+        await tell(previewId, 'Устарел: этот черновик был до перезапуска — его не отправлю. Ничего не отправлено, нужен новый черновик.', 'stale')
+        return
+      }
+      if (m.status !== 'pending') return
+      const rec = loadSecretaryState(deps.home).drafts[key]
+      const d: Draft = { chat_id: m.chat_id, text: m.text, created: rec?.created ?? now().toISOString(), status: 'sending' }
       d.approval = { kind, at: now().toISOString() }
-      saveSecretaryState(deps.home, st) // BEFORE the call: a restart or 2nd approval never sends twice
+      const fail = async (error: string, report: string) => {
+        m.status = d.status = 'failed'
+        d.error = error
+        saveDraft(key, d)
+        await tell(previewId, report, 'failed')
+      }
+      if (!cfg.chats.has(m.chat_id)) {
+        // review F2: delisted since the draft (switch on) → told, never silent.
+        await fail('chat not on the list', `Не ушло: ${m.name} больше нет в списке. Ничего не отправлено.`)
+        return
+      }
+      m.status = 'sending'
+      saveDraft(key, d) // BEFORE the call: a restart or 2nd approval never sends twice
       let report: string
       try {
-        if (!st.connection?.id) throw new Error('no verified Business connection')
-        const sent = await deps.api.sendMessage(d.chat_id, d.text, { business_connection_id: st.connection.id })
-        d.status = 'sent'
+        const connId = loadSecretaryState(deps.home).connection?.id
+        if (!connId) throw new Error('no verified Business connection')
+        // Re-check right before sending: the id comes from a session-writable file (security F1).
+        const conn = await deps.api.getBusinessConnection(connId)
+        if (String(conn.user?.id) !== deps.ownerId || conn.is_enabled !== true) {
+          throw new Error('the Business connection is not the owner\'s or is disabled')
+        }
+        const sent = await deps.api.sendMessage(m.chat_id, m.text, { business_connection_id: connId })
+        m.status = d.status = 'sent'
         d.sent_msg_id = sent.message_id
-        report = `Отправил: ${name}.`
+        report = `Отправил: ${m.name}.`
       } catch (err) {
-        d.status = 'failed'
-        d.error = (err as { description?: string })?.description ?? String(err)
+        m.status = d.status = 'failed'
+        d.error = (err as { description?: string })?.description ?? (err as Error)?.message ?? String(err)
         report = `Не ушло: ${d.error}. Ничего не отправлено.`
       }
-      saveSecretaryState(deps.home, st)
-      try {
-        await deps.api.sendMessage(deps.ownerId, report, { reply_parameters: { message_id: previewId } })
-      } catch (err) {
-        deps.log(`telegram secretary: outcome reply failed (${d.status}): ${err}`)
-      }
+      saveDraft(key, d) // fresh re-read: drafts made during the await survive (review F1)
+      await tell(previewId, report, d.status)
     })
   }
 
@@ -388,6 +429,7 @@ export function createSecretary(deps: SecretaryDeps) {
   /** edit_message guard: a draft's preview is never edited (fail-closed when state is unreadable). */
   function isDraftPreview(chatId: string, messageId: number): boolean {
     if (!deps.ownerId || chatId !== deps.ownerId) return false
+    if (shown.has(String(messageId))) return true
     if (!existsSync(secretaryStatePath(deps.home))) return false
     try {
       return loadSecretaryState(deps.home).drafts[String(messageId)] !== undefined

@@ -7,7 +7,7 @@
  * state, nothing under the real ~/Workspace or ~/.claude is read or written.
  */
 import { describe, test, expect, beforeEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, readdirSync } from 'fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, readdirSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import {
@@ -489,6 +489,15 @@ describe('criterion 9 — approval sends exactly once (OB-02)', () => {
     onConfig({ [TIMUR]: 'Тимур' })
     await s.onOwnerText({ fromId: OWNER, chatId: OWNER, text: 'да', replyToId: id, forwarded: false })
     expect(f.businessSends()).toEqual([])
+    // review F2: the draft is `failed` and he is told, once, under the preview
+    expect(loadSecretaryState(home).drafts[String(id)].status).toBe('failed')
+    const told = f.calls.filter(c => c.method === 'sendMessage' && c.args[0] === OWNER && String(c.args[1]).startsWith('Не ушло:'))
+    expect(told.length).toBe(1)
+    expect(told[0].args[1]).toBe('Не ушло: Максим больше нет в списке. Ничего не отправлено.')
+    expect((told[0].args[2] as any)?.reply_parameters?.message_id).toBe(id)
+    await s.onOwnerText({ fromId: OWNER, chatId: OWNER, text: 'да', replyToId: id, forwarded: false })
+    expect(f.businessSends()).toEqual([])
+    expect(f.calls.filter(c => c.method === 'sendMessage' && c.args[0] === OWNER && String(c.args[1]).startsWith('Не ушло:')).length).toBe(1)
   })
 })
 
@@ -575,5 +584,173 @@ describe('labelOf parity with the message:* labels', () => {
     expect(labelOf({ ...b, contact: { first_name: 'A', last_name: 'B', phone_number: '+1' } }).text).toBe('(contact: A B, +1)')
     expect(labelOf({ ...b, poll: { question: 'Q', options: [{ text: 'x' }, { text: 'y' }] } }).text).toBe('(poll: Q — x | y)')
     expect(labelOf(b).kind).toBe('other')
+  })
+})
+
+// ── fix round 1 (review F1/F2, security F1) ───────────────────────────────
+
+/** Wraps a fake API: the NEXT sendMessage matching `pred` is held until release() (one round-trip in flight). */
+function heldApi(base: ReturnType<typeof fakeApi>) {
+  let gate: { pred: (chatId: string, o: any) => boolean; onStart: () => void; release?: () => void } | undefined
+  const api: SecretaryApi = {
+    getBusinessConnection: id => base.api.getBusinessConnection(id),
+    async sendMessage(chatId, text, o) {
+      const g = gate
+      if (g && g.pred(chatId, o)) {
+        gate = undefined
+        const res = await base.api.sendMessage(chatId, text, o)
+        await new Promise<void>(r => {
+          g.release = r
+          g.onStart()
+        })
+        return res
+      }
+      return base.api.sendMessage(chatId, text, o)
+    },
+  }
+  function holdNext(pred: (chatId: string, o: any) => boolean) {
+    let onStart!: () => void
+    const started = new Promise<void>(r => (onStart = r))
+    const g = { pred, onStart } as NonNullable<typeof gate>
+    gate = g
+    return { started, release: () => g.release!() }
+  }
+  return { api, holdNext }
+}
+
+const yes = (s: ReturnType<typeof make>, id: number) =>
+  s.onOwnerText({ fromId: OWNER, chatId: OWNER, text: 'да', replyToId: id, forwarded: false })
+const thumb = (s: ReturnType<typeof make>, id: number) =>
+  s.onReaction({ fromId: OWNER, chatId: OWNER, messageId: id, added: ['👍'] })
+const ownerReplies = (f: ReturnType<typeof fakeApi>, prefix: string) =>
+  f.calls.filter(c => c.method === 'sendMessage' && c.args[0] === OWNER && String(c.args[1]).startsWith(prefix))
+
+describe('review F1 — state.json lost update (R1, R2)', () => {
+  test('R1: a draft created while A is approved never reverts A; a later «да» on A sends nothing more', async () => {
+    onConfig()
+    const f = fakeApi()
+    const h = heldApi(f)
+    const s = make(h.api)
+    await s.onBusinessMessage(bmsg())
+    const a = await s.draft({ chat_id: OWNER, text: 'A text', as_owner_to: MAXIM })
+    const hold = h.holdNext((chatId, o) => chatId === OWNER && !o) // B's preview
+    const bP = s.draft({ chat_id: OWNER, text: 'B text', as_owner_to: TIMUR })
+    await hold.started
+    await thumb(s, a)
+    expect(f.businessSends().length).toBe(1)
+    hold.release()
+    await bP
+    await yes(s, a)
+    await s.onReaction({ fromId: OWNER, chatId: OWNER, messageId: a, added: [] })
+    await thumb(s, a)
+    expect(f.businessSends().length).toBe(1)
+    expect(loadSecretaryState(home).drafts[String(a)].status).toBe('sent')
+  })
+
+  test("R2: a draft created during A's business send survives in state.json and 👍 on it sends B once", async () => {
+    onConfig()
+    const f = fakeApi()
+    const h = heldApi(f)
+    const s = make(h.api)
+    await s.onBusinessMessage(bmsg())
+    const a = await s.draft({ chat_id: OWNER, text: 'A text', as_owner_to: MAXIM })
+    const hold = h.holdNext((_c, o) => !!o?.business_connection_id) // A's business send
+    const aP = thumb(s, a)
+    await hold.started
+    const b = await s.draft({ chat_id: OWNER, text: 'B text', as_owner_to: TIMUR })
+    hold.release()
+    await aP
+    expect(loadSecretaryState(home).drafts[String(b)]?.status).toBe('pending')
+    await thumb(s, b)
+    const bs = f.businessSends()
+    expect(bs.length).toBe(2)
+    expect(bs[1].args[0]).toBe(TIMUR)
+    expect(bs[1].args[1]).toBe('B text')
+    expect(s.isDraftPreview(OWNER, b)).toBe(true)
+  })
+})
+
+describe('security F1 — the send is decided only from plugin memory', () => {
+  test('(a) a draft written straight into state.json + his 👍 / «да» → 0 business sends', async () => {
+    onConfig()
+    const f = fakeApi()
+    const s = make(f.api)
+    await s.onBusinessMessage(bmsg())
+    const st = loadSecretaryState(home)
+    st.drafts['5000'] = { chat_id: MAXIM, text: 'FORGED', created: new Date().toISOString(), status: 'pending' }
+    st.drafts['5001'] = { chat_id: MAXIM, text: 'FORGED 2', created: new Date().toISOString(), status: 'pending' }
+    writeFileSync(secretaryStatePath(home), JSON.stringify(st))
+    await thumb(s, 5000)
+    await yes(s, 5001)
+    await thumb(s, 5000)
+    expect(f.businessSends()).toEqual([])
+  })
+
+  test('(b) text and chat rewritten after the preview → exactly the previewed text to the previewed chat', async () => {
+    onConfig()
+    const f = fakeApi()
+    const { s, id } = await pendingDraft(f, 'the previewed text')
+    const st = loadSecretaryState(home)
+    st.drafts[String(id)].text = 'SWAPPED after the preview'
+    st.drafts[String(id)].chat_id = TIMUR
+    writeFileSync(secretaryStatePath(home), JSON.stringify(st))
+    await yes(s, id)
+    const bs = f.businessSends()
+    expect(bs.length).toBe(1)
+    expect(bs[0].args[0]).toBe(MAXIM)
+    expect(bs[0].args[1]).toBe('the previewed text')
+  })
+
+  test("(c) a stranger's connection id in the file → 0 sends + one «Не ушло:» reply", async () => {
+    onConfig()
+    const f = fakeApi()
+    const { s, id } = await pendingDraft(f)
+    const st = loadSecretaryState(home)
+    st.connection = { id: CONN_STRANGER, verified_at: new Date().toISOString() }
+    writeFileSync(secretaryStatePath(home), JSON.stringify(st))
+    await thumb(s, id)
+    await yes(s, id)
+    expect(f.businessSends()).toEqual([])
+    const r = ownerReplies(f, 'Не ушло:')
+    expect(r.length).toBe(1)
+    expect(r[0].args[2]).toEqual({ reply_parameters: { message_id: id } })
+    expect(loadSecretaryState(home).drafts[String(id)].status).toBe('failed')
+  })
+
+  test('(c2) a disabled connection at send time → 0 sends + «Не ушло:»', async () => {
+    onConfig()
+    const f = fakeApi()
+    const { s, id } = await pendingDraft(f)
+    const st = loadSecretaryState(home)
+    st.connection = { id: CONN_DISABLED, verified_at: new Date().toISOString() }
+    writeFileSync(secretaryStatePath(home), JSON.stringify(st))
+    await thumb(s, id)
+    expect(f.businessSends()).toEqual([])
+    expect(ownerReplies(f, 'Не ушло:').length).toBe(1)
+  })
+
+  test('(d) the record deleted from state.json → editing the preview is still refused', async () => {
+    onConfig()
+    const f = fakeApi()
+    const { s, id } = await pendingDraft(f)
+    const st = loadSecretaryState(home)
+    delete st.drafts[String(id)]
+    writeFileSync(secretaryStatePath(home), JSON.stringify(st))
+    expect(s.isDraftPreview(OWNER, id)).toBe(true)
+    rmSync(secretaryStatePath(home))
+    expect(s.isDraftPreview(OWNER, id)).toBe(true)
+  })
+
+  test('restart: a pending draft known only from the file → 0 sends + exactly one stale notice', async () => {
+    onConfig()
+    const f = fakeApi()
+    const { id } = await pendingDraft(f)
+    const restarted = make(f.api)
+    await thumb(restarted, id)
+    await yes(restarted, id)
+    expect(f.businessSends()).toEqual([])
+    const r = ownerReplies(f, 'Устарел:')
+    expect(r.length).toBe(1)
+    expect(r[0].args[2]).toEqual({ reply_parameters: { message_id: id } })
   })
 })
