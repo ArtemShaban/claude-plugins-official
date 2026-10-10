@@ -108,3 +108,31 @@ Append-only, no cap; dir 0700, files 0600; the folder holds a `.gitignore` of `*
 so it never enters git. Senders the gate does not allow leave nothing. No
 sam-data folder → archive off (one stderr line at start); a write error → one
 stderr line, delivery unchanged.
+
+## Secretary in the owner's Telegram (this fork, Telegram Business, D-637)
+
+Off unless the owner's sam-data `config.json` has `"overrides": {"telegram-secretary": true}`
+(exactly boolean `true`; read on every event, so switching off needs no restart).
+The owner connects this bot to his own account in Telegram → Settings → Telegram
+Business → Chatbots (no login of the assistant into his account, no new secret).
+`secretary.ts`:
+
+- **Inbound.** A `business_message` is used only when Telegram's `getBusinessConnection`
+  says the connection is the owner's (`user.id` = sam-data `user.telegram_chat_id`)
+  and enabled, and only for chats in the top-level `telegram_secretary_chats`
+  (`{"<chat id>": "<name>"}`; his own id, `access.json` `allowFrom` ids and
+  non-positive ids are dropped with one stderr line). Each message → one JSON
+  line in `sam-data/state/tg-business/<chat>/<YYYY-MM>.jsonl` (the archive line
+  shape; text and labels only; dir 0700, files 0600, `.gitignore` `*`). A chat
+  not on the list leaves only `{name, first_seen}` in `state.json` `unlisted`.
+  Never wakes the session, never replies, never marks read.
+- **Draft.** `reply` with `as_owner_to: "<listed chat id>"` and `chat_id` = the
+  owner's DM shows him one literal preview («Отправить от твоего имени → <name>: …»)
+  and records a pending draft keyed by the preview id in `state.json`. Refused
+  with `files` / `checklist` / `voice`, empty text, a preview over one message,
+  or an unlisted chat. `edit_message` on a preview is refused.
+- **Send.** Only the plugin sends, only after the owner's net-added 👍 on the
+  preview in his DM, or his own non-forwarded reply «да» to it: the draft text
+  byte-for-byte, no parse mode, once (`sending` is saved before the call), then
+  «Отправил: <name>.» or «Не ушло: <reason>. Ничего не отправлено.» under the
+  preview. The business path uses only `getBusinessConnection` and `sendMessage`.

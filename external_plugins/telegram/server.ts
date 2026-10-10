@@ -59,6 +59,7 @@ import {
 } from './group-buffer'
 import { sendWithAutoFormat, buildVoiceCaption } from './telegram-format'
 import { appendArchive, archiveRoot } from './tg-archive'
+import { createSecretary, type SecretaryApi } from './secretary'
 import { clipUtf16 } from './text-clip'
 import {
   buildChecklist,
@@ -548,6 +549,23 @@ function assertAllowedChat(chat_id: string): void {
   if (!result.allowed) throw new Error(result.reason)
 }
 
+// Secretary bot in the owner's personal Telegram (Telegram Business; spec sam-data
+// dev/analysis/2026-10-10-secretary-bot-spec.md, D-637). OFF unless his sam-data
+// override `telegram-secretary` is boolean true (read per event — secretary.ts).
+// The business path gets exactly these two Bot API methods and nothing else
+// (no read marks, deletes, profile/story/gift/star calls — spec OB-11).
+const SECRETARY_API: SecretaryApi = {
+  getBusinessConnection: id => bot.api.getBusinessConnection(id),
+  sendMessage: (chatId, text, opts) => bot.api.sendMessage(chatId, text, opts),
+}
+const secretary = createSecretary({
+  home: homedir(),
+  ownerId: OWNER_TG_ID,
+  allowFrom: () => loadAccess().allowFrom,
+  api: SECRETARY_API,
+  log: line => safeStderr(`${line}\n`),
+})
+
 function saveAccess(a: Access): void {
   if (STATIC) return
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
@@ -900,6 +918,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: 'string' },
             description: "Optional. When provided (non-empty), sends `text` as a header followed by one tappable inline button per item instead of a plain reply — tapping an item toggles it (☐/✅ on the button, struck-through in the message text) with no server-side database; state is re-derived from the message itself, so it survives a bot restart. Cannot be combined with files or voice (send those as a separate reply). Max ~100 items (Telegram's inline-button limit); each item renders as a single line (embedded newlines are flattened).",
           },
+          as_owner_to: {
+            type: 'string',
+            description: "Secretary (skill telegram-secretary). A chat id from the owner's secretary list: instead of a normal reply, shows the owner (chat_id must be his DM) the exact `text` as a draft of a message IN HIS NAME to that chat. Nothing goes out now — the plugin itself sends it only after his 👍 on the preview or his «да» reply to it, then tells him the result. Refused when the secretary is off, the chat is not listed, or combined with files/checklist/voice.",
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -975,6 +997,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           message_thread_id != null ? { message_thread_id } : {}
 
         assertAllowedChat(chat_id)
+
+        // Secretary draft path (spec §2 C). Always returns or throws, so the
+        // plain-reply code below is never affected. Sending in his name happens
+        // only in secretary.ts after his 👍 / «да» — never from this tool.
+        if (args.as_owner_to != null) {
+          const previewId = await secretary.draft({
+            chat_id,
+            text,
+            as_owner_to: String(args.as_owner_to),
+            files,
+            checklist: args.checklist,
+            voice: args.voice,
+          })
+          return {
+            content: [{ type: 'text', text: `draft preview shown to the owner (id: ${previewId}); it goes out in his name only after his 👍 or «да» — the plugin reports the result to him` }],
+          }
+        }
 
         // Opt-in checklist path (owner msg 5347, 2026-07-20). Absent/empty
         // `checklist` falls straight through to the unchanged code below —
@@ -1186,6 +1225,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
+        // A secretary draft preview must keep showing exactly the recorded text.
+        if (secretary.isDraftPreview(String(args.chat_id), Number(args.message_id))) {
+          throw new Error('this message is a secretary draft preview — it cannot be edited; make a new draft instead')
+        }
         // Default 'auto': same auto-format + guaranteed-plain-fallback
         // behavior as 'reply' — see telegram-format.ts.
         const editFormat = (args.format as string | undefined) ?? 'auto'
@@ -1421,7 +1464,24 @@ bot.on('callback_query:data', async ctx => {
 })
 
 bot.on('message:text', async ctx => {
+  // Secretary «да» on a draft preview (his own DM, not forwarded, a reply to
+  // the preview) — checked in secretary.ts. The message still reaches the
+  // session below exactly as before.
+  void secretary.onOwnerText({
+    fromId: String(ctx.from.id),
+    chatId: String(ctx.chat.id),
+    text: ctx.message.text,
+    replyToId: ctx.message.reply_to_message?.message_id,
+    forwarded: ctx.message.forward_origin != null,
+  })
   await handleInbound(ctx, ctx.message.text, undefined)
+})
+
+// Secretary inbound (spec §2 B): messages on a Business connection. The
+// message:* handlers never see these. Stored only when the connection is the
+// owner's and the chat is on his list; never wakes the session, never replies.
+bot.on('business_message', async ctx => {
+  await secretary.onBusinessMessage(ctx.businessMessage)
 })
 
 bot.on('message:photo', async ctx => {
@@ -1645,6 +1705,10 @@ bot.on('message_reaction', async ctx => {
   }).catch(err => {
     process.stderr.write(`telegram channel: failed to deliver reaction to Claude: ${err}\n`)
   })
+
+  // Secretary 👍 on a draft preview (his own DM, his own net-added 👍) —
+  // checked in secretary.ts; the notification above is unchanged.
+  void secretary.onReaction({ fromId: String(from.id), chatId: chat_id, messageId: r.message_id, added })
 
   // Route A — additive signed approval-channel emit. `reactionGate` already
   // proved an ALLOWLISTED user acted in their own DM; this additionally
