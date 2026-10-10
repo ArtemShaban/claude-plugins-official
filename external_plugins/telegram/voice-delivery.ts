@@ -203,6 +203,17 @@ export function forwardOriginMeta(
   }
 }
 
+// The forwarded message's ORIGINAL date (owner tg 29540: a month-old chat he
+// forwarded looked like today's, because the envelope `ts` is the time of the
+// forward). For EVERY forward, voice included — the date is a label, not a
+// trust decision. Same ISO format as the envelope `ts`. Not forwarded, or no
+// usable date from Telegram => {} (never a made-up 1970 date).
+export function forwardDateMeta(origin: MessageOrigin | undefined): Record<string, string> {
+  const d = origin?.date
+  if (typeof d !== 'number' || !Number.isFinite(d) || d <= 0) return {}
+  return { forward_date: new Date(d * 1000).toISOString() }
+}
+
 // The user's own settings, read once at start from sam-data config.json (D-454,
 // D-449): `<home>/Workspace/ClaudeProjects/sam-data/config.json` — the same
 // path rule as sam-core tools/sam_data.py::data_root_of.

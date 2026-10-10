@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   deliverVoiceTranscript,
+  forwardDateMeta,
   forwardOriginMeta,
   serialize,
   transcribeFlags,
@@ -603,5 +604,49 @@ describe('F4 fix — a hung download is bounded (timeoutMs + download budget), n
       ).catch(() => ({ text: caption ?? '(voice message)', meta: {} })),
     )
     expect(envelope).toEqual({ text: 'a caption', meta: {} })
+  })
+})
+
+// ── forwardDateMeta — the forwarded message's ORIGINAL date (BACKLOG «БЛОК ·
+// ДОРАБОТКИ ПЛАГИНА TELEGRAM» п.1, owner tg 29540): the envelope `ts` is the
+// time of the forward; a month-old chat forwarded today looked like today's.
+describe('forwardDateMeta (every forward, voice included)', () => {
+  const alice = { id: 555, is_bot: false, username: 'alice_h', first_name: 'Alice' }
+
+  test('not forwarded => {} (envelope byte-identical to today)', () => {
+    expect(forwardDateMeta(undefined)).toEqual({})
+  })
+
+  test('forward from a user => forward_date = origin.date as ISO UTC (same format as ts)', () => {
+    // 1757304000 = 2025-09-08T04:00:00Z
+    expect(forwardDateMeta({ type: 'user', date: 1757304000, sender_user: alice })).toEqual({
+      forward_date: '2025-09-08T04:00:00.000Z',
+    })
+  })
+
+  test('all four origin kinds carry the date (hidden_user / chat / channel too)', () => {
+    const d = 1759896000 // 2025-10-08T04:00:00Z
+    const want = { forward_date: '2025-10-08T04:00:00.000Z' }
+    expect(forwardDateMeta({ type: 'hidden_user', date: d, sender_user_name: '' })).toEqual(want)
+    expect(
+      forwardDateMeta({ type: 'chat', date: d, sender_chat: { id: -100123, type: 'group', title: 'G' } as never }),
+    ).toEqual(want)
+    expect(
+      forwardDateMeta({ type: 'channel', date: d, message_id: 7, chat: { id: -100999, type: 'channel', title: 'C' } as never }),
+    ).toEqual(want)
+  })
+
+  test('missing / zero / non-finite date => {} (never a made-up 1970 date)', () => {
+    expect(forwardDateMeta({ type: 'user', date: 0, sender_user: alice })).toEqual({})
+    expect(forwardDateMeta({ type: 'user', date: undefined as never, sender_user: alice })).toEqual({})
+    expect(forwardDateMeta({ type: 'user', date: Number.NaN, sender_user: alice })).toEqual({})
+  })
+
+  test('forwardOriginMeta is unchanged by the date (its own contract stays as is)', () => {
+    expect(forwardOriginMeta({ type: 'user', date: 1757304000, sender_user: alice })).toEqual({
+      forward_origin: 'forward_user',
+      forward_author: 'alice_h',
+      forward_author_id: '555',
+    })
   })
 })

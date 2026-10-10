@@ -59,6 +59,7 @@ import {
 } from './group-buffer'
 import { sendWithAutoFormat, buildVoiceCaption } from './telegram-format'
 import { appendArchive, archiveRoot } from './tg-archive'
+import { clipUtf16 } from './text-clip'
 import {
   buildChecklist,
   applyToggle,
@@ -70,6 +71,7 @@ import {
 import {
   deliverVoiceTranscript,
   DOWNLOAD_TIMEOUT_MS,
+  forwardDateMeta,
   forwardOriginMeta,
   serialize,
   transcribeFlags,
@@ -2143,22 +2145,27 @@ async function handleInbound(
     // selection. Surface it in meta so Claude knows which earlier message the
     // sender is responding to. Snippets are sanitized + truncated (uploader-
     // controlled text could otherwise break out of the <channel> tag).
+    // clipUtf16, not .slice: a cut through an emoji left a lone surrogate.
     const repliedTo = ctx.message?.reply_to_message
     const replyMeta: Record<string, string> = {}
     if (repliedTo != null) {
       replyMeta.reply_to_message_id = String(repliedTo.message_id)
-      const repliedSnippet = safeName(repliedTo.text ?? repliedTo.caption)?.slice(0, 300)
+      const repliedSnippet = clipUtf16(safeName(repliedTo.text ?? repliedTo.caption), 300)
       if (repliedSnippet) replyMeta.reply_to_text = repliedSnippet
       if (repliedTo.from) replyMeta.reply_to_user = repliedTo.from.username ?? String(repliedTo.from.id)
     }
-    const quotedSnippet = safeName(ctx.message?.quote?.text)?.slice(0, 300)
+    const quotedSnippet = clipUtf16(safeName(ctx.message?.quote?.text), 300)
     if (quotedSnippet) replyMeta.reply_to_quote = quotedSnippet
 
     // Forward origin for NON-voice messages (owner tg 18168/18170): a
     // forwarded text/photo/document must not look like the sender's own
     // words. Same mapping as voiceAuthor (shared in voice-delivery.ts); voice
     // keeps its own voice_author_* attributes unchanged. Not forwarded => {}.
-    const forwardMeta = forwardOriginMeta(ctx.message?.forward_origin, attachment?.kind)
+    // Plus the ORIGINAL date for every forward, voice included (tg 29540).
+    const forwardMeta = {
+      ...forwardOriginMeta(ctx.message?.forward_origin, attachment?.kind),
+      ...forwardDateMeta(ctx.message?.forward_origin),
+    }
 
     // Group context-buffer delivery (group-buffer.ts): a configured group with
     // contextBuffer:true accumulates non-mention messages instead of dropping
