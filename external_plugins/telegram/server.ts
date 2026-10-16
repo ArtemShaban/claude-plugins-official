@@ -83,6 +83,7 @@ import {
   withTimeout,
 } from './voice-delivery'
 import { spawn } from 'child_process'
+import { createPollLiveness } from './poll-liveness'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -351,6 +352,9 @@ process.on('uncaughtException', (err: any) => {
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
+// getUpdates time limit (poll timeout + 15 s) + the poll.json heartbeat the core
+// watchdog reads — poll-liveness.ts. Only getUpdates is touched.
+bot.api.config.use(createPollLiveness({ stateDir: STATE_DIR, log: safeStderr }).transformer)
 let botUsername = ''
 
 // Idea-capture ✍ ack queue (reaction-queue.ts). Replaces the old direct,
