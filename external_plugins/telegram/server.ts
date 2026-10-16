@@ -82,6 +82,7 @@ import {
   whisperTimeoutMs,
   withTimeout,
 } from './voice-delivery'
+import { chooseAccess, detectLockMode, lockOwnerId, lockedAccessReader, ownerGate } from './access-lock'
 import { spawn } from 'child_process'
 import { createPollLiveness } from './poll-liveness'
 
@@ -107,6 +108,15 @@ try {
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
+// D-528(b) (access-lock.ts): in a client container the host binds a read-only lock
+// at /etc/sam-telegram-access; then the list and the owner id come only from it, re-read on
+// every call, and the home access.json is neither read nor written. Decided here, once, from
+// the real platform and the fixed path; it consults neither an env var nor a setting itself. Known limit
+// (access-lock.ts header): bun's BUN_OPTIONS / a cwd bunfig.toml `preload` can rewrite
+// process.platform before load and turn this OFF — a deliberate bypass, like patching this file.
+const ACCESS_LOCK = detectLockMode()
+// No runtime write of access (prune, pairing, seenGroups, the approvals loop) in static or locked mode.
+const ACCESS_READ_ONLY = STATIC || ACCESS_LOCK.locked
 
 // Route A (sam-data dev/analysis/routea-spec-FINAL.md — authenticated owner-
 // approval side-channel). The plugin ADDITIVELY appends a signed, structured
@@ -195,6 +205,8 @@ const TRANSCRIBE_CMD = transcribeCmd(process.env)
 // sam-data config.json (D-454, D-449): user.telegram_chat_id and
 // user.language. No id => fail-safe: every voice becomes voice_trust='data',
 // never mistakenly 'owner'. No language => 'auto' (whisper detects it).
+// In locked mode (D-528(b)) the voice-trust owner is the lock's ownerChatId instead — see
+// voiceOwnerId() below; this config id is then only compared against it (ownerGate).
 const { chatId: OWNER_TG_ID, lang: USER_VOICE_LANG } = userVoiceConfig(homedir())
 // Inbound archive (tg-archive.ts, D-520): every message from an allowed DM
 // person or allowed group member is appended to the install's sam-data
@@ -525,7 +537,7 @@ function readAccessFile(): Access {
 // In static mode, access is snapshotted at boot and never re-read or written.
 // Pairing requires runtime mutation, so it's downgraded to allowlist with a
 // startup warning — handing out codes that never get approved would be worse.
-const BOOT_ACCESS: Access | null = STATIC
+const BOOT_ACCESS: Access | null = STATIC && !ACCESS_LOCK.locked
   ? (() => {
       const a = readAccessFile()
       if (a.dmPolicy === 'pairing') {
@@ -539,8 +551,21 @@ const BOOT_ACCESS: Access | null = STATIC
     })()
   : null
 
+// Locked mode (D-528(b)): the lock, or deny-all when it is missing / unreadable / invalid —
+// never the home copy (chooseAccess in access-lock.ts).
+const readLockedAccess = ACCESS_LOCK.locked ? lockedAccessReader(ACCESS_LOCK.file, safeStderr) : null
+if (ACCESS_LOCK.locked) {
+  safeStderr(`telegram channel: access locked by the host (${ACCESS_LOCK.file})\n`)
+}
+
 function loadAccess(): Access {
-  return BOOT_ACCESS ?? readAccessFile()
+  return chooseAccess(ACCESS_LOCK, readLockedAccess, () => BOOT_ACCESS ?? readAccessFile()) as Access
+}
+
+// The owner id for voice trust: the lock's ownerChatId in locked mode (re-read; an invalid lock
+// → none, so every voice is data), else config.json's id read at start.
+function voiceOwnerId(): string | undefined {
+  return lockOwnerId(ACCESS_LOCK, readLockedAccess, OWNER_TG_ID)
 }
 
 // Outbound gate — reply/react/edit can only target chats the inbound gate
@@ -564,14 +589,17 @@ const SECRETARY_API: SecretaryApi = {
 }
 const secretary = createSecretary({
   home: homedir(),
-  ownerId: OWNER_TG_ID,
+  // Locked mode (D-528(b), AC-10): the lock's ownerChatId, read once at start; a lock missing,
+  // unreadable or invalid at start → undefined → secretary off. Never the config id there.
+  // An admin change of ownerChatId reaches the secretary at the next restart.
+  ownerId: lockOwnerId(ACCESS_LOCK, readLockedAccess, OWNER_TG_ID),
   allowFrom: () => loadAccess().allowFrom,
   api: SECRETARY_API,
   log: line => safeStderr(`${line}\n`),
 })
 
 function saveAccess(a: Access): void {
-  if (STATIC) return
+  if (ACCESS_READ_ONLY) return
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
   const tmp = ACCESS_FILE + '.tmp'
   writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
@@ -649,8 +677,8 @@ function gate(ctx: Context): GateResult {
       // Discovery breadcrumb (group-access.ts): lets the owner find this new
       // group's chat_id via /telegram:access later, without a third-party bot
       // or interrupting the live poller. Purely additive — the drop below is
-      // unchanged behaviour. Skipped in static mode (no runtime writes).
-      if (!STATIC) {
+      // unchanged behaviour. Skipped in static and locked mode (no runtime writes).
+      if (!ACCESS_READ_ONLY) {
         const chatTitle = ctx.chat && 'title' in ctx.chat ? ctx.chat.title : undefined
         access.seenGroups = recordSeenGroup(access.seenGroups, groupId, {
           title: chatTitle,
@@ -757,7 +785,27 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
+if (!ACCESS_READ_ONLY) setInterval(checkApprovals, 5000).unref()
+
+// Locked mode (D-528(b), OB-04): every inbound update — message, reaction, button — is dropped
+// while the client's config.json owner id differs from the lock's ownerChatId (or either is
+// unreadable): an edited number makes the agent deaf, it never makes a new owner. One stderr
+// line per new reason, not one per update.
+if (readLockedAccess) {
+  let lastOwnerReason: string | null = null
+  bot.use(async (_ctx, next) => {
+    const g = ownerGate(userVoiceConfig(homedir()).chatId, readLockedAccess())
+    if (!g.pass) {
+      if (g.reason !== lastOwnerReason) {
+        safeStderr(`telegram channel: update dropped — ${g.reason} (D-528)\n`)
+        lastOwnerReason = g.reason
+      }
+      return
+    }
+    lastOwnerReason = null
+    await next()
+  })
+}
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
@@ -2157,8 +2205,9 @@ async function handleInbound(
     // own `fallback`, and the pre-existing "no image" state) — never a hung
     // or dropped delivery.
     if (attachment?.kind === 'voice') {
-      const ownerSent = OWNER_TG_ID != null && String(from.id) === OWNER_TG_ID
-      const author = voiceAuthor({ from: ctx.from, forwardOrigin: ctx.message?.forward_origin }, OWNER_TG_ID)
+      const ownerId = voiceOwnerId()
+      const ownerSent = ownerId != null && String(from.id) === ownerId
+      const author = voiceAuthor({ from: ctx.from, forwardOrigin: ctx.message?.forward_origin }, ownerId)
       const lang = author.voice_trust === 'owner' ? USER_VOICE_LANG : 'auto'
       const timeoutMs = whisperTimeoutMs(attachment.duration ?? 0)
       const fileId = attachment.file_id
