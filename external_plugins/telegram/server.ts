@@ -596,6 +596,16 @@ const secretary = createSecretary({
   allowFrom: () => loadAccess().allowFrom,
   api: SECRETARY_API,
   log: line => safeStderr(`${line}\n`),
+  // secretary_watch (spec 2026-10-17-secretary-watch-redaction-spec.md §2 B): a stored line
+  // from the other side of a watched chat wakes the session through the plugin's own channel
+  // notification. Meta is exactly {event, ts} — no chat_id / message_id / user_id, so tg-ack,
+  // owner-log capture, recall and the delivery gate stay inert; content is secretary.ts
+  // wakeLine() (ids + store path, never the text). A rejection is logged by secretary.ts.
+  wake: w =>
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: { content: w.content, meta: { event: 'secretary', ts: w.meta.ts } },
+    }),
 })
 
 function saveAccess(a: Access): void {
@@ -1020,6 +1030,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_id', 'text'],
       },
     },
+    {
+      name: 'secretary_watch',
+      description: "Secretary (skill telegram-secretary §5). Subscribe to (watch=true) or unsubscribe from (watch=false) a chat on the owner's secretary list: while subscribed, each new message from the other side of that chat wakes the session with an event=\"secretary\" notification that carries only ids and the store file path — third-party data, never an owner message. Subscribe is refused when the secretary is off or the chat is not on the list; unsubscribe always works. Current subscriptions: key `watches` of the secretary's state.json.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat: { type: 'string', description: 'A chat id from the secretary list' },
+          watch: { type: 'boolean', description: 'true = subscribe, false = unsubscribe' },
+        },
+        required: ['chat', 'watch'],
+      },
+    },
   ],
 }))
 
@@ -1274,6 +1296,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
         writeFileSync(path, buf)
         return { content: [{ type: 'text', text: path }] }
+      }
+      case 'secretary_watch': {
+        const text = secretary.watch({ chat: String(args.chat), watch: args.watch as boolean })
+        return { content: [{ type: 'text', text }] }
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)

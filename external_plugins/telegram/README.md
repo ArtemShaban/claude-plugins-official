@@ -77,6 +77,7 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 | `reply` | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading and `files` (absolute paths) for attachments. Images (`.jpg`/`.png`/`.gif`/`.webp`) send as photos with inline preview; other types send as documents. Max 50MB each. Auto-chunks text; files send as separate messages after the text. Returns the sent message ID(s). |
 | `react` | Add an emoji reaction to a message by ID. **Only Telegram's fixed whitelist** is accepted (👍 👎 ❤ 🔥 👀 etc). |
 | `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
+| `secretary_watch` | This fork only: subscribe to / unsubscribe from a chat on the owner's secretary list (see «Secretary» below). |
 
 The plugin sends no typing indicator on receipt; in this fork "typing…" is driven from outside the plugin.
 
@@ -123,9 +124,21 @@ Business → Chatbots (no login of the assistant into his account, no new secret
   (`{"<chat id>": "<name>"}`; his own id, `access.json` `allowFrom` ids and
   non-positive ids are dropped with one stderr line). Each message → one JSON
   line in `sam-data/state/tg-business/<chat>/<YYYY-MM>.jsonl` (the archive line
-  shape; text and labels only; dir 0700, files 0600, `.gitignore` `*`). A chat
-  not on the list leaves only `{name, first_seen}` in `state.json` `unlisted`.
-  Never wakes the session, never replies, never marks read.
+  shape; text and labels only; dir 0700, files 0600, `.gitignore` `*`). Before
+  the line is written, an invite payload — `start=` followed by 20 or more of
+  `[A-Za-z0-9_-]` — becomes `start=<INVITE>` (the link stays in his Telegram; the
+  key is never stored); every other byte is kept. A chat not on the list leaves
+  only `{name, first_seen}` in `state.json` `unlisted`. Never replies, never marks read.
+- **Watch (wake).** `secretary_watch` with `chat: "<listed chat id>"`, `watch: true`
+  subscribes (`state.json` `watches: {"<chat id>": {"since": "<ISO>"}}`; refused
+  when the switch is off or the chat is not on the filtered list); `watch: false`
+  unsubscribes (always allowed). After a line from the OTHER side of a watched
+  chat is stored (not his own messages), the plugin wakes the session once
+  through its channel notification: meta exactly `event: "secretary"` + `ts`
+  (no `chat_id` / `message_id` / `user_id`, so nothing acks or captures it as his
+  message), content one fixed English line with the chat id, message id, kind
+  and store file path — never a byte of the message text. A failed wake is one
+  stderr line; the stored line stays. Unwatched or unlisted chats never wake.
 - **Draft.** `reply` with `as_owner_to: "<listed chat id>"` and `chat_id` = the
   owner's DM shows him one literal preview («Отправить от твоего имени → <name>: …»)
   and records a pending draft keyed by the preview id in `state.json`. Refused
