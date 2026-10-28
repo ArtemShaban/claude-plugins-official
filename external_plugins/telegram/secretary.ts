@@ -11,11 +11,16 @@
 //   (W) `secretary_watch` (spec 2026-10-17-secretary-watch-redaction-spec.md) keeps
 //       a per-chat watch in state.json `watches`; a stored line from the OTHER side
 //       of a watched chat → one session wake (ids + store path, never the text).
-//   (C) the `reply` tool's `as_owner_to` option → one literal preview in his DM
+//   (C) the `reply` tool's `as_owner_to` option. Preview ON (override
+//       `telegram-secretary-preview` exactly true) → one literal preview in his DM
 //       + a pending draft keyed by the preview message id.
 //   (D) his 👍 on the preview, or his own non-forwarded «да» replying to it →
 //       the plugin sends the draft text byte-for-byte in his name, ONCE, and
 //       tells him «Отправил» / «Не ушло».
+//   (E) Preview OFF (the default, D-876: same as WhatsApp) → the SAME call sends the
+//       text byte-for-byte straight into that chat in his name, ONCE, and records it
+//       under a `direct:` key. Whether he said «да» (or a grant names the person) is
+//       the agent's rule (CLAUDE.md §4, skill telegram-secretary), not this module's.
 //
 // Safety:
 // - OFF unless sam-data config.json `overrides["telegram-secretary"] === true`,
@@ -40,18 +45,20 @@ import { samDataDir, serialize } from './voice-delivery'
 
 export const SECRETARY_SWITCH = 'telegram-secretary'
 export const SECRETARY_CHATS_KEY = 'telegram_secretary_chats'
+/** D-876: exactly boolean `true` → the old 👍-on-preview flow; anything else (absent, false, a string) → direct send. */
+export const SECRETARY_PREVIEW = 'telegram-secretary-preview'
 /** One Telegram text message (Bot API cap, UTF-16 units — same as MAX_CHUNK_LIMIT in server.ts). */
 export const PREVIEW_MAX = 4096
 export const APPROVE_EMOJI = '👍'
 
-export type SecretaryConfig = { on: boolean; chats: Map<string, string> }
+export type SecretaryConfig = { on: boolean; preview: boolean; chats: Map<string, string> }
 
 export type Draft = {
   chat_id: string
   text: string
   created: string
   status: 'pending' | 'sending' | 'sent' | 'failed'
-  approval?: { kind: '👍' | 'да'; at: string }
+  approval?: { kind: '👍' | 'да' | 'direct'; at: string }
   sent_msg_id?: number
   error?: string
 }
@@ -134,14 +141,14 @@ function readConfigJson(home: string): Record<string, unknown> | undefined {
   }
 }
 
-/** Switch ON only for exactly boolean `true` in overrides; the list keeps only safe targets. */
+/** Switch ON only for exactly boolean `true` in overrides; the list keeps only safe targets. Preview ON only for exactly `true` (D-876). */
 export function readSecretaryConfig(
   home: string,
   ownerId: string | undefined,
   allowFrom: string[],
   logDrop: (line: string) => void,
 ): SecretaryConfig {
-  const off: SecretaryConfig = { on: false, chats: new Map() }
+  const off: SecretaryConfig = { on: false, preview: false, chats: new Map() }
   if (!ownerId) return off
   const cfg = readConfigJson(home)
   const ov = cfg?.overrides
@@ -162,7 +169,7 @@ export function readSecretaryConfig(
       chats.set(id, (name as string).trim())
     }
   }
-  return { on: true, chats }
+  return { on: true, preview: (ov as Record<string, unknown>)[SECRETARY_PREVIEW] === true, chats }
 }
 
 // ── state file ───────────────────────────────────────────────────────────
@@ -247,7 +254,26 @@ export function previewText(name: string, text: string): string {
   return `Отправить от твоего имени → ${name}:\n\n${text}\n\n👍 или ответь «да» на это сообщение — отправлю. Без этого не уйдёт.`
 }
 
+/**
+ * The `reply` tool's result line for a preview-mode `as_owner_to` call (today's wording).
+ */
+export function previewResultText(previewId: number): string {
+  return `draft preview shown to the owner (id: ${previewId}); it goes out in his name only after his 👍 or «да» — the plugin reports the result to him`
+}
+
+/**
+ * The result line for a direct send. It must NOT start with `sent` and hold no `id:` / `ids:`:
+ * the core owner-log outgoing hook (tools/owner_log_outgoing_hook.py) logs a result that starts
+ * `sent` as a message in HIS DM with that id — a false owner-log row.
+ */
+export function directResultText(name: string, businessMessageId: number): string {
+  return `secretary: delivered in the owner's name to ${name}, business message ${businessMessageId}`
+}
+
 // ── the secretary (one per plugin process) ──────────────────────────────
+
+/** What a submitted `as_owner_to` call did: `mode` = which path ran, `id` = the message id it produced. */
+export type DraftResult = { mode: 'preview' | 'direct'; id: number; name: string }
 
 export type DraftArgs = {
   chat_id: string
@@ -387,8 +413,60 @@ export function createSecretary(deps: SecretaryDeps) {
     saveSecretaryState(deps.home, st)
   }
 
-  /** (C) draft. Throws on every refusal (nothing sent, no draft). Returns the preview message id. */
-  async function draft(a: DraftArgs): Promise<number> {
+  /** Record one direct send. A failed write is one stderr line, never a failure report (the message already left). */
+  function recordDirect(key: string, d: Draft): void {
+    try {
+      saveDraft(key, d)
+    } catch (err) {
+      deps.log(`telegram secretary: direct record not written (${key}): ${err}`)
+    }
+  }
+
+  /**
+   * (E) Preview OFF: the verified-connection re-check exactly as `approve` does it, then ONE
+   * sendMessage, byte-for-byte, no retry. Sent or failed, it leaves one `direct:` record
+   * (a key that can never equal a preview message id, so isDraftPreview never matches it).
+   */
+  async function sendDirect(chatId: string, text: string, name: string, connId: string): Promise<DraftResult> {
+    const created = now().toISOString()
+    let sentId: number
+    try {
+      // Re-check right before sending: the id comes from a session-writable file (security F1).
+      const conn = await deps.api.getBusinessConnection(connId)
+      if (String(conn.user?.id) !== deps.ownerId || conn.is_enabled !== true) {
+        throw new Error("the Business connection is not the owner's or is disabled")
+      }
+      sentId = (await deps.api.sendMessage(chatId, text, { business_connection_id: connId })).message_id
+    } catch (err) {
+      const error = (err as { description?: string })?.description ?? (err as Error)?.message ?? String(err)
+      deps.log(`telegram secretary: direct send failed: ${error}`)
+      recordDirect(`direct:${chatId}:${created}`, {
+        chat_id: chatId,
+        text,
+        created,
+        status: 'failed',
+        approval: { kind: 'direct', at: created },
+        error,
+      })
+      throw new Error(error)
+    }
+    recordDirect(`direct:${chatId}:${sentId}`, {
+      chat_id: chatId,
+      text,
+      created,
+      status: 'sent',
+      approval: { kind: 'direct', at: now().toISOString() },
+      sent_msg_id: sentId,
+    })
+    return { mode: 'direct', id: sentId, name }
+  }
+
+  /**
+   * (C/E) The `as_owner_to` call. Throws on every refusal (nothing sent, no draft). Preview ON →
+   * one preview to his DM, `id` = the preview message id. Preview OFF (default) → the text is
+   * sent into the chat, `id` = the business message id. The mode is read from config on every call.
+   */
+  async function submit(a: DraftArgs): Promise<DraftResult> {
     const cfg = config()
     if (!cfg.on) throw new Error('telegram-secretary is off')
     if (!deps.ownerId || a.chat_id !== deps.ownerId) throw new Error("as_owner_to: chat_id must be the owner's DM")
@@ -398,15 +476,28 @@ export function createSecretary(deps: SecretaryDeps) {
       throw new Error('as_owner_to: cannot be combined with files, checklist or voice')
     }
     if (typeof a.text !== 'string' || a.text.trim() === '') throw new Error('as_owner_to: empty text')
+    const verifiedConnection = (): string => {
+      const id = loadSecretaryState(deps.home).connection?.id
+      if (!id) throw new Error('as_owner_to: no verified Business connection yet (no message from it has arrived)')
+      return id
+    }
+    if (!cfg.preview) {
+      if (a.text.length > PREVIEW_MAX) throw new Error('as_owner_to: the text is longer than one Telegram message')
+      return sendDirect(String(a.as_owner_to), a.text, name, verifiedConnection())
+    }
     const preview = previewText(name, a.text)
     if (preview.length > PREVIEW_MAX) throw new Error('as_owner_to: the preview is longer than one Telegram message')
-    const st = loadSecretaryState(deps.home)
-    if (!st.connection?.id) throw new Error('as_owner_to: no verified Business connection yet (no message from it has arrived)')
+    verifiedConnection()
     const sent = await deps.api.sendMessage(deps.ownerId, preview)
     const key = String(sent.message_id)
     shown.set(key, { chat_id: String(a.as_owner_to), text: a.text, name, status: 'pending' })
     saveDraft(key, { chat_id: String(a.as_owner_to), text: a.text, created: now().toISOString(), status: 'pending' })
-    return sent.message_id
+    return { mode: 'preview', id: sent.message_id, name }
+  }
+
+  /** Same call, only the message id (the preview id, or the business message id in direct mode). */
+  async function draft(a: DraftArgs): Promise<number> {
+    return (await submit(a)).id
   }
 
   async function tell(previewId: number, report: string, status: string): Promise<void> {
@@ -512,7 +603,7 @@ export function createSecretary(deps: SecretaryDeps) {
     }
   }
 
-  return { onBusinessMessage, draft, onReaction, onOwnerText, isDraftPreview, watch }
+  return { onBusinessMessage, draft, submit, onReaction, onOwnerText, isDraftPreview, watch }
 }
 
 export type Secretary = ReturnType<typeof createSecretary>

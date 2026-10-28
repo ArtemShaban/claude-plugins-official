@@ -59,7 +59,7 @@ import {
 } from './group-buffer'
 import { sendWithAutoFormat, buildVoiceCaption } from './telegram-format'
 import { appendArchive, archiveRoot } from './tg-archive'
-import { createSecretary, type SecretaryApi } from './secretary'
+import { createSecretary, directResultText, previewResultText, type SecretaryApi } from './secretary'
 import { clipUtf16 } from './text-clip'
 import {
   buildChecklist,
@@ -982,7 +982,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           as_owner_to: {
             type: 'string',
-            description: "Secretary (skill telegram-secretary). A chat id from the owner's secretary list: instead of a normal reply, shows the owner (chat_id must be his DM) the exact `text` as a draft of a message IN HIS NAME to that chat. Nothing goes out now — the plugin itself sends it only after his 👍 on the preview or his «да» reply to it, then tells him the result. Refused when the secretary is off, the chat is not listed, or combined with files/checklist/voice.",
+            description: "Secretary (skill telegram-secretary). A chat id from the owner's secretary list: instead of a normal reply, sends the exact `text` as a message IN HIS NAME to that chat (chat_id must be his DM). Two modes, set by his sam-data override `telegram-secretary-preview` (run `config-get telegram-secretary-preview` first; the skill says when you may call). Preview OFF (the default; absent, false or anything but true): the text goes out AT ONCE, byte-for-byte, into that chat — there is no preview and no undo; call this only after his «да» on this exact text or inside a grant that names this person. Preview ON (exactly true): nothing goes out now — a preview is shown to him and the plugin sends it only after his 👍 on the preview or his «да» reply to it, then tells him the result. Refused when the secretary is off, the chat is not listed, there is no verified Business connection, or combined with files/checklist/voice.",
           },
         },
         required: ['chat_id', 'text'],
@@ -1072,11 +1072,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         assertAllowedChat(chat_id)
 
-        // Secretary draft path (spec §2 C). Always returns or throws, so the
+        // Secretary path (spec §2 C, D-876). Always returns or throws, so the
         // plain-reply code below is never affected. Sending in his name happens
-        // only in secretary.ts after his 👍 / «да» — never from this tool.
+        // only in secretary.ts: after his 👍 / «да» on the preview (preview ON), or at once
+        // (preview OFF, the default — whether he said «да» is the agent's rule, as in WhatsApp).
+        // The direct result must not start with `sent` (owner-log outgoing hook) — see secretary.ts.
         if (args.as_owner_to != null) {
-          const previewId = await secretary.draft({
+          const r = await secretary.submit({
             chat_id,
             text,
             as_owner_to: String(args.as_owner_to),
@@ -1085,7 +1087,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             voice: args.voice,
           })
           return {
-            content: [{ type: 'text', text: `draft preview shown to the owner (id: ${previewId}); it goes out in his name only after his 👍 or «да» — the plugin reports the result to him` }],
+            content: [{ type: 'text', text: r.mode === 'direct' ? directResultText(r.name, r.id) : previewResultText(r.id) }],
           }
         }
 

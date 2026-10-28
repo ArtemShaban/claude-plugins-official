@@ -139,12 +139,28 @@ Business → Chatbots (no login of the assistant into his account, no new secret
   message), content one fixed English line with the chat id, message id, kind
   and store file path — never a byte of the message text. A failed wake is one
   stderr line; the stored line stays. Unwatched or unlisted chats never wake.
-- **Draft.** `reply` with `as_owner_to: "<listed chat id>"` and `chat_id` = the
+- **Preview setting (D-876).** `"overrides": {"telegram-secretary-preview": true}` (exactly
+  boolean `true`; read on every call) turns the preview flow below ON. Absent, `false` or any
+  other value (the default, same on every install) → **direct mode**, like WhatsApp: the same
+  `reply` + `as_owner_to` call sends the text at once and shows no preview. Whether he said
+  «да» (or a grant names the person) is the agent's rule (skill `telegram-secretary`), not a
+  plugin check.
+- **Direct send (preview OFF).** After the same refusals as a draft (switch off, `chat_id` not his
+  DM, chat not on the list, `files` / `checklist` / `voice`, empty text, text over one message,
+  no verified Business connection), the plugin re-checks the connection with
+  `getBusinessConnection` (his and enabled) and calls `sendMessage(chat, text,
+  {business_connection_id})` once, byte-for-byte, no parse mode, no retry. Sent or failed, it
+  writes one `state.json` `drafts["direct:<chat>:<msg id | time>"]` record (`status`,
+  `sent_msg_id` | `error`, `approval: {kind: "direct"}`); a failed record write is one stderr
+  line. He gets no notice in his DM (he sees the message in his own Telegram). The tool result is
+  «secretary: delivered in the owner's name to <name>, business message N» — it must not start
+  with `sent` or hold `id:` (the core owner-log hook would log it as a message in his DM).
+- **Draft (preview ON).** `reply` with `as_owner_to: "<listed chat id>"` and `chat_id` = the
   owner's DM shows him one literal preview («Отправить от твоего имени → <name>: …»)
   and records a pending draft keyed by the preview id in `state.json`. Refused
   with `files` / `checklist` / `voice`, empty text, a preview over one message,
   or an unlisted chat. `edit_message` on a preview is refused.
-- **Send.** Only the plugin sends, only after the owner's net-added 👍 on the
+- **Send (preview ON).** Only the plugin sends, only after the owner's net-added 👍 on the
   preview in his DM, or his own non-forwarded reply «да» to it: the draft text
   byte-for-byte, no parse mode, once (`sending` is saved before the call), then
   «Отправил: <name>.» or «Не ушло: <reason>. Ничего не отправлено.» under the
