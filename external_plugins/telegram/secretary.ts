@@ -89,6 +89,13 @@ export type SecretaryDeps = {
   ownerId: string | undefined
   /** access.json allowFrom — the chats where I take orders (D-460); never a target. */
   allowFrom: () => string[]
+  /**
+   * The bot's own user id (server.ts: from the polling-started callback's info.id, never the token). Wired →
+   * a list entry equal to it is dropped (our own bot chat is never a target, D-460) and, while it
+   * is still unknown (returns undefined), `as_owner_to` is refused before any API call (fail-closed).
+   * Not wired (unit tests of the older blocks) → no bot-chat check.
+   */
+  botId?: () => string | undefined
   api: SecretaryApi
   log: (line: string) => void
   now?: () => Date
@@ -147,6 +154,7 @@ export function readSecretaryConfig(
   ownerId: string | undefined,
   allowFrom: string[],
   logDrop: (line: string) => void,
+  botId?: string,
 ): SecretaryConfig {
   const off: SecretaryConfig = { on: false, preview: false, chats: new Map() }
   if (!ownerId) return off
@@ -161,6 +169,7 @@ export function readSecretaryConfig(
       if (!/^[1-9][0-9]{0,19}$/.test(id)) why = 'not a positive integer chat id'
       else if (id === ownerId) why = "the owner's own id"
       else if (allowFrom.includes(id)) why = 'an allowFrom id (a chat where I take orders)'
+      else if (botId !== undefined && id === botId) why = "the bot's own id (our own bot chat, D-460)"
       else if (typeof name !== 'string' || name.trim() === '') why = 'no name'
       if (why) {
         logDrop(`telegram secretary: list entry ${JSON.stringify(id)} dropped: ${why}`)
@@ -296,7 +305,7 @@ export function createSecretary(deps: SecretaryDeps) {
     loggedDrops.add(line)
     deps.log(line)
   }
-  const config = () => readSecretaryConfig(deps.home, deps.ownerId, deps.allowFrom(), logDrop)
+  const config = () => readSecretaryConfig(deps.home, deps.ownerId, deps.allowFrom(), logDrop, deps.botId?.())
 
   async function isOwnersConnection(id: string): Promise<boolean> {
     const cached = connCache.get(id)
@@ -469,6 +478,10 @@ export function createSecretary(deps: SecretaryDeps) {
   async function submit(a: DraftArgs): Promise<DraftResult> {
     const cfg = config()
     if (!cfg.on) throw new Error('telegram-secretary is off')
+    // Fail-closed (security S1, D-460): the bot's own id is what keeps our own bot chat off the list.
+    if (deps.botId && deps.botId() === undefined) {
+      throw new Error("as_owner_to: the bot's own id is not known yet (polling has not started) — refused")
+    }
     if (!deps.ownerId || a.chat_id !== deps.ownerId) throw new Error("as_owner_to: chat_id must be the owner's DM")
     const name = cfg.chats.get(String(a.as_owner_to))
     if (name === undefined) throw new Error('as_owner_to: chat is not on the secretary list')

@@ -368,6 +368,8 @@ const bot = new Bot(TOKEN)
 // watchdog reads — poll-liveness.ts. Only getUpdates is touched.
 bot.api.config.use(createPollLiveness({ stateDir: STATE_DIR, log: safeStderr }).transformer)
 let botUsername = ''
+// The bot's own user id (set in bot.start onStart); the secretary refuses to send while it is unknown.
+let botUserId: string | undefined
 
 // Idea-capture ✍ ack queue (reaction-queue.ts). Replaces the old direct,
 // unbounded `bot.api.setMessageReaction` fire-and-forget call in the
@@ -594,6 +596,8 @@ const secretary = createSecretary({
   // An admin change of ownerChatId reaches the secretary at the next restart.
   ownerId: lockOwnerId(ACCESS_LOCK, readLockedAccess, OWNER_TG_ID),
   allowFrom: () => loadAccess().allowFrom,
+  // D-876 security S1 (D-460): our own bot chat is never a target. Id from bot.start onStart (below), not the token.
+  botId: () => botUserId,
   api: SECRETARY_API,
   log: line => safeStderr(`${line}\n`),
   // secretary_watch (spec 2026-10-17-secretary-watch-redaction-spec.md §2 B): a stored line
@@ -2425,6 +2429,7 @@ void (async () => {
         onStart: info => {
           attempt = 0
           botUsername = info.username
+          botUserId = String(info.id)
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
         },
       })

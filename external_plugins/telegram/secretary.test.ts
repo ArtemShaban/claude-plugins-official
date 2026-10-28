@@ -1448,3 +1448,54 @@ describe('D-876 — nothing else changed (OB-05, OB-07)', () => {
     expect(readme.slice(readme.indexOf("## Secretary in the owner's Telegram"))).toContain('telegram-secretary-preview')
   })
 })
+
+// ── D-876 security S1 — our own bot chat is never a target (D-460) ───────────
+const BOT = '555555555'
+
+function makeBot(api: SecretaryApi, botId: () => string | undefined) {
+  return createSecretary({ home, ownerId: OWNER, allowFrom: () => allowFrom, botId, api, log: l => logs.push(l) })
+}
+
+describe('D-876 security S1 — the bot\'s own id is dropped from the list; unknown id → refused', () => {
+  test('readSecretaryConfig drops a list entry equal to the bot id (one drop line) and keeps the others', () => {
+    onDirect(undefined, { [BOT]: 'бот', [MAXIM]: 'Максим' })
+    const cfg = readSecretaryConfig(home, OWNER, allowFrom, l => logs.push(l), BOT)
+    expect([...cfg.chats.keys()]).toEqual([MAXIM])
+    expect(logs.filter(l => l.includes(BOT) && l.includes('dropped') && l.includes("bot's own id")).length).toBe(1)
+  })
+
+  for (const preview of [undefined, true] as const) {
+    test(`a list holding the bot id (preview key ${preview === undefined ? 'absent' : 'true'}) → submit refused, 0 sendMessage, 0 records`, async () => {
+      onDirect(preview, { [BOT]: 'бот', [MAXIM]: 'Максим' })
+      const f = fakeApi()
+      const s = makeBot(f.api, () => BOT)
+      await s.onBusinessMessage(bmsg())
+      await expect(s.submit({ chat_id: OWNER, text: 'ok', as_owner_to: BOT })).rejects.toThrow('not on the secretary list')
+      expect(sendsAll(f)).toEqual([])
+      expect(Object.keys(loadSecretaryState(home).drafts)).toEqual([])
+      // a normal listed chat still works in the same setup
+      const r = await s.submit({ chat_id: OWNER, text: 'ok', as_owner_to: MAXIM })
+      expect(r.mode).toBe(preview === true ? 'preview' : 'direct')
+    })
+  }
+
+  for (const preview of [undefined, true] as const) {
+    test(`bot id still unknown (preview key ${preview === undefined ? 'absent' : 'true'}) → as_owner_to refused, no API call at all`, async () => {
+      onDirect(preview)
+      const f = fakeApi()
+      const s = makeBot(f.api, () => undefined)
+      await expect(s.submit({ chat_id: OWNER, text: 'ok', as_owner_to: MAXIM })).rejects.toThrow("bot's own id is not known")
+      await expect(s.draft({ chat_id: OWNER, text: 'ok', as_owner_to: MAXIM })).rejects.toThrow("bot's own id is not known")
+      expect(f.calls).toEqual([])
+      expect(existsSync(secretaryStatePath(home))).toBe(false)
+    })
+  }
+
+  test('server.ts wires botId from bot.start onStart info.id (not from the token)', () => {
+    const server = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const block = server.slice(server.indexOf('const secretary = createSecretary('), server.indexOf('wake: w =>'))
+    expect(block).toContain('botId: () => botUserId')
+    expect(server).toContain('botUserId = String(info.id)')
+    expect(server.slice(server.indexOf('botUserId = String(info.id)') - 200, server.indexOf('botUserId = String(info.id)') + 60)).toContain('onStart')
+  })
+})
