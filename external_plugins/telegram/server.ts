@@ -59,7 +59,8 @@ import {
 } from './group-buffer'
 import { sendWithAutoFormat, buildVoiceCaption } from './telegram-format'
 import { appendArchive, archiveRoot } from './tg-archive'
-import { createSecretary, directResultText, previewResultText, type SecretaryApi } from './secretary'
+import { createSecretary, directResultText, loadSecretaryState, previewResultText, secretaryRoot, type SecretaryApi } from './secretary'
+import { catchUp, createKeeper, createOutStore, isOwnDeliveredMedia, type Download } from './chat-store'
 import { clipUtf16 } from './text-clip'
 import {
   buildChecklist,
@@ -367,6 +368,45 @@ const bot = new Bot(TOKEN)
 // getUpdates time limit (poll timeout + 15 s) + the poll.json heartbeat the core
 // watchdog reads — poll-liveness.ts. Only getUpdates is touched.
 bot.api.config.use(createPollLiveness({ stateDir: STATE_DIR, log: safeStderr }).transformer)
+
+// D-883 chat store (chat-store.ts; spec sam-data dev/analysis/2026-10-29-d883-store-timeline-door-spec.md).
+// The secretary store lives beside the archive; no sam-data folder → both off.
+const BUSINESS_ROOT = ARCHIVE_ROOT ? secretaryRoot(homedir()) : undefined
+// The one Bot API read the store adds (getFile; amends D-637 OB-11 — the secretary's own
+// SecretaryApi stays two methods). 'too_big' / undefined → nothing kept.
+const fetchTelegramFile: Download = async fileId => {
+  const file = await bot.api.getFile(fileId)
+  if (!file.file_path) return undefined
+  if (file.file_size != null && file.file_size > MAX_DOWNLOAD_BYTES) return 'too_big'
+  const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`)
+  if (!res.ok) throw Object.assign(new Error('file download failed'), { code: `HTTP_${res.status}` })
+  const ext = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
+  return { bytes: new Uint8Array(await res.arrayBuffer()), ext }
+}
+const keeper = createKeeper({ download: fetchTelegramFile, log: safeStderr, maxBytes: MAX_DOWNLOAD_BYTES })
+// Every message we send (reply tool, previews, approvals, D-876 direct sends, reports, echoes)
+// → one out line in that chat's store; a sent file is kept too. ctx.api inherits this.
+bot.api.config.use(
+  createOutStore({
+    roots: { archive: ARCHIVE_ROOT, business: BUSINESS_ROOT },
+    log: safeStderr,
+    onFile: (root, line) => void keeper.keep(root, line.chat_id, line.msg_id, line.file_id!),
+    // The archive's own membership (D-520): allowed DM people and configured groups only.
+    archiveAllows: chat => {
+      const a = loadAccess()
+      return a.allowFrom.includes(chat) || a.groups[chat] != null
+    },
+  }).transformer,
+)
+/** Someone else's voice / photo in a bot chat → kept in the store (delivered from there); his own → undefined (inbox path). */
+function keepOthersMedia(ctx: Context, fileId: string, size: number | undefined): Promise<string | undefined> {
+  const msgId = ctx.message?.message_id
+  if (!ARCHIVE_ROOT || msgId == null || ctx.chat == null) return Promise.resolve(undefined)
+  const owner = voiceOwnerId()
+  if (owner != null && String(ctx.from?.id) === owner) return Promise.resolve(undefined)
+  return keeper.keep(ARCHIVE_ROOT, String(ctx.chat.id), msgId, fileId, size)
+}
+let storeCatchUpDone = false
 let botUsername = ''
 // The bot's own user id (set in bot.start onStart); the secretary refuses to send while it is unknown.
 let botUserId: string | undefined
@@ -1565,7 +1605,11 @@ bot.on('message:text', async ctx => {
 // message:* handlers never see these. Stored only when the connection is the
 // owner's and the chat is on his list; never wakes the session, never replies.
 bot.on('business_message', async ctx => {
-  await secretary.onBusinessMessage(ctx.businessMessage)
+  const stored = await secretary.onBusinessMessage(ctx.businessMessage)
+  // D-883: the stored line's file goes into the chat store too (never blocks; keep() never throws).
+  if (stored?.file_id && stored.msg_id != null && BUSINESS_ROOT) {
+    void keeper.keep(BUSINESS_ROOT, stored.chat_id, stored.msg_id, stored.file_id)
+  }
 })
 
 bot.on('message:photo', async ctx => {
@@ -1589,6 +1633,9 @@ bot.on('message:photo', async ctx => {
     ctx,
     caption,
     async () => {
+      // D-883: someone else's photo is delivered from the chat store; his own keeps the inbox path.
+      const kept = await keepOthersMedia(ctx, best.file_id, best.file_size)
+      if (kept) return kept
       try {
         const file = await ctx.api.getFile(best.file_id)
         if (!file.file_path) return undefined
@@ -1991,6 +2038,15 @@ async function handleInbound(
         ...(threadId != null ? { thread_id: threadId } : {}),
         ...(attachment?.file_id ? { file_id: attachment.file_id } : {}),
       })
+      // D-883: the file goes into the chat store on arrival (never blocks delivery). His own
+      // voice / photo are skipped — delivery already keeps them (inbox + owner-log-media, D-197).
+      if (
+        attachment?.file_id &&
+        msg?.message_id != null &&
+        !isOwnDeliveredMedia(attachment.kind, String(ctx.from!.id), voiceOwnerId())
+      ) {
+        void keeper.keep(ARCHIVE_ROOT, String(ctx.chat!.id), msg.message_id, attachment.file_id, attachment.size)
+      }
     } catch (err) {
       safeStderr(`telegram channel: tg-archive append failed (${ARCHIVE_ROOT}): ${err}\n`)
     }
@@ -2248,7 +2304,11 @@ async function handleInbound(
         safeStderr(`telegram channel: voice transcribe (chat=${chat_id} msg=${msgId ?? '?'}): ${reason}\n`)
       const envelope = await withTimeout(
         deliverVoiceTranscript(TRANSCRIBE_CMD != null, ctx.message?.caption, author, {
-          download: () => downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga'),
+          // D-883: someone else's voice is delivered from the chat store (its transcript lands
+          // next to it — core transcribe.sh); his own, or a store failure, keeps the inbox path.
+          download: async () =>
+            (await keepOthersMedia(ctx, fileId, sizeHint)) ??
+            downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga'),
           // Whisper mutex (§6.3, EXTRAS(2)): the SAME serialize() keyed on a
           // fixed 'whisper' key bounds concurrent whisper runs to 1 across ALL
           // chats (whisper is ~1.5GB RSS on a 16GB miniK) — a slow voice in
@@ -2431,6 +2491,19 @@ void (async () => {
           botUsername = info.username
           botUserId = String(info.id)
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          // D-883 start-up catch-up, once per process: files of stored lines (≤ 90 days) and
+          // secretary sends made before the out store. Background; never throws.
+          if (!storeCatchUpDone && ARCHIVE_ROOT) {
+            storeCatchUpDone = true
+            void catchUp({
+              archiveRoot: ARCHIVE_ROOT,
+              businessRoot: BUSINESS_ROOT,
+              ownerId: voiceOwnerId(),
+              drafts: () => loadSecretaryState(homedir()).drafts,
+              keeper,
+              log: safeStderr,
+            })
+          }
         },
       })
       return // bot.stop() was called — clean exit from the loop

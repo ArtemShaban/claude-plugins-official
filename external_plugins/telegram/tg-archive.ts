@@ -51,11 +51,23 @@ export function archiveFilePath(root: string, chatId: string, ts: string): strin
   return join(archiveChatDir(root, chatId), `${ts.slice(0, 7)}.jsonl`)
 }
 
-/** Append one line. Throws on a real fs failure — the caller (server.ts) logs and carries on. */
-export function appendArchive(root: string, line: ArchiveLine): void {
+/** D-883: our own sends to this chat — a sibling file, so readers of exact `YYYY-MM.jsonl` names see no change. */
+export function outFilePath(root: string, chatId: string, ts: string): string {
+  return join(archiveChatDir(root, chatId), `${ts.slice(0, 7)}.out.jsonl`)
+}
+
+/** Root (0700, ignores itself in git) + this chat's dir (0700); returns the chat dir. Shared by every store writer. */
+export function ensureChatDir(root: string, chatId: string): string {
   mkdirSync(root, { recursive: true, mode: 0o700 })
   const ignore = join(root, '.gitignore')
   if (!existsSync(ignore)) writeFileSync(ignore, '*\n', { mode: 0o600 })
-  mkdirSync(archiveChatDir(root, line.chat_id), { recursive: true, mode: 0o700 })
+  const dir = archiveChatDir(root, chatId)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  return dir
+}
+
+/** Append one line. Throws on a real fs failure — the caller (server.ts) logs and carries on. */
+export function appendArchive(root: string, line: ArchiveLine): void {
+  ensureChatDir(root, line.chat_id)
   appendFileSync(archiveFilePath(root, line.chat_id, line.ts), JSON.stringify(line) + '\n', { mode: 0o600 })
 }

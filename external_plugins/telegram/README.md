@@ -110,6 +110,32 @@ so it never enters git. Senders the gate does not allow leave nothing. No
 sam-data folder → archive off (one stderr line at start); a write error → one
 stderr line, delivery unchanged.
 
+## Both sides and the files in the chat store (this fork, D-883)
+
+`chat-store.ts`. Owner rule: keep every message in and out.
+
+- **Our sends.** One transformer on `bot.api` (ctx.api inherits it): after a successful
+  `send*` (not `sendChatAction`), `editMessageText` or `editMessageCaption` whose result is a
+  message, one line goes to `<root>/<chat>/<YYYY-MM>.out.jsonl` — `<root>` = `state/tg-business`
+  when the call carried `business_connection_id` (the secretary: approvals, direct sends),
+  else `state/tg-archive` (reply tool, previews, reports, echoes; only chats the archive itself
+  keeps — allowed DM people and configured groups, so a pairing reply to a stranger is not
+  stored). Fields `ts`, `chat_id`, `msg_id`, `direction:"out"`, `via` (`secretary` | `bot`),
+  `kind`, `text` (caption for media; `start=<INVITE>` redaction), optional `file_id`,
+  `of_msg_id` (edits), `backfilled`. A sibling file: readers of `YYYY-MM.jsonl` see no change.
+  A failed send writes nothing; a write error is one stderr JSON line
+  `{ts, component, error_class, action_taken}` and the send's result is returned unchanged.
+- **Kept files.** Every incoming file of a stored line (tg-archive: delivered, buffered or
+  allowed-but-not-woken; tg-business: listed chats) and every file we send is saved to
+  `<root>/<chat>/files/<msg_id>.<ext>` (one `getFile` + download, ≤ 20 MB, 0600, idempotent,
+  never blocks delivery). His own voice and photo in a bot chat are not copied — delivery keeps
+  them (inbox + owner-log-media). Someone else's voice or photo is delivered from the kept path
+  (`attachment_path` / `image_path`); his own keep the inbox path. Retention (90 days for other
+  people's files) is core's nightly job, not the plugin's.
+- **Start-up catch-up** (once per process, background): kept files for stored lines of the last
+  90 days that have none, and one `backfilled: true` out line per secretary draft with
+  `status: "sent"` not yet in its `.out.jsonl`.
+
 ## Secretary in the owner's Telegram (this fork, Telegram Business, D-637)
 
 Off unless the owner's sam-data `config.json` has `"overrides": {"telegram-secretary": true}`

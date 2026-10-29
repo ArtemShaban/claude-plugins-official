@@ -331,8 +331,11 @@ export function createSecretary(deps: SecretaryDeps) {
     return true
   }
 
-  /** (B) inbound. Never throws: a failure is one stderr line (fail-open, the channel keeps working). */
-  async function onBusinessMessage(m: BusinessMessage): Promise<void> {
+  /**
+   * (B) inbound. Never throws: a failure is one stderr line (fail-open, the channel keeps working).
+   * Returns the line it stored (D-883: server.ts keeps its file), else undefined — an unlisted chat stores nothing.
+   */
+  async function onBusinessMessage(m: BusinessMessage): Promise<ArchiveLine | undefined> {
     try {
       const cfg = config()
       if (!cfg.on) return
@@ -355,7 +358,7 @@ export function createSecretary(deps: SecretaryDeps) {
         }
         appendArchive(secretaryRoot(deps.home), line)
         await wakeIfWatched(line)
-        return
+        return line
       }
       const st = loadSecretaryState(deps.home)
       if (!st.unlisted[chatId]) {
