@@ -33,10 +33,15 @@
  *    attempt bounded to STARTUP_DEADLINE_MS, then bot.start(); between failed
  *    attempts the pause is 1, 2, 4, 8, 16, 32, then 60 s every time; a
  *    successful start resets it to 1 s.
- * 4. `startup.log` in STATE_DIR, mode 0600, append-only, one line per startup
- *    attempt, metadata only (no token, URL, error text or message content):
+ *    A 409 follows the same cadence (no give-up): polling resumes by itself
+ *    once the other poller dies. A pass is «connected» at its first successful
+ *    getUpdates, not at onStart.
+ * 4. `startup.log` in STATE_DIR, mode 0600, append-only, metadata only (no
+ *    token, URL, error text or message content). One `ok` line per connect; a
+ *    failure line only when outcome or next_in_s changes within a run (≤ 8 lines
+ *    per outage or lasting 409):
  *      <ISO ts> pid=<n> attempt=<k> outcome=ok|timeout|network|http_NNN ms=<attempt ms> next_in_s=<pause|0>
- *    Readers: humans and the D-914 T+7 check. No rotation (≈1 line per start).
+ *    Readers: humans and the D-914 T+7 check. No rotation (bounded per run).
  */
 import { closeSync, constants as fsc, fchmodSync, openSync, renameSync, unlinkSync, writeSync } from 'fs'
 import { join } from 'path'
@@ -176,8 +181,6 @@ export const STARTUP_LOG = 'startup.log'
 /** Bound on one pre-connect getMe — a dead TCP path outlasts grammY's 500 s request bound. */
 export const STARTUP_DEADLINE_MS = 15_000
 export const STARTUP_PAUSE_CAP_S = 60
-/** A 409 that persists this many consecutive attempts = another poller holds the token → give up. */
-export const CONFLICT_GIVE_UP_ATTEMPTS = 8
 
 /** Pause after the n-th consecutive failed attempt (n ≥ 1): 1, 2, 4, 8, 16, 32, then 60 s (owner tg 40604/40605). */
 export function startupRetryDelayS(failures: number): number {
@@ -271,8 +274,6 @@ export interface StartupLoopOptions {
   startOptions?: Omit<PollingOptions, 'onStart'>
   onStart: (info: UserFromGetMe) => void
   isShuttingDown: () => boolean
-  /** 409 persisted CONFLICT_GIVE_UP_ATTEMPTS attempts — the caller logs it; the loop returns. */
-  onConflictGiveUp: (attempt: number) => void
   recordStartupFailure: (cls: PollErrorClass) => void
   startupLog: (l: StartupLine) => void
   log: (line: string) => void
@@ -284,17 +285,44 @@ export interface StartupLoopOptions {
 
 /**
  * The plugin's outer polling loop. Returns on a clean bot.stop(), on shutdown,
- * on grammY's «Aborted delay», or after a persistent 409. Every other failure
- * pauses by startupRetryDelayS and tries again, forever.
+ * or on grammY's «Aborted delay». Every other failure — 409 included, one
+ * cadence for all paths (spec §2) — pauses by startupRetryDelayS and tries
+ * again, forever: a lasting 409 (another poller holds the token) settles at one
+ * try per 60 s and polling resumes by itself when the other poller dies.
+ *
+ * A pass counts as connected only when one of its getUpdates calls succeeds —
+ * not at onStart: grammY throws a 409 from getUpdates only after onStart, so a
+ * reset there kept a lasting 409 at a 1 s pause forever (D-914 review F2).
+ *
+ * startup.log gets the `ok` line of a pass at its first successful getUpdates,
+ * and a failure line only when it differs from the last line written in this
+ * run (outcome or next_in_s) or opens the run — so an outage writes ≤ 8 lines
+ * (1, 2, 4 … 60, then silence) and a lasting 409 the same, not a line per pass.
  */
 export async function runStartupLoop(o: StartupLoopOptions): Promise<void> {
   const now = o.nowMs ?? Date.now
   const sleep = o.sleep ?? defaultSleep
   const deadlineMs = o.deadlineMs ?? STARTUP_DEADLINE_MS
-  let failures = 0 // consecutive failed attempts since the last successful start
+  let failures = 0 // consecutive failed passes since the last successful getUpdates
+  let last: { outcome: StartupOutcome; nextInS: number } | null = null // last line of this run
+  // Per-pass state, read by the getUpdates observer below.
+  let attempt = 1
+  let t0 = now()
+  let polledOk = false
+  o.bot.api.config.use(async (prev, method, payload, signal) => {
+    const res = await prev(method, payload, signal)
+    if (method === 'getUpdates' && res.ok && !polledOk) {
+      polledOk = true
+      failures = 0
+      o.startupLog({ attempt, outcome: 'ok', ms: now() - t0, nextInS: 0 })
+      last = null // a new run starts
+    }
+    return res
+  })
   for (;;) {
-    const attempt = failures + 1
-    const t0 = now()
+    attempt = failures + 1
+    t0 = now()
+    polledOk = false
     let started = false
     try {
       if (!o.bot.isInited()) {
@@ -305,8 +333,6 @@ export async function runStartupLoop(o: StartupLoopOptions): Promise<void> {
         ...o.startOptions,
         onStart: info => {
           started = true
-          failures = 0
-          o.startupLog({ attempt, outcome: 'ok', ms: now() - t0, nextInS: 0 })
           o.onStart(info)
         },
       })
@@ -317,16 +343,14 @@ export async function runStartupLoop(o: StartupLoopOptions): Promise<void> {
       if (err instanceof Error && err.message === 'Aborted delay') return
       failures += 1
       const is409 = err instanceof GrammyError && err.error_code === 409
-      if (is409 && failures >= CONFLICT_GIVE_UP_ATTEMPTS) {
-        o.onConflictGiveUp(failures)
-        return
-      }
       const delayS = startupRetryDelayS(failures)
-      if (!started) {
-        // A failure after onStart already has its ok line (and getUpdates its poll.json entry).
-        const cls = startupErrorClass(err)
-        o.recordStartupFailure(cls)
+      const cls = startupErrorClass(err)
+      // Before onStart nothing polled yet → poll.json hears it here; after onStart the
+      // failing getUpdates already counted it in the poll-liveness transformer.
+      if (!started) o.recordStartupFailure(cls)
+      if (last === null || last.outcome !== cls || last.nextInS !== delayS) {
         o.startupLog({ attempt, outcome: cls, ms: now() - t0, nextInS: delayS })
+        last = { outcome: cls, nextInS: delayS }
       }
       const detail = is409
         ? `409 Conflict${failures === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`

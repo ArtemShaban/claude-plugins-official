@@ -69,6 +69,8 @@ type FakeOpts = {
   hangGetMe?: number[]
   /** getUpdates call numbers that answer 409. */
   conflictGetUpdates?: number[]
+  /** Every getUpdates answers 409 while this returns true (another poller holds the token). */
+  conflictWhile?: () => boolean
 }
 function fakeBotApi(o: FakeOpts) {
   const counts = { getMe: 0, getUpdates: 0, deleteWebhook: 0 }
@@ -99,7 +101,7 @@ function fakeBotApi(o: FakeOpts) {
       }
       if (method === 'getUpdates') {
         counts.getUpdates++
-        if (o.conflictGetUpdates?.includes(counts.getUpdates)) {
+        if (o.conflictGetUpdates?.includes(counts.getUpdates) || o.conflictWhile?.()) {
           return new Response('{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request"}')
         }
         await Bun.sleep(30)
@@ -131,7 +133,6 @@ function harness(port: number) {
     bot,
     onStart: () => { starts.push(clock.nowMs()) },
     isShuttingDown: () => shuttingDown,
-    onConflictGiveUp: () => {},
     recordStartupFailure: pl.recordStartupFailure,
     startupLog: createStartupLog({ stateDir: dir, nowMs: clock.nowMs, log: () => {} }),
     log: l => { stderr.push(l) },
@@ -222,16 +223,19 @@ describe('start with no network (D-914)', () => {
     expect(typeof lastOkAfterFirstPoll.last_ok_at).toBe('number')
     expect(lastOkAfterFirstPoll.consecutive_errors).toBe(0)
 
-    // AC-6: one line per startup attempt, exact shape, 0600, no secret-ish text.
+    // AC-6: exact shape, 0600, no secret-ish text. A failure line only when outcome or
+    // next_in_s changes within a run (r1, security N1): the 8th attempt (network, 60 s
+    // again) writes nothing. Then ok (attempt 9), the 409 drop after it (a new run, 1 s),
+    // and the reconnect's ok.
     const lines = h.lines()
-    // 8 failed attempts + ok + (after the 409 throw) one more ok.
     expect(lines.length).toBe(10)
     for (const l of lines) expect(l).toMatch(LINE_RE)
     const outcomes = lines.map(l => /outcome=(\S+)/.exec(l)![1])
-    expect(outcomes.slice(0, 8)).toEqual(Array(8).fill('network'))
-    expect(outcomes.slice(8)).toEqual(['ok', 'ok'])
-    expect(lines.slice(0, 8).map(l => Number(/next_in_s=(\d+)/.exec(l)![1]))).toEqual([1, 2, 4, 8, 16, 32, 60, 60])
-    expect(lines.map(l => Number(/attempt=(\d+)/.exec(l)![1]))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 2])
+    expect(outcomes.slice(0, 7)).toEqual(Array(7).fill('network'))
+    expect(outcomes.slice(7)).toEqual(['ok', 'http_409', 'ok'])
+    expect(lines.slice(0, 7).map(l => Number(/next_in_s=(\d+)/.exec(l)![1]))).toEqual([1, 2, 4, 8, 16, 32, 60])
+    expect(lines.map(l => Number(/attempt=(\d+)/.exec(l)![1]))).toEqual([1, 2, 3, 4, 5, 6, 7, 9, 9, 2])
+    expect(lines[8]).toContain('next_in_s=1')
     expect(statSync(join(h.dir, STARTUP_LOG)).mode & 0o777).toBe(0o600)
     const raw = readFileSync(join(h.dir, STARTUP_LOG), 'utf8')
     expect(raw).not.toContain(FAKE_TOKEN)
@@ -263,6 +267,52 @@ describe('start with no network (D-914)', () => {
     expect(api.counts.getMe).toBe(2)
     const hb = h.hb()
     expect(hb.last_error === null || hb.last_error === 'timeout').toBe(true)
+  }, 30_000)
+
+  test('r1/F2: a lasting 409 after connect follows 1, 2, 4 … 60 s (no 1 s loop, no give-up), bounded log; once it clears polling resumes and the counter resets', async () => {
+    const port = reservePort()
+    const h0 = Date.now()
+    let conflict = true // another poller holds the token
+    let oneMore = false // one extra 409 after recovery, to prove the reset
+    const api = fakeBotApi({
+      port,
+      conflictWhile: () => {
+        if (oneMore) { oneMore = false; return true }
+        return conflict
+      },
+    })
+    cleanups.push(() => api.stop())
+    const h = harness(port)
+    // The other poller dies at virtual 280 s → the pass at 303 s connects.
+    const clearTimer = setTimeout(() => { conflict = false }, 280_000 / SCALE)
+    cleanups.push(() => clearTimeout(clearTimer))
+    await waitFor(() => h.lines().some(l => l.includes('outcome=ok')), 15_000)
+    const okGetUpdates = api.counts.getUpdates
+    // Polling really resumed: more getUpdates go by after the ok.
+    await waitFor(() => api.counts.getUpdates >= okGetUpdates + 2, 5_000)
+    const pausesBeforeReset = h.clock.pauses.length
+    oneMore = true
+    await waitFor(() => h.clock.pauses.length > pausesBeforeReset && h.lines().filter(l => l.includes('outcome=ok')).length >= 2, 15_000)
+    await h.stop()
+    expect(Date.now() - h0).toBeLessThan(20_000)
+
+    // Cadence while the 409 lasted: the owner's doubling, then 60 s — not 1 s forever.
+    expect(h.clock.pauses.slice(0, 10)).toEqual([1, 2, 4, 8, 16, 32, 60, 60, 60, 60].map(s => s * 1000))
+    // After the 409 cleared and a getUpdates succeeded, the next 409 starts again at 1 s.
+    expect(h.clock.pauses[pausesBeforeReset]).toBe(1000)
+    expect(Math.max(...h.clock.pauses)).toBeLessThanOrEqual(60_000)
+
+    // Bounded log: 7 distinct 409 lines (1 … 60 s), silence for the repeats, then ok,
+    // then the one extra 409 (a new run) and its reconnect's ok.
+    const lines = h.lines()
+    for (const l of lines) expect(l).toMatch(LINE_RE)
+    const outcomes = lines.map(l => /outcome=(\S+)/.exec(l)![1])
+    expect(outcomes).toEqual([...Array(7).fill('http_409'), 'ok', 'http_409', 'ok'])
+    expect(lines.slice(0, 7).map(l => Number(/next_in_s=(\d+)/.exec(l)![1]))).toEqual([1, 2, 4, 8, 16, 32, 60])
+    expect(lines[7]).toContain('attempt=11 outcome=ok')
+    // poll.json: the 409s were counted by the getUpdates transformer; healthy at the end.
+    const hb = h.hb()
+    expect(typeof hb.last_ok_at).toBe('number')
   }, 30_000)
 
   test('a 4xx from getMe is recorded as http_NNN in poll.json and startup.log', async () => {

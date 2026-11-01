@@ -2508,13 +2508,6 @@ void runStartupLoop({
     }
   },
   isShuttingDown: () => shuttingDown,
-  onConflictGiveUp: attempt => {
-    process.stderr.write(
-      `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
-      `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
-    )
-    logShutdown('polling-stopped: 409 Conflict', `attempt=${attempt}`)
-  },
   recordStartupFailure: pollLiveness.recordStartupFailure,
   startupLog: createStartupLog({ stateDir: STATE_DIR, log: safeStderr }),
   log: line => process.stderr.write(line),
