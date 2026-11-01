@@ -85,7 +85,7 @@ import {
 } from './voice-delivery'
 import { chooseAccess, detectLockMode, lockOwnerId, lockedAccessReader, ownerGate } from './access-lock'
 import { spawn } from 'child_process'
-import { createPollLiveness } from './poll-liveness'
+import { createPollLiveness, createStartupLog, runStartupLoop } from './poll-liveness'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -367,7 +367,8 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const bot = new Bot(TOKEN)
 // getUpdates time limit (poll timeout + 15 s) + the poll.json heartbeat the core
 // watchdog reads — poll-liveness.ts. Only getUpdates is touched.
-bot.api.config.use(createPollLiveness({ stateDir: STATE_DIR, log: safeStderr }).transformer)
+const pollLiveness = createPollLiveness({ stateDir: STATE_DIR, log: safeStderr })
+bot.api.config.use(pollLiveness.transformer)
 
 // D-883 chat store (chat-store.ts; spec sam-data dev/analysis/2026-10-29-d883-store-timeline-door-spec.md).
 // The secretary store lives beside the archive; no sam-data folder → both off.
@@ -2475,57 +2476,39 @@ bot.catch(err => {
 // returned, and polling stopped permanently while the process stayed alive
 // (MCP stdin keeps it running). Outbound tools kept working but the bot was
 // deaf to inbound messages until a full restart.
-void (async () => {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      await bot.start({
-        // Telegram excludes message_reaction from the default update set, so
-        // without an explicit allowed_updates the bot never receives reaction
-        // changes. Start from grammY's default list (message, callback_query,
-        // …) and add message_reaction so emoji reactions arrive as updates.
-        // We deliberately do NOT add message_reaction_count (anonymous
-        // aggregate counts — no actor to authenticate) or chat_member.
-        allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, 'message_reaction'],
-        onStart: info => {
-          attempt = 0
-          botUsername = info.username
-          botUserId = String(info.id)
-          process.stderr.write(`telegram channel: polling as @${info.username}\n`)
-          // D-883 start-up catch-up, once per process: files of stored lines (≤ 90 days) and
-          // secretary sends made before the out store. Background; never throws.
-          if (!storeCatchUpDone && ARCHIVE_ROOT) {
-            storeCatchUpDone = true
-            void catchUp({
-              archiveRoot: ARCHIVE_ROOT,
-              businessRoot: BUSINESS_ROOT,
-              ownerId: voiceOwnerId(),
-              drafts: () => loadSecretaryState(homedir()).drafts,
-              keeper,
-              log: safeStderr,
-            })
-          }
-        },
+// D-914: the loop lives in poll-liveness.ts (runStartupLoop) — own getMe with a
+// 15 s deadline, pause 1, 2, 4 … 60 s, each attempt in STATE_DIR/startup.log.
+void runStartupLoop({
+  bot,
+  startOptions: {
+    // Telegram excludes message_reaction from the default update set, so
+    // without an explicit allowed_updates the bot never receives reaction
+    // changes. Start from grammY's default list (message, callback_query,
+    // …) and add message_reaction so emoji reactions arrive as updates.
+    // We deliberately do NOT add message_reaction_count (anonymous
+    // aggregate counts — no actor to authenticate) or chat_member.
+    allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, 'message_reaction'],
+  },
+  onStart: info => {
+    botUsername = info.username
+    botUserId = String(info.id)
+    process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+    // D-883 start-up catch-up, once per process: files of stored lines (≤ 90 days) and
+    // secretary sends made before the out store. Background; never throws.
+    if (!storeCatchUpDone && ARCHIVE_ROOT) {
+      storeCatchUpDone = true
+      void catchUp({
+        archiveRoot: ARCHIVE_ROOT,
+        businessRoot: BUSINESS_ROOT,
+        ownerId: voiceOwnerId(),
+        drafts: () => loadSecretaryState(homedir()).drafts,
+        keeper,
+        log: safeStderr,
       })
-      return // bot.stop() was called — clean exit from the loop
-    } catch (err) {
-      if (shuttingDown) return
-      // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
-      if (err instanceof Error && err.message === 'Aborted delay') return
-      const is409 = err instanceof GrammyError && err.error_code === 409
-      if (is409 && attempt >= 8) {
-        process.stderr.write(
-          `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
-          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
-        )
-        logShutdown('polling-stopped: 409 Conflict', `attempt=${attempt}`)
-        return
-      }
-      const delay = Math.min(1000 * attempt, 15000)
-      const detail = is409
-        ? `409 Conflict${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
-        : `polling error: ${err}`
-      process.stderr.write(`telegram channel: ${detail}, retrying in ${delay / 1000}s\n`)
-      await new Promise(r => setTimeout(r, delay))
     }
-  }
-})()
+  },
+  isShuttingDown: () => shuttingDown,
+  recordStartupFailure: pollLiveness.recordStartupFailure,
+  startupLog: createStartupLog({ stateDir: STATE_DIR, log: safeStderr }),
+  log: line => process.stderr.write(line),
+})
