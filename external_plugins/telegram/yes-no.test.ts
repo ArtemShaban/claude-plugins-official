@@ -1,0 +1,203 @@
+// «Да / Нет» buttons (D-890; spec sam-data dev/analysis/2026-11-01-yes-no-buttons-spec.md).
+// Unit tests of yes-no.ts + source-text pins of its two server.ts call sites (style of
+// access-lock.callsites.test.ts). STATE ISOLATION: config.json lives in a mkdtemp HOME.
+
+import { describe, expect, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
+import { join } from 'path'
+import { tmpdir } from 'os'
+import {
+  answeredKeyboard,
+  handleYesNoPress,
+  parseYesNoData,
+  wantsYesNo,
+  yesNoButtonsOn,
+  yesNoKeyboard,
+  type PressDeps,
+  type PressInput,
+} from './yes-no'
+
+const OWNER = 111222333
+const OTHER = 444555666
+
+function home(overrides: unknown): string {
+  const h = mkdtempSync(join(tmpdir(), 'yn-home-'))
+  const d = join(h, 'Workspace', 'ClaudeProjects', 'sam-data')
+  mkdirSync(d, { recursive: true })
+  writeFileSync(join(d, 'config.json'), JSON.stringify({ user: { telegram_chat_id: String(OWNER) }, overrides }))
+  return h
+}
+
+describe('switch (AC-1/AC-2 inputs)', () => {
+  test('on only for exactly true', () => {
+    expect(yesNoButtonsOn(home({ 'yes-no-buttons': true }))).toBe(true)
+    expect(yesNoButtonsOn(home({ 'yes-no-buttons': false }))).toBe(false)
+    expect(yesNoButtonsOn(home({ 'yes-no-buttons': 'true' }))).toBe(false)
+    expect(yesNoButtonsOn(home({}))).toBe(false)
+    expect(yesNoButtonsOn(home(undefined))).toBe(false)
+    expect(yesNoButtonsOn(mkdtempSync(join(tmpdir(), 'yn-empty-')))).toBe(false)
+  })
+})
+
+describe('keyboard (AC-1)', () => {
+  test('one row, exactly «Да» «Нет»', () => {
+    expect(yesNoKeyboard()).toEqual([[{ text: 'Да', callback_data: 'yn:y' }, { text: 'Нет', callback_data: 'yn:n' }]])
+  })
+  test('answered = one inert button', () => {
+    expect(answeredKeyboard('y')).toEqual([[{ text: '✅ Да', callback_data: 'yn:x' }]])
+    expect(answeredKeyboard('n')).toEqual([[{ text: '❌ Нет', callback_data: 'yn:x' }]])
+  })
+  test('callback data', () => {
+    expect(parseYesNoData('yn:y')).toBe('y')
+    expect(parseYesNoData('yn:n')).toBe('n')
+    expect(parseYesNoData('yn:x')).toBe('x')
+    expect(parseYesNoData('chk:1')).toBeNull()
+    expect(parseYesNoData('yn:yy')).toBeNull()
+  })
+})
+
+describe('wantsYesNo (AC-3)', () => {
+  test('absent / false → no buttons', () => {
+    expect(wantsYesNo({})).toBe(false)
+    expect(wantsYesNo({ yes_no: false, files: ['/x.png'] })).toBe(false)
+  })
+  test('true alone → buttons', () => {
+    expect(wantsYesNo({ yes_no: true, files: [], checklist: [] })).toBe(true)
+  })
+  test('with checklist → refused', () => {
+    expect(() => wantsYesNo({ yes_no: true, checklist: ['a'] })).toThrow(/checklist/)
+  })
+  test('with files → refused', () => {
+    expect(() => wantsYesNo({ yes_no: true, files: ['/a.png'] })).toThrow(/files/)
+  })
+  test('with voice → refused', () => {
+    expect(() => wantsYesNo({ yes_no: true, voice: true })).toThrow(/voice/)
+  })
+  test('with secretary → refused', () => {
+    expect(() => wantsYesNo({ yes_no: true, as_owner_to: '777' })).toThrow(/as_owner_to/)
+  })
+  test('non-boolean → refused', () => {
+    expect(() => wantsYesNo({ yes_no: 'true' })).toThrow(/boolean/)
+  })
+})
+
+function deps(ownerId: string | undefined = String(OWNER)) {
+  const calls = { answer: [] as string[], edit: [] as unknown[], notify: [] as { content: string; meta: Record<string, string> }[], errors: [] as string[] }
+  const d: PressDeps = {
+    ownerId,
+    answer: async t => { calls.answer.push(t) },
+    editMarkup: async k => { calls.edit.push(k) },
+    notify: async n => { calls.notify.push(n) },
+    now: () => new Date('2026-11-01T10:00:00.000Z'),
+    logError: l => { calls.errors.push(l) },
+  }
+  return { d, calls }
+}
+
+function press(data: string, fromId: number, chat: { id: number; type: string } | null, messageId = 501): PressInput {
+  return { data, from: { id: fromId, username: 'artem' }, ...(chat ? { message: { message_id: messageId, chat } } : {}) }
+}
+
+describe('press acceptance (AC-4)', () => {
+  const cases: [string, PressInput, string | undefined][] = [
+    ['another allowlisted DM id', press('yn:y', OTHER, { id: OTHER, type: 'private' }), String(OWNER)],
+    ['the owner pressing in a group', press('yn:y', OWNER, { id: -100123, type: 'supergroup' }), String(OWNER)],
+    ['an unknown id in the owner DM', press('yn:y', OTHER, { id: OWNER, type: 'private' }), String(OWNER)],
+    ['missing message', press('yn:y', OWNER, null), String(OWNER)],
+    ['no owner configured', press('yn:y', OWNER, { id: OWNER, type: 'private' }), ''],
+  ]
+  for (const [name, p, owner] of cases) {
+    test(`${name} → toast, no notification, no edit`, async () => {
+      const { d, calls } = deps(owner)
+      expect(await handleYesNoPress(p, d)).toBe(true)
+      expect(calls.notify).toEqual([])
+      expect(calls.edit).toEqual([])
+      expect(calls.answer.length).toBe(1)
+    })
+  }
+  test('non-yes/no data → not handled, nothing called', async () => {
+    const { d, calls } = deps()
+    expect(await handleYesNoPress(press('chk:0', OWNER, { id: OWNER, type: 'private' }), d)).toBe(false)
+    expect(calls).toEqual({ answer: [], edit: [], notify: [], errors: [] })
+  })
+})
+
+describe('accepted press (AC-5)', () => {
+  for (const [data, glyph, label, inert] of [
+    ['yn:y', '👍', 'Да', '✅ Да'],
+    ['yn:n', '👎', 'Нет', '❌ Нет'],
+  ] as const) {
+    test(`${label} → one reaction envelope with via=button, keyboard → inert`, async () => {
+      const { d, calls } = deps()
+      expect(await handleYesNoPress(press(data, OWNER, { id: OWNER, type: 'private' }), d)).toBe(true)
+      expect(calls.notify).toEqual([
+        {
+          content: `(button on message 501: ${label})`,
+          meta: {
+            event: 'reaction',
+            chat_id: String(OWNER),
+            message_id: '501',
+            user: 'artem',
+            user_id: String(OWNER),
+            ts: '2026-11-01T10:00:00.000Z',
+            reaction_added: glyph,
+            via: 'button',
+          },
+        },
+      ])
+      expect(calls.edit).toEqual([[[{ text: inert, callback_data: 'yn:x' }]]])
+      expect(calls.answer).toEqual([inert])
+    })
+  }
+  test('tap on the inert button → toast only', async () => {
+    const { d, calls } = deps()
+    await handleYesNoPress(press('yn:x', OWNER, { id: OWNER, type: 'private' }), d)
+    expect(calls.notify).toEqual([])
+    expect(calls.edit).toEqual([])
+    expect(calls.answer).toEqual(['Already answered.'])
+  })
+  test('edit failure never blocks the event', async () => {
+    const { d, calls } = deps()
+    d.editMarkup = async () => { throw new Error('400 message is not modified') }
+    await handleYesNoPress(press('yn:y', OWNER, { id: OWNER, type: 'private' }), d)
+    expect(calls.notify.length).toBe(1)
+    expect(calls.errors.length).toBe(1)
+  })
+})
+
+// Source pins: the wiring in server.ts (the handler itself is unit-tested above).
+const SRC = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+function block(start: string, end: string): string {
+  const i = SRC.indexOf(start)
+  expect(i).toBeGreaterThanOrEqual(0)
+  const j = SRC.indexOf(end, i)
+  expect(j).toBeGreaterThan(i)
+  return SRC.slice(i, j)
+}
+
+describe('server.ts call sites', () => {
+  test('AC-6: the press branch reaches neither the secretary nor the signed approval channel', () => {
+    const b = block('const yesNoHandled = await handleYesNoPress(', 'if (yesNoHandled) return')
+    expect(b).not.toContain('secretary')
+    expect(b).not.toContain('emitApprovalSignal')
+    expect(b).toContain('ownerId: lockOwnerId(ACCESS_LOCK, readLockedAccess, OWNER_TG_ID)')
+  })
+  test('AC-6: the press branch runs before the checklist branch, inside the callback handler', () => {
+    const b = block("bot.on('callback_query:data'", 'parseChecklistCallbackData(data)')
+    expect(b).toContain('if (yesNoHandled) return')
+  })
+  test('AC-1: the keyboard goes on the last chunk only, and only when the switch is on', () => {
+    expect(SRC).toContain('...(yesNoOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: yesNoKeyboard() } } : {}),')
+    expect(SRC).toContain('const yesNoOn = yesNo && yesNoButtonsOn(homedir())')
+  })
+  test('AC-3: the arg check runs before the secretary and checklist branches', () => {
+    const i = SRC.indexOf('const yesNo = wantsYesNo(')
+    expect(i).toBeGreaterThan(0)
+    expect(i).toBeLessThan(SRC.indexOf('if (args.as_owner_to != null) {'))
+    expect(i).toBeLessThan(SRC.indexOf('if (args.checklist != null) {'))
+  })
+  test('AC-2: the result names the switch state; result still starts with "sent"', () => {
+    expect(SRC).toContain('const yesNoNote = yesNo ? (yesNoOn ? SUFFIX_ON : SUFFIX_OFF) : \'\'')
+    expect(SRC).toContain("text: result + voiceNote + yesNoNote")
+  })
+})

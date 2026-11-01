@@ -81,6 +81,21 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 
 The plugin sends no typing indicator on receipt; in this fork "typing…" is driven from outside the plugin.
 
+## «Да / Нет» buttons (this fork, D-890)
+
+`reply` with `yes_no: true` puts one row of two buttons, «Да» «Нет», under a binary question
+(on the last chunk of a long text). On only where the owner's sam-data override
+`yes-no-buttons` is `true` (default `false`, owner first); off → the text goes plain and the
+result says the buttons are off. Refused together with `checklist`, `files`, `voice`,
+`as_owner_to`.
+
+A press counts only from the owner (`user.telegram_chat_id`; the lock's owner in locked
+mode) in his own DM. It reaches the session as the same `event="reaction"` envelope his
+👍/👎 makes (`reaction_added` 👍 for «Да», 👎 for «Нет») plus `via="button"`; the buttons
+turn into one inert «✅ Да» / «❌ Нет». A press never feeds the secretary preview or the
+signed approval channel, and the 👍-only checks in core refuse an envelope with `via`.
+Code: `yes-no.ts`.
+
 ## Photos
 
 Inbound photos are downloaded to `~/.claude/channels/telegram/inbox/` and the
