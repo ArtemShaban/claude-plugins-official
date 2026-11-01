@@ -62,6 +62,7 @@ import { appendArchive, archiveRoot } from './tg-archive'
 import { createSecretary, directResultText, loadSecretaryState, previewResultText, secretaryRoot, type SecretaryApi } from './secretary'
 import { catchUp, createKeeper, createOutStore, isOwnDeliveredMedia, type Download } from './chat-store'
 import { clipUtf16 } from './text-clip'
+import { SUFFIX_OFF, SUFFIX_ON, handleYesNoPress, wantsYesNo, yesNoButtonsOn, yesNoKeyboard } from './yes-no'
 import {
   buildChecklist,
   applyToggle,
@@ -1024,6 +1025,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: 'string' },
             description: "Optional. When provided (non-empty), sends `text` as a header followed by one tappable inline button per item instead of a plain reply — tapping an item toggles it (☐/✅ on the button, struck-through in the message text) with no server-side database; state is re-derived from the message itself, so it survives a bot restart. Cannot be combined with files or voice (send those as a separate reply). Max ~100 items (Telegram's inline-button limit); each item renders as a single line (embedded newlines are flattened).",
           },
+          yes_no: {
+            type: 'boolean',
+            description: "Optional. true → a binary question to the owner gets two buttons «Да» «Нет» in one row (D-890). His press arrives as his reaction event (reaction_added 👍 for Да, 👎 for Нет) with via=\"button\"; afterwards the message shows his choice. Only when his sam-data override `yes-no-buttons` is true; otherwise the text goes plain and the result says the buttons are off. Cannot be combined with checklist, files, voice or as_owner_to. Never for a question that needs his own 👍 — a press is not his 👍 there: a laws slot line, Telegram access, «Выдать инвайт <имя>?», a secretary preview.",
+          },
           as_owner_to: {
             type: 'string',
             description: "Secretary (skill telegram-secretary). A chat id from the owner's secretary list: instead of a normal reply, sends the exact `text` as a message IN HIS NAME to that chat (chat_id must be his DM). Two modes, set by his sam-data override `telegram-secretary-preview` (run `config-get telegram-secretary-preview` first; the skill says when you may call). Preview OFF (the default; absent, false or anything but true): the text goes out AT ONCE, byte-for-byte, into that chat — there is no preview and no undo; call this only after his «да» on this exact text or inside a grant that names this person. Preview ON (exactly true): nothing goes out now — a preview is shown to him and the plugin sends it only after his 👍 on the preview or his «да» reply to it, then tells him the result. Refused when the secretary is off, the chat is not listed, there is no verified Business connection, or combined with files/checklist/voice.",
@@ -1115,6 +1120,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           message_thread_id != null ? { message_thread_id } : {}
 
         assertAllowedChat(chat_id)
+
+        // «Да / Нет» buttons (D-890, yes-no.ts): refused with checklist/files/voice/secretary.
+        const yesNo = wantsYesNo({ yes_no: args.yes_no, checklist: args.checklist, files, voice: args.voice, as_owner_to: args.as_owner_to })
+        const yesNoOn = yesNo && yesNoButtonsOn(homedir())
 
         // Secretary path (spec §2 C, D-876). Always returns or throws, so the
         // plain-reply code below is never affected. Sending in his name happens
@@ -1250,6 +1259,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               const sendOpts = {
                 ...threadOpt,
                 ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+                ...(yesNoOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: yesNoKeyboard() } } : {}),
               }
               const sent =
                 format === 'auto'
@@ -1316,7 +1326,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
-        return { content: [{ type: 'text', text: result + voiceNote }] }
+        const yesNoNote = yesNo ? (yesNoOn ? SUFFIX_ON : SUFFIX_OFF) : ''
+        return { content: [{ type: 'text', text: result + voiceNote + yesNoNote }] }
       }
       case 'react': {
         assertAllowedChat(args.chat_id as string)
@@ -1457,6 +1468,21 @@ setInterval(() => {
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+
+  // «Да / Нет» press (D-890, yes-no.ts): the owner only, in his own DM; a reaction
+  // envelope with via="button". Never the secretary or the signed approval channel.
+  const yesNoHandled = await handleYesNoPress(
+    { data, from: ctx.from, message: ctx.callbackQuery.message },
+    {
+      ownerId: lockOwnerId(ACCESS_LOCK, readLockedAccess, OWNER_TG_ID),
+      answer: text => ctx.answerCallbackQuery({ text }),
+      editMarkup: keyboard => ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: keyboard } }),
+      notify: n => mcp.notification({ method: 'notifications/claude/channel', params: n }),
+      now: () => new Date(),
+      logError: line => safeStderr(line + '\n'),
+    },
+  )
+  if (yesNoHandled) return
 
   const chkIdx = parseChecklistCallbackData(data)
   if (chkIdx != null) {

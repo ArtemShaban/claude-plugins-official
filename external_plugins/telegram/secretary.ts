@@ -139,7 +139,7 @@ export function secretaryLinePath(home: string, chatId: string, ts: string): str
 
 // ── config ───────────────────────────────────────────────────────────────
 
-function readConfigJson(home: string): Record<string, unknown> | undefined {
+export function readConfigJson(home: string): Record<string, unknown> | undefined {
   try {
     const cfg = JSON.parse(readFileSync(join(samDataDir(home), 'config.json'), 'utf8'))
     return cfg != null && typeof cfg === 'object' ? (cfg as Record<string, unknown>) : undefined

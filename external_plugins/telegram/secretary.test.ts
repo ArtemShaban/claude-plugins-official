@@ -1442,8 +1442,12 @@ describe('D-876 — nothing else changed (OB-05, OB-07)', () => {
       expect(server).not.toContain(bad)
     }
   })
-  test('plugin.json is 0.0.24 and the README names the setting', () => {
-    expect(JSON.parse(readFileSync(join(dir, '.claude-plugin', 'plugin.json'), 'utf8')).version).toBe('0.0.24')
+  test('plugin.json is at least 0.0.24 (the secretary preview setting) and the README names the setting', () => {
+    // A floor, not a pin: the next version bump must not redden this test (D-914 review F1).
+    const v = JSON.parse(readFileSync(join(dir, '.claude-plugin', 'plugin.json'), 'utf8')).version
+    const m = /^0\.0\.(\d+)$/.exec(v)
+    expect(m).not.toBeNull()
+    expect(Number(m![1])).toBeGreaterThanOrEqual(24)
     const readme = readFileSync(join(dir, 'README.md'), 'utf8')
     expect(readme.slice(readme.indexOf("## Secretary in the owner's Telegram"))).toContain('telegram-secretary-preview')
   })
