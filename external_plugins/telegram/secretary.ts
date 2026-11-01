@@ -5,9 +5,13 @@
 // What it does, and nothing more:
 //   (B) a business_message that arrives on HIS Business connection from a chat
 //       on his list → one line in <sam-data>/state/tg-business/<chat>/<YYYY-MM>.jsonl
-//       (the tg-archive line shape); an unlisted chat → only a breadcrumb
-//       {name, first_seen}. No reply, no read mark. Before the line is written,
-//       an invite payload `start=<20+ of [A-Za-z0-9_-]>` becomes `start=<INVITE>`.
+//       (the tg-archive line shape); an unlisted chat → a breadcrumb
+//       {name, first_seen} + the same line parked in
+//       <sam-data>/state/tg-business/unlisted/<chat>/<YYYY-MM>.jsonl, no wake;
+//       core chat_thread.py reads it only once the chat is on his list (row 13,
+//       spec 2026-11-01-secretary-first-msg-spec.md). No reply, no read mark.
+//       Before a line is written, an invite payload
+//       `start=<20+ of [A-Za-z0-9_-]>` becomes `start=<INVITE>`.
 //   (W) `secretary_watch` (spec 2026-10-17-secretary-watch-redaction-spec.md) keeps
 //       a per-chat watch in state.json `watches`; a stored line from the OTHER side
 //       of a watched chat → one session wake (ids + store path, never the text).
@@ -126,6 +130,11 @@ export type BusinessMessage = {
 
 export function secretaryRoot(home: string): string {
   return join(samDataDir(home), 'state', 'tg-business')
+}
+
+/** Lines of chats not (yet) on his list (row 13): core reads them only after he lists the chat. */
+export function secretaryUnlistedRoot(home: string): string {
+  return join(secretaryRoot(home), 'unlisted')
 }
 
 export function secretaryStatePath(home: string): string {
@@ -333,7 +342,8 @@ export function createSecretary(deps: SecretaryDeps) {
 
   /**
    * (B) inbound. Never throws: a failure is one stderr line (fail-open, the channel keeps working).
-   * Returns the line it stored (D-883: server.ts keeps its file), else undefined — an unlisted chat stores nothing.
+   * Returns the line it stored for a listed chat (D-883: server.ts keeps its file), else undefined —
+   * an unlisted chat's line is parked under unlisted/ and NOT returned (no wake, no keeper).
    */
   async function onBusinessMessage(m: BusinessMessage): Promise<ArchiveLine | undefined> {
     try {
@@ -343,19 +353,19 @@ export function createSecretary(deps: SecretaryDeps) {
       if (!connId) return
       if (!(await isOwnersConnection(connId))) return
       const chatId = String(m.chat.id)
+      const label = labelOf(m)
+      const from = m.from
+      const line: ArchiveLine = {
+        ts: new Date(m.date * 1000).toISOString(),
+        chat_id: chatId,
+        msg_id: m.message_id,
+        sender_id: from ? String(from.id) : chatId,
+        senderName: from ? (from.username ?? String(from.id)) : chatId,
+        kind: label.kind,
+        text: redactInvites(label.text),
+        ...(label.file_id ? { file_id: label.file_id } : {}),
+      }
       if (cfg.chats.has(chatId)) {
-        const label = labelOf(m)
-        const from = m.from
-        const line: ArchiveLine = {
-          ts: new Date(m.date * 1000).toISOString(),
-          chat_id: chatId,
-          msg_id: m.message_id,
-          sender_id: from ? String(from.id) : chatId,
-          senderName: from ? (from.username ?? String(from.id)) : chatId,
-          kind: label.kind,
-          text: redactInvites(label.text),
-          ...(label.file_id ? { file_id: label.file_id } : {}),
-        }
         appendArchive(secretaryRoot(deps.home), line)
         await wakeIfWatched(line)
         return line
@@ -365,6 +375,8 @@ export function createSecretary(deps: SecretaryDeps) {
         st.unlisted[chatId] = { name: displayName(m.chat), first_seen: now().toISOString() }
         saveSecretaryState(deps.home, st)
       }
+      // Row 13: park the line so it is there the moment he lists the chat. No wake, not returned.
+      appendArchive(secretaryUnlistedRoot(deps.home), line)
     } catch (err) {
       deps.log(`telegram secretary: business message not stored: ${err}`)
     }

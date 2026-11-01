@@ -20,6 +20,7 @@ import {
   secretaryLinePath,
   secretaryRoot,
   secretaryStatePath,
+  secretaryUnlistedRoot,
   type BusinessMessage,
   type SecretaryApi,
   directResultText,
@@ -227,7 +228,9 @@ describe('criterion 2 — the store line (OB-08)', () => {
 })
 
 describe('criterion 3 — only HIS connection, only listed chats (OB-01)', () => {
-  test('his connection + unlisted chat → 0 lines, breadcrumb {name, first_seen} only', async () => {
+  // Row 13 (spec 2026-11-01-secretary-first-msg): the main store still gets 0 lines; the text is
+  // parked under unlisted/ (see the «row 13» block at the end), never in state.json.
+  test('his connection + unlisted chat → 0 lines in the main store, breadcrumb {name, first_seen}', async () => {
     onConfig({ [MAXIM]: 'Максим' })
     const f = fakeApi()
     await make(f.api).onBusinessMessage(
@@ -1442,8 +1445,12 @@ describe('D-876 — nothing else changed (OB-05, OB-07)', () => {
       expect(server).not.toContain(bad)
     }
   })
-  test('plugin.json is 0.0.24 and the README names the setting', () => {
-    expect(JSON.parse(readFileSync(join(dir, '.claude-plugin', 'plugin.json'), 'utf8')).version).toBe('0.0.24')
+  test('plugin.json is at least 0.0.24 (the secretary preview setting) and the README names the setting', () => {
+    // A floor, not a pin: the next version bump must not redden this test (D-914 review F1).
+    const v = JSON.parse(readFileSync(join(dir, '.claude-plugin', 'plugin.json'), 'utf8')).version
+    const m = /^0\.0\.(\d+)$/.exec(v)
+    expect(m).not.toBeNull()
+    expect(Number(m![1])).toBeGreaterThanOrEqual(24)
     const readme = readFileSync(join(dir, 'README.md'), 'utf8')
     expect(readme.slice(readme.indexOf("## Secretary in the owner's Telegram"))).toContain('telegram-secretary-preview')
   })
@@ -1497,5 +1504,136 @@ describe('D-876 security S1 — the bot\'s own id is dropped from the list; unkn
     expect(block).toContain('botId: () => botUserId')
     expect(server).toContain('botUserId = String(info.id)')
     expect(server.slice(server.indexOf('botUserId = String(info.id)') - 200, server.indexOf('botUserId = String(info.id)') + 60)).toContain('onStart')
+  })
+})
+
+// ── Row 13 — an unlisted chat's messages are parked (spec sam-data
+//    dev/analysis/2026-11-01-secretary-first-msg-spec.md §3 criteria 1–5) ──────
+
+function parkedLines(chatId: string): any[] {
+  const dir = join(secretaryUnlistedRoot(home), chatId)
+  return filesUnder(dir).flatMap(f => readFileSync(f, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)))
+}
+
+const timurMsg = (over: Partial<BusinessMessage> = {}) =>
+  bmsg({ chat: { id: Number(TIMUR), type: 'private', first_name: 'Тимур' }, from: { id: Number(TIMUR), username: 'timur' }, ...over })
+
+describe('row 13 criterion 1 — his verified connection + unlisted chat → one parked line (OB-01)', () => {
+  test('same line shape as a listed chat; breadcrumb kept; undefined; 0 main-store lines; 0 wakes', async () => {
+    onConfig({ [MAXIM]: 'Максим' })
+    const f = fakeApi()
+    const wakes: SecretaryWake[] = []
+    const m = timurMsg({ text: 'Да, где-то должен быть' })
+    const r = await makeW(f.api, wakes).onBusinessMessage(m)
+    expect(r).toBeUndefined()
+    const p = join(secretaryUnlistedRoot(home), TIMUR, '2026-10.jsonl')
+    expect(readFileSync(p, 'utf8').trim().split('\n').length).toBe(1)
+    expect(parkedLines(TIMUR)).toEqual([
+      { ts: msgTs(m), chat_id: TIMUR, msg_id: 77, sender_id: TIMUR, senderName: 'timur', kind: 'text', text: 'Да, где-то должен быть' },
+    ])
+    expect(statSync(p).mode & 0o777).toBe(0o600)
+    expect(statSync(join(secretaryUnlistedRoot(home), TIMUR)).mode & 0o777).toBe(0o700)
+    expect(statSync(secretaryUnlistedRoot(home)).mode & 0o777).toBe(0o700)
+    expect(storedLines(TIMUR)).toEqual([])
+    expect(existsSync(join(secretaryRoot(home), TIMUR))).toBe(false)
+    expect(Object.keys(loadSecretaryState(home).unlisted)).toEqual([TIMUR])
+    expect(readFileSync(secretaryStatePath(home), 'utf8')).not.toContain('где-то')
+    expect(wakes).toEqual([])
+    expect(f.calls.map(c => c.method)).toEqual(['getBusinessConnection'])
+  })
+
+  test('every message is parked, not only the first; the breadcrumb is written once', async () => {
+    onConfig({ [MAXIM]: 'Максим' })
+    const s = makeW(fakeApi().api, [])
+    await s.onBusinessMessage(timurMsg({ message_id: 1, text: 'Да, где-то должен быть' }))
+    await s.onBusinessMessage(timurMsg({ message_id: 2, text: 'Максим знает' }))
+    expect(parkedLines(TIMUR).map(l => [l.msg_id, l.text])).toEqual([[1, 'Да, где-то должен быть'], [2, 'Максим знает']])
+    expect(loadSecretaryState(home).unlisted[TIMUR].first_seen).toBe(FIXED_NOW.toISOString())
+  })
+
+  test('a watch left on that chat id (taken off the list) still does not wake for a parked line', async () => {
+    onConfig({ [MAXIM]: 'Максим', [TIMUR]: 'Тимур' })
+    const wakes: SecretaryWake[] = []
+    const s = makeW(fakeApi().api, wakes)
+    await s.onBusinessMessage(bmsg()) // verify the connection
+    s.watch({ chat: TIMUR, watch: true })
+    onConfig({ [MAXIM]: 'Максим' }) // he took Тимур off the list; the watch entry is left behind
+    await s.onBusinessMessage(timurMsg())
+    expect(parkedLines(TIMUR).length).toBe(1)
+    expect(wakes).toEqual([])
+  })
+})
+
+describe('row 13 criterion 2 — invite redaction on parked lines (OB-02)', () => {
+  test('start=<22-char key> → start=<INVITE>', async () => {
+    onConfig({ [MAXIM]: 'Максим' })
+    const key = 'Ab3dEf6hIj9kLm2nOp5qRs' // 22 chars
+    expect(key.length).toBe(22)
+    await makeW(fakeApi().api, []).onBusinessMessage(timurMsg({ text: `жми t.me/bot?start=${key} ok` }))
+    const [l] = parkedLines(TIMUR)
+    expect(l.text).toBe('жми t.me/bot?start=<INVITE> ok')
+    expect(readFileSync(join(secretaryUnlistedRoot(home), TIMUR, '2026-10.jsonl'), 'utf8')).not.toContain(key)
+  })
+})
+
+describe('row 13 criterion 3 — nothing parked off his verified connection (OB-02)', () => {
+  const cases: [string, () => void, Partial<BusinessMessage>][] = [
+    ['secretary off', () => onConfig({ [MAXIM]: 'Максим' }, false), {}],
+    ["a stranger's connection", () => onConfig({ [MAXIM]: 'Максим' }), { business_connection_id: CONN_STRANGER }],
+    ['a disabled connection', () => onConfig({ [MAXIM]: 'Максим' }), { business_connection_id: CONN_DISABLED }],
+    ['getBusinessConnection failing', () => onConfig({ [MAXIM]: 'Максим' }), { business_connection_id: CONN_BROKEN }],
+    ['no connection id', () => onConfig({ [MAXIM]: 'Максим' }), { business_connection_id: undefined }],
+  ]
+  for (const [label, setup, over] of cases) {
+    test(`${label} → 0 parked lines, 0 breadcrumbs`, async () => {
+      setup()
+      await makeW(fakeApi().api, []).onBusinessMessage(timurMsg(over))
+      expect(existsSync(secretaryUnlistedRoot(home))).toBe(false)
+      expect(existsSync(secretaryStatePath(home)) ? Object.keys(loadSecretaryState(home).unlisted) : []).toEqual([])
+    })
+  }
+})
+
+describe('row 13 criterion 4 — his own outgoing message in an unlisted chat is parked (OB-01)', () => {
+  test('sender_id = his id', async () => {
+    onConfig({ [MAXIM]: 'Максим' })
+    await makeW(fakeApi().api, []).onBusinessMessage(timurMsg({ from: { id: Number(OWNER) }, text: 'а свечи есть?' }))
+    const [l] = parkedLines(TIMUR)
+    expect(l.sender_id).toBe(OWNER)
+    expect(l.chat_id).toBe(TIMUR)
+    expect(l.text).toBe('а свечи есть?')
+  })
+})
+
+describe('row 13 criterion 5 — no new outward path (OB-02, OB-03)', () => {
+  test('SecretaryApi type still has exactly getBusinessConnection + sendMessage', () => {
+    const src = readFileSync(join(import.meta.dir, 'secretary.ts'), 'utf8')
+    const m = src.match(/export type SecretaryApi = \{([\s\S]*?)\n\}/)
+    expect(m).not.toBeNull()
+    const keys = [...m![1].matchAll(/^ {2}(\w+)\(/gm)].map(x => x[1])
+    expect(keys).toEqual(['getBusinessConnection', 'sendMessage'])
+  })
+
+  for (const preview of [undefined, true] as const) {
+    test(`an unlisted chat with parked lines (preview key ${preview === undefined ? 'absent' : 'true'}) → reply as_owner_to refused, 0 sends`, async () => {
+      onDirect(preview, { [MAXIM]: 'Максим' })
+      const f = fakeApi()
+      const s = makeBot(f.api, () => BOT)
+      await s.onBusinessMessage(timurMsg())
+      expect(parkedLines(TIMUR).length).toBe(1)
+      await expect(s.submit({ chat_id: OWNER, text: 'ok', as_owner_to: TIMUR })).rejects.toThrow('chat is not on the secretary list')
+      expect(sendsAll(f)).toEqual([])
+      expect(Object.keys(loadSecretaryState(home).drafts)).toEqual([])
+    })
+  }
+
+  test('secretary_watch(true) on that chat → refused, no entry', async () => {
+    onConfig({ [MAXIM]: 'Максим' })
+    const f = fakeApi()
+    const s = makeW(f.api, [])
+    await s.onBusinessMessage(timurMsg())
+    expect(() => s.watch({ chat: TIMUR, watch: true })).toThrow('chat is not on the secretary list')
+    expect(loadSecretaryState(home).watches).toEqual({})
+    expect(sendsAll(f)).toEqual([])
   })
 })

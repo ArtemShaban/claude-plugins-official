@@ -154,7 +154,9 @@ Business → Chatbots (no login of the assistant into his account, no new secret
   the line is written, an invite payload — `start=` followed by 20 or more of
   `[A-Za-z0-9_-]` — becomes `start=<INVITE>` (the link stays in his Telegram; the
   key is never stored); every other byte is kept. A chat not on the list leaves
-  only `{name, first_seen}` in `state.json` `unlisted`. Never replies, never marks read.
+  `{name, first_seen}` in `state.json` `unlisted` and the same line, parked, in
+  `sam-data/state/tg-business/unlisted/<chat>/<YYYY-MM>.jsonl` — no wake; core
+  `tools/chat_thread.py --tg` reads it only once the chat is on the list. Never replies, never marks read.
 - **Watch (wake).** `secretary_watch` with `chat: "<listed chat id>"`, `watch: true`
   subscribes (`state.json` `watches: {"<chat id>": {"since": "<ISO>"}}`; refused
   when the switch is off or the chat is not on the filtered list); `watch: false`
