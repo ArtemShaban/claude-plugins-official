@@ -22,11 +22,27 @@
  *    "consecutive_errors": int, "last_error": "timeout"|"network"|"http_NNN"|null}
  * Epoch SECONDS, never ms. Never free text: the bot token lives in request
  * URLs and error strings, so errors are reduced to a closed set of classes.
+ * Since 0.0.25 `consecutive_errors` / `last_error` also count a failed startup
+ * attempt (pre-connect getMe or bot.start setup, before onStart); `last_ok_at`
+ * stays getUpdates-only.
+ *
+ * 3. Startup loop (`runStartupLoop`, D-914; spec sam-data
+ *    dev/analysis/2026-11-01-tg-plugin-startup-retry-spec.md). After a boot with
+ *    no internet grammY's own startup ladder slept 100 s → 200 s → … (1.41.1,
+ *    grammY issue #961). Now: our own getMe (never grammY's withRetries), each
+ *    attempt bounded to STARTUP_DEADLINE_MS, then bot.start(); between failed
+ *    attempts the pause is 1, 2, 4, 8, 16, 32, then 60 s every time; a
+ *    successful start resets it to 1 s.
+ * 4. `startup.log` in STATE_DIR, mode 0600, append-only, one line per startup
+ *    attempt, metadata only (no token, URL, error text or message content):
+ *      <ISO ts> pid=<n> attempt=<k> outcome=ok|timeout|network|http_NNN ms=<attempt ms> next_in_s=<pause|0>
+ *    Readers: humans and the D-914 T+7 check. No rotation (≈1 line per start).
  */
-import { closeSync, openSync, renameSync, unlinkSync, writeSync } from 'fs'
+import { closeSync, constants as fsc, fchmodSync, openSync, renameSync, unlinkSync, writeSync } from 'fs'
 import { join } from 'path'
 import { randomBytes } from 'crypto'
-import type { Transformer } from 'grammy'
+import { GrammyError, type Bot, type PollingOptions, type Transformer } from 'grammy'
+import type { UserFromGetMe } from 'grammy/types'
 import { withTimeout } from './voice-delivery'
 
 export const POLL_SLACK_S = 15
@@ -66,7 +82,11 @@ export function pollDeadlineMs(payload: unknown, slackS: number): number {
   return (pollS + slackS) * 1000
 }
 
-export function createPollLiveness(opts: PollLivenessOptions): { transformer: Transformer } {
+export function createPollLiveness(opts: PollLivenessOptions): {
+  transformer: Transformer
+  /** A startup attempt failed before onStart → consecutive_errors += 1, last_error = cls. */
+  recordStartupFailure: (cls: PollErrorClass) => void
+} {
   const slackS = opts.slackS ?? POLL_SLACK_S
   const pid = opts.pid ?? process.pid
   const nowS = () => Math.floor((opts.nowMs ?? Date.now)() / 1000)
@@ -147,5 +167,190 @@ export function createPollLiveness(opts: PollLivenessOptions): { transformer: Tr
     }
   }
 
-  return { transformer }
+  return { transformer, recordStartupFailure: fail }
+}
+
+// ── startup loop (D-914) ────────────────────────────────────────────────────
+
+export const STARTUP_LOG = 'startup.log'
+/** Bound on one pre-connect getMe — a dead TCP path outlasts grammY's 500 s request bound. */
+export const STARTUP_DEADLINE_MS = 15_000
+export const STARTUP_PAUSE_CAP_S = 60
+/** A 409 that persists this many consecutive attempts = another poller holds the token → give up. */
+export const CONFLICT_GIVE_UP_ATTEMPTS = 8
+
+/** Pause after the n-th consecutive failed attempt (n ≥ 1): 1, 2, 4, 8, 16, 32, then 60 s (owner tg 40604/40605). */
+export function startupRetryDelayS(failures: number): number {
+  const n = Number.isFinite(failures) && failures >= 1 ? Math.floor(failures) : 1
+  return Math.min(STARTUP_PAUSE_CAP_S, 2 ** (n - 1))
+}
+
+export type StartupOutcome = 'ok' | PollErrorClass
+
+export interface StartupLine {
+  attempt: number
+  outcome: StartupOutcome
+  ms: number
+  nextInS: number
+}
+
+const OUTCOME_RE = /^(ok|timeout|network|http_[0-9]{3})$/
+const int = (n: number) => (Number.isFinite(n) && n >= 0 ? Math.round(n) : 0)
+
+/** The line shape of the header, item 4. Only integers and the closed outcome set reach the file. */
+export function formatStartupLine(tsMs: number, pid: number, l: StartupLine): string {
+  const outcome = OUTCOME_RE.test(l.outcome) ? l.outcome : 'network'
+  return `${new Date(tsMs).toISOString()} pid=${int(pid)} attempt=${int(l.attempt)} outcome=${outcome} ms=${int(l.ms)} next_in_s=${int(l.nextInS)}\n`
+}
+
+/** Appender for STATE_DIR/startup.log. Never throws: a write failure = one stderr line per streak, startup goes on. */
+export function createStartupLog(opts: {
+  stateDir: string
+  pid?: number
+  nowMs?: () => number
+  log?: (line: string) => void
+}): (l: StartupLine) => void {
+  const pid = opts.pid ?? process.pid
+  const now = opts.nowMs ?? Date.now
+  const log = opts.log ?? ((line: string) => { try { process.stderr.write(line) } catch {} })
+  const file = join(opts.stateDir, STARTUP_LOG)
+  let failing = false
+  return l => {
+    try {
+      // O_NOFOLLOW: never append through a symlink planted at the path.
+      const fd = openSync(file, fsc.O_WRONLY | fsc.O_APPEND | fsc.O_CREAT | fsc.O_NOFOLLOW, 0o600)
+      try {
+        fchmodSync(fd, 0o600)
+        writeSync(fd, formatStartupLine(now(), pid, l))
+      } finally {
+        closeSync(fd)
+      }
+      failing = false
+    } catch (err) {
+      if (!failing) {
+        failing = true
+        const code = (err as { code?: unknown } | null)?.code
+        const safe = typeof code === 'string' && /^[A-Z0-9_]{1,24}$/.test(code) ? code : 'unknown'
+        log(`telegram channel: startup.log write failed (${safe}), startup continues\n`)
+      }
+    }
+  }
+}
+
+class StartupDeadline extends Error {
+  constructor(ms: number) {
+    super(`startup getMe gave no answer within ${ms / 1000}s`)
+  }
+}
+
+/** Closed-set class of a startup failure — never the error text (the token lives in URLs and messages). */
+export function startupErrorClass(err: unknown): PollErrorClass {
+  if (err instanceof StartupDeadline) return 'timeout'
+  const code = (err as { error_code?: unknown } | null)?.error_code
+  return code === undefined ? 'network' : httpErrorClass(code)
+}
+
+function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error('aborted'))
+    const onAbort = () => {
+      clearTimeout(t)
+      reject(new Error('aborted'))
+    }
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+export interface StartupLoopOptions {
+  bot: Bot<any>
+  /** Passed to bot.start() as-is (allowed_updates …); onStart is wrapped. */
+  startOptions?: Omit<PollingOptions, 'onStart'>
+  onStart: (info: UserFromGetMe) => void
+  isShuttingDown: () => boolean
+  /** 409 persisted CONFLICT_GIVE_UP_ATTEMPTS attempts — the caller logs it; the loop returns. */
+  onConflictGiveUp: (attempt: number) => void
+  recordStartupFailure: (cls: PollErrorClass) => void
+  startupLog: (l: StartupLine) => void
+  log: (line: string) => void
+  /** Injected clock for tests; default Date.now / setTimeout. */
+  nowMs?: () => number
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
+  deadlineMs?: number
+}
+
+/**
+ * The plugin's outer polling loop. Returns on a clean bot.stop(), on shutdown,
+ * on grammY's «Aborted delay», or after a persistent 409. Every other failure
+ * pauses by startupRetryDelayS and tries again, forever.
+ */
+export async function runStartupLoop(o: StartupLoopOptions): Promise<void> {
+  const now = o.nowMs ?? Date.now
+  const sleep = o.sleep ?? defaultSleep
+  const deadlineMs = o.deadlineMs ?? STARTUP_DEADLINE_MS
+  let failures = 0 // consecutive failed attempts since the last successful start
+  for (;;) {
+    const attempt = failures + 1
+    const t0 = now()
+    let started = false
+    try {
+      if (!o.bot.isInited()) {
+        // Our own getMe: bot.start() then skips grammY's init() and its withRetries ladder.
+        o.bot.botInfo = await getMeWithin(o.bot, deadlineMs, sleep)
+      }
+      await o.bot.start({
+        ...o.startOptions,
+        onStart: info => {
+          started = true
+          failures = 0
+          o.startupLog({ attempt, outcome: 'ok', ms: now() - t0, nextInS: 0 })
+          o.onStart(info)
+        },
+      })
+      return // bot.stop() was called — clean exit from the loop
+    } catch (err) {
+      if (o.isShuttingDown()) return
+      // bot.stop() mid-setup rejects with grammY's "Aborted delay" — expected, not an error.
+      if (err instanceof Error && err.message === 'Aborted delay') return
+      failures += 1
+      const is409 = err instanceof GrammyError && err.error_code === 409
+      if (is409 && failures >= CONFLICT_GIVE_UP_ATTEMPTS) {
+        o.onConflictGiveUp(failures)
+        return
+      }
+      const delayS = startupRetryDelayS(failures)
+      if (!started) {
+        // A failure after onStart already has its ok line (and getUpdates its poll.json entry).
+        const cls = startupErrorClass(err)
+        o.recordStartupFailure(cls)
+        o.startupLog({ attempt, outcome: cls, ms: now() - t0, nextInS: delayS })
+      }
+      const detail = is409
+        ? `409 Conflict${failures === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
+        : `polling error: ${err}`
+      o.log(`telegram channel: ${detail}, retrying in ${delayS}s\n`)
+      await sleep(delayS * 1000)
+    }
+  }
+}
+
+/** One getMe, no retries, rejected with StartupDeadline after `ms` (the request is aborted). */
+async function getMeWithin(
+  bot: Bot<any>,
+  ms: number,
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>,
+): Promise<UserFromGetMe> {
+  const ctl = new AbortController()
+  const deadline = sleep(ms, ctl.signal).then(() => {
+    throw new StartupDeadline(ms)
+  })
+  deadline.catch(() => {}) // aborted after getMe won — nothing to report
+  try {
+    return await Promise.race([bot.api.getMe(ctl.signal), deadline])
+  } finally {
+    ctl.abort()
+  }
 }
