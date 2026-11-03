@@ -3,9 +3,9 @@
 // access-lock.callsites.test.ts). STATE ISOLATION: config.json lives in a mkdtemp HOME.
 
 import { describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
-import { tmpdir } from 'os'
+import { homedir, tmpdir } from 'os'
 import {
   answeredKeyboard,
   handleYesNoPress,
@@ -28,13 +28,51 @@ function home(overrides: unknown): string {
   return h
 }
 
-describe('switch (AC-1/AC-2 inputs)', () => {
-  test('on only for exactly true', () => {
-    expect(yesNoButtonsOn(home({ 'yes-no-buttons': true }))).toBe(true)
-    expect(yesNoButtonsOn(home({ 'yes-no-buttons': false }))).toBe(false)
-    expect(yesNoButtonsOn(home({ 'yes-no-buttons': 'true' }))).toBe(false)
-    expect(yesNoButtonsOn(home({}))).toBe(false)
-    expect(yesNoButtonsOn(home(undefined))).toBe(false)
+// The switch is the core setting `yes-no-buttons`: core default (tools/config-defaults.json)
+// ⊕ the person's override, resolved by core itself (`tools/sam_data.py config-get`; owner tg
+// 41857). The tests run the REAL sam_data.py, copied into a temp core next to a crafted defaults
+// file, under a temp HOME — never the live sam-data. Source of sam_data.py: SAM_CORE_DIR, else
+// ~/Workspace/ClaudeProjects/sam-core; neither present → the block is skipped (named reason).
+const REAL_CORE = Bun.env.SAM_CORE_DIR || join(homedir(), 'Workspace', 'ClaudeProjects', 'sam-core')
+const REAL_SAM_DATA = join(REAL_CORE, 'tools', 'sam_data.py')
+const HAVE_CORE = existsSync(REAL_SAM_DATA)
+if (!HAVE_CORE) console.warn(`yes-no.test: SKIP switch block — no core sam_data.py at ${REAL_SAM_DATA}`)
+
+/** temp HOME with sam-data config.json (`overrides`) and a temp core whose default is `def`
+ * (`'broken'` → an invalid defaults file; `'none'` → no core at all). */
+function install(overrides: unknown, def: boolean | 'broken' | 'none'): string {
+  const h = home(overrides)
+  if (def === 'none') return h
+  const tools = join(h, 'Workspace', 'ClaudeProjects', 'sam-core', 'tools')
+  mkdirSync(tools, { recursive: true })
+  copyFileSync(REAL_SAM_DATA, join(tools, 'sam_data.py'))
+  const defaults = def === 'broken'
+    ? '{not json'
+    : JSON.stringify({ defaults: { 'yes-no-buttons': { value: def, what: 'w', why: 'w' } }, known_exceptions: [] })
+  writeFileSync(join(tools, 'config-defaults.json'), defaults)
+  return h
+}
+
+describe.skipIf(!HAVE_CORE)('switch = core default ⊕ override (AC-1/AC-2 inputs; tg 41857)', () => {
+  test('no override + default on → buttons (the client case)', () => {
+    expect(yesNoButtonsOn(install({}, true))).toBe(true)
+    expect(yesNoButtonsOn(install(undefined, true))).toBe(true)
+  })
+  test('override false wins over default on → no buttons', () => {
+    expect(yesNoButtonsOn(install({ 'yes-no-buttons': false }, true))).toBe(false)
+  })
+  test('override true wins over default off → buttons', () => {
+    expect(yesNoButtonsOn(install({ 'yes-no-buttons': true }, false))).toBe(true)
+  })
+  test('no override + default off → no buttons', () => {
+    expect(yesNoButtonsOn(install({}, false))).toBe(false)
+  })
+  test('an invalid override is ignored the way core ignores it → the default applies', () => {
+    expect(yesNoButtonsOn(install({ 'yes-no-buttons': 'false' }, true))).toBe(true)
+  })
+  test('resolution error → no buttons (plain text): defaults unreadable, no core, no sam-data', () => {
+    expect(yesNoButtonsOn(install({ 'yes-no-buttons': true }, 'broken'))).toBe(false)
+    expect(yesNoButtonsOn(install({ 'yes-no-buttons': true }, 'none'))).toBe(false)
     expect(yesNoButtonsOn(mkdtempSync(join(tmpdir(), 'yn-empty-')))).toBe(false)
   })
 })

@@ -84,9 +84,10 @@ The plugin sends no typing indicator on receipt; in this fork "typing…" is dri
 ## «Да / Нет» buttons (this fork, D-890)
 
 `reply` with `yes_no: true` puts one row of two buttons, «Да» «Нет», under a binary question
-(on the last chunk of a long text). On only where the owner's sam-data override
-`yes-no-buttons` is `true` (default `false`, owner first); off → the text goes plain and the
-result says the buttons are off. Refused together with `checklist`, `files`, `voice`,
+(on the last chunk of a long text). On where the core setting `yes-no-buttons` is on —
+core default (`tools/config-defaults.json`) or the person's sam-data override, resolved by
+`python3 ~/Workspace/ClaudeProjects/sam-core/tools/sam_data.py config-get yes-no-buttons`;
+off, or not resolvable → the text goes plain and the result says the buttons are off. Refused together with `checklist`, `files`, `voice`,
 `as_owner_to`.
 
 A press counts only from the owner (`user.telegram_chat_id`; the lock's owner in locked

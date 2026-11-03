@@ -2,8 +2,9 @@
 // dev/analysis/2026-11-01-yes-no-buttons-spec.md).
 //
 // Send: the reply tool's `yes_no: true` puts ONE keyboard row «Да» «Нет» on the
-// message — only when the owner's sam-data override `yes-no-buttons` is exactly
-// boolean true (default off, owner first: D-475). Off → a plain message.
+// message — only when the setting `yes-no-buttons` is on: core default
+// (tools/config-defaults.json) ⊕ the person's sam-data override, resolved by core
+// itself (`tools/sam_data.py config-get`; owner tg 41857). Off → a plain message.
 // Press: accepted only from the owner (config.json user.telegram_chat_id) in his
 // own DM. It reaches the session as the SAME reaction envelope his 👍/👎 makes,
 // plus `via="button"`, so every 👍/👎 reader works unchanged and the 👍-only
@@ -12,7 +13,8 @@
 //
 // Pure + injected effects (no grammy import), so it is unit-testable.
 
-import { readConfigJson } from './secretary'
+import { spawnSync } from 'child_process'
+import { join } from 'path'
 
 export const YES_NO_SWITCH = 'yes-no-buttons'
 export const YES = 'yn:y'
@@ -22,10 +24,26 @@ export const ANSWERED = 'yn:x'
 export type Choice = 'y' | 'n'
 export type Button = { text: string; callback_data: string }
 
-/** ON only for exactly boolean `true` in sam-data config.json overrides. */
-export function yesNoButtonsOn(home: string): boolean {
-  const ov = readConfigJson(home)?.overrides
-  return ov != null && typeof ov === 'object' && (ov as Record<string, unknown>)[YES_NO_SWITCH] === true
+/** Core lives next to sam-data on every install (tools/start-sam.sh, the container image). */
+export function coreDirOf(home: string): string {
+  return join(home, 'Workspace', 'ClaudeProjects', 'sam-core')
+}
+
+/** The setting's effective value through core's one resolution (default ⊕ valid override):
+ * `python3 <core>/tools/sam_data.py config-get yes-no-buttons` under HOME=home. ON only when it
+ * prints exactly `true`. Any failure (no core / python, timeout, exit≠0, other output) → OFF:
+ * the message goes plain and the answer comes by 👍/👎 or text — with one stderr line. */
+export function yesNoButtonsOn(home: string, coreDir: string = coreDirOf(home)): boolean {
+  const r = spawnSync('python3', [join(coreDir, 'tools', 'sam_data.py'), 'config-get', YES_NO_SWITCH], {
+    env: { ...process.env, HOME: home },
+    encoding: 'utf8',
+    timeout: 5000,
+  })
+  const out = (r.stdout ?? '').trim()
+  if (r.status === 0 && (out === 'true' || out === 'false')) return out === 'true'
+  const why = r.error ? String(r.error) : `exit ${r.status}: ${(r.stderr ?? '').trim().slice(0, 200)}`
+  process.stderr.write(`telegram channel: yes-no-buttons unresolved (${why}) — buttons off, plain text\n`)
+  return false
 }
 
 /** Validates the reply args. Returns true when buttons were asked for. Throws on a forbidden combination. */

@@ -1028,7 +1028,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           yes_no: {
             type: 'boolean',
-            description: "Optional. true → a binary question to the owner gets two buttons «Да» «Нет» in one row (D-890). His press arrives as his reaction event (reaction_added 👍 for Да, 👎 for Нет) with via=\"button\"; afterwards the message shows his choice. Only when his sam-data override `yes-no-buttons` is true; otherwise the text goes plain and the result says the buttons are off. Cannot be combined with checklist, files, voice or as_owner_to. Never for a question that needs his own 👍 — a press is not his 👍 there: a laws slot line, Telegram access, «Выдать инвайт <имя>?», a secretary preview.",
+            description: "Optional. true → a binary question to the owner gets two buttons «Да» «Нет» in one row (D-890). His press arrives as his reaction event (reaction_added 👍 for Да, 👎 for Нет) with via=\"button\"; afterwards the message shows his choice. Only when the setting `yes-no-buttons` is on (core default, or his sam-data override); otherwise the text goes plain and the result says the buttons are off. Cannot be combined with checklist, files, voice or as_owner_to. Never for a question that needs his own 👍 — a press is not his 👍 there: a laws slot line, Telegram access, «Выдать инвайт <имя>?», a secretary preview.",
           },
           as_owner_to: {
             type: 'string',
