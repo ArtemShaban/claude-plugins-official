@@ -62,7 +62,7 @@ import { appendArchive, archiveRoot } from './tg-archive'
 import { createSecretary, directResultText, loadSecretaryState, previewResultText, secretaryRoot, type SecretaryApi } from './secretary'
 import { catchUp, createKeeper, createOutStore, isOwnDeliveredMedia, type Download } from './chat-store'
 import { clipUtf16 } from './text-clip'
-import { SUFFIX_OFF, SUFFIX_ON, handleYesNoPress, wantsYesNo, yesNoButtonsOn, yesNoKeyboard } from './yes-no'
+import { CO_OWNERS_FILE, SUFFIX_OFF, SUFFIX_ON, handleYesNoPress, readCoOwners, wantsYesNo, yesNoButtonsOn, yesNoKeyboard } from './yes-no'
 import {
   buildChecklist,
   applyToggle,
@@ -1028,7 +1028,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           yes_no: {
             type: 'boolean',
-            description: "Optional. true → a binary question to the owner gets two buttons «Да» «Нет» in one row (D-890). His press arrives as his reaction event (reaction_added 👍 for Да, 👎 for Нет) with via=\"button\"; afterwards the message shows his choice. Only when the setting `yes-no-buttons` is on (core default, or his sam-data override); otherwise the text goes plain and the result says the buttons are off. Cannot be combined with checklist, files, voice or as_owner_to. Never for a question that needs his own 👍 — a press is not his 👍 there: a laws slot line, Telegram access, «Выдать инвайт <имя>?», a secretary preview.",
+            description: "Optional. true → a binary question to the owner gets two buttons «Да» «Нет» in one row (D-890). Only the owner or a co-owner may press, in their own DM; the press arrives as the presser's reaction event (user_id = who pressed; reaction_added 👍 for Да, 👎 for Нет) with via=\"button\"; afterwards the message shows the choice. Only when the setting `yes-no-buttons` is on (core default, or his sam-data override); otherwise the text goes plain and the result says the buttons are off. Cannot be combined with checklist, files, voice or as_owner_to. Never for a question that needs his own 👍 — a press is not his 👍 there: a laws slot line, Telegram access, «Выдать инвайт <имя>?», a secretary preview.",
           },
           as_owner_to: {
             type: 'string',
@@ -1470,12 +1470,13 @@ setInterval(() => {
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
 
-  // «Да / Нет» press (D-890, yes-no.ts): the owner only, in his own DM; a reaction
+  // «Да / Нет» press (D-890, yes-no.ts): the owner or a co-owner, in their own DM; a reaction
   // envelope with via="button". Never the secretary or the signed approval channel.
   const yesNoHandled = await handleYesNoPress(
     { data, from: ctx.from, message: ctx.callbackQuery.message },
     {
       ownerId: lockOwnerId(ACCESS_LOCK, readLockedAccess, OWNER_TG_ID),
+      coOwners: () => readCoOwners(CO_OWNERS_FILE, line => safeStderr(line + '\n')),
       answer: text => ctx.answerCallbackQuery({ text }),
       editMarkup: keyboard => ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: keyboard } }),
       notify: n => mcp.notification({ method: 'notifications/claude/channel', params: n }),

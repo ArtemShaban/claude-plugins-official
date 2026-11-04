@@ -5,8 +5,10 @@
 // message — only when the setting `yes-no-buttons` is on: core default
 // (tools/config-defaults.json) ⊕ the person's sam-data override, resolved by core
 // itself (`tools/sam_data.py config-get`; owner tg 41857). Off → a plain message.
-// Press: accepted only from the owner (config.json user.telegram_chat_id) in his
-// own DM. It reaches the session as the SAME reaction envelope his 👍/👎 makes,
+// Press: accepted only from the owner (config.json user.telegram_chat_id) or a
+// co-owner (the admin's /etc/sam-telegram-access/co-owners, read fresh per press;
+// spec sam-data dev/analysis/2026-11-04-yes-no-co-owner-spec.md), in their own DM.
+// It reaches the session as the SAME reaction envelope his 👍/👎 makes,
 // plus `via="button"`, so every 👍/👎 reader works unchanged and the 👍-only
 // rails (tools/owner_approval.py check_thumbs) can refuse it. The press never
 // feeds the secretary preview or the signed approval side-channel.
@@ -14,7 +16,9 @@
 // Pure + injected effects (no grammy import), so it is unit-testable.
 
 import { spawnSync } from 'child_process'
+import { closeSync, openSync, readSync } from 'fs'
 import { join } from 'path'
+import { LOCK_DIR } from './access-lock'
 
 export const YES_NO_SWITCH = 'yes-no-buttons'
 export const YES = 'yn:y'
@@ -92,8 +96,57 @@ export type PressInput = {
   message?: { message_id: number; chat: { id: number; type: string } }
 }
 
+// The admin's co-owner list (CLAUDE.md §4 «Co-owners on a client install»: the only source,
+// read fresh). Rules mirror the status Mini App (sam-core services/status-miniapp
+// status_core.parse_co_owners + server.AdminFiles): each trimmed line is one id of 5-20
+// digits without a leading 0; ANY other line → no co-owner at all; empty → none.
+export const CO_OWNERS_FILE = join(LOCK_DIR, 'co-owners')
+export const CO_OWNERS_MAX_BYTES = 4096
+const CO_OWNER_ID_RE = /^[1-9][0-9]{4,19}$/
+
+export function parseCoOwners(text: string): { ids: Set<string>; fault: string | null } {
+  const lines = text.split(/\r\n|\n|\r/)
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop() // trailing newline, as Python splitlines
+  const ids = new Set<string>()
+  for (const line of lines) {
+    const v = line.trim()
+    if (!CO_OWNER_ID_RE.test(v)) return { ids: new Set(), fault: 'co_owners_bad_line' }
+    ids.add(v)
+  }
+  return { ids, fault: null }
+}
+
+/** Absent → none, silently. Unreadable / not UTF-8 / bad line / over the size cap → none + one logError line. */
+export function readCoOwners(path: string, logError: (line: string) => void): Set<string> {
+  let fault: string
+  try {
+    const fd = openSync(path, 'r')
+    let n: number
+    const buf = Buffer.alloc(CO_OWNERS_MAX_BYTES + 1)
+    try {
+      n = readSync(fd, buf, 0, buf.length, 0)
+    } finally {
+      closeSync(fd)
+    }
+    if (n > CO_OWNERS_MAX_BYTES) {
+      fault = 'co_owners_too_big' // a cut line could read as a different, shorter id
+    } else {
+      const r = parseCoOwners(new TextDecoder('utf-8', { fatal: true }).decode(buf.subarray(0, n)))
+      if (r.fault == null) return r.ids
+      fault = r.fault
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return new Set()
+    fault = (err as NodeJS.ErrnoException)?.code ?? (err as Error)?.name ?? 'error'
+  }
+  logError(`telegram channel: co-owners file ${path} ignored (${fault}) — no co-owner may press yes/no`)
+  return new Set()
+}
+
 export type PressDeps = {
   ownerId: string | undefined
+  // The co-owner ids, read fresh on each call (readCoOwners). Called only for a non-owner press.
+  coOwners: () => ReadonlySet<string>
   answer: (text: string) => Promise<unknown>
   editMarkup: (keyboard: Button[][]) => Promise<unknown>
   notify: (n: { content: string; meta: Record<string, string> }) => Promise<unknown>
@@ -110,7 +163,8 @@ export async function handleYesNoPress(p: PressInput, d: PressDeps): Promise<boo
   if (choice == null) return false
   const toast = (t: string) => d.answer(t).catch(() => {})
   const fromId = String(p.from.id)
-  if (!d.ownerId || fromId !== d.ownerId) {
+  const isOwner = !!d.ownerId && fromId === d.ownerId
+  if (!isOwner && !d.coOwners().has(fromId)) {
     await toast('Not authorized.')
     return true
   }

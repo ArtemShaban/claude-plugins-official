@@ -9,7 +9,9 @@ import { homedir, tmpdir } from 'os'
 import {
   answeredKeyboard,
   handleYesNoPress,
+  parseCoOwners,
   parseYesNoData,
+  readCoOwners,
   wantsYesNo,
   yesNoButtonsOn,
   yesNoKeyboard,
@@ -19,6 +21,7 @@ import {
 
 const OWNER = 111222333
 const OTHER = 444555666
+const CO = 777888999
 
 function home(overrides: unknown): string {
   const h = mkdtempSync(join(tmpdir(), 'yn-home-'))
@@ -119,10 +122,11 @@ describe('wantsYesNo (AC-3)', () => {
   })
 })
 
-function deps(ownerId: string | undefined = String(OWNER)) {
+function deps(ownerId: string | undefined = String(OWNER), coOwners: () => ReadonlySet<string> = () => new Set()) {
   const calls = { answer: [] as string[], edit: [] as unknown[], notify: [] as { content: string; meta: Record<string, string> }[], errors: [] as string[] }
   const d: PressDeps = {
     ownerId,
+    coOwners,
     answer: async t => { calls.answer.push(t) },
     editMarkup: async k => { calls.edit.push(k) },
     notify: async n => { calls.notify.push(n) },
@@ -203,6 +207,126 @@ describe('accepted press (AC-5)', () => {
   })
 })
 
+// Co-owner press (spec sam-data dev/analysis/2026-11-04-yes-no-co-owner-spec.md). The admin's file
+// lives in a mkdtemp dir; read fresh per press through the real reader. Fixture ids only (AC-6).
+function coFile(content: string | null): string {
+  const dir = mkdtempSync(join(tmpdir(), 'yn-co-'))
+  const f = join(dir, 'co-owners')
+  if (content != null) writeFileSync(f, content)
+  return f
+}
+function fileDeps(f: string, ownerId: string | undefined = String(OWNER)) {
+  const errors: string[] = []
+  const r = deps(ownerId, () => readCoOwners(f, l => { errors.push(l) }))
+  return { d: r.d, calls: r.calls, readerErrors: errors }
+}
+
+describe('parseCoOwners (CLAUDE.md §4 rules, mirror of status Mini App parse_co_owners)', () => {
+  test('one id per line, trimmed, trailing newline ok', () => {
+    expect([...parseCoOwners(` ${CO} \n${OTHER}\n`).ids].sort()).toEqual([String(OTHER), String(CO)].sort())
+  })
+  test('empty file → none, no fault', () => {
+    expect(parseCoOwners('')).toEqual({ ids: new Set(), fault: null })
+  })
+  for (const bad of ['0123456', 'abc', '1234', '123456789012345678901', `${CO} ${OTHER}`, '']) {
+    test(`a bad line ${JSON.stringify(bad)} next to a valid one → none at all`, () => {
+      const r = parseCoOwners(`${CO}\n${bad}\n${OTHER}\n`)
+      expect(r.ids.size).toBe(0)
+      expect(r.fault).toBe('co_owners_bad_line')
+    })
+  }
+  test('5 and 20 digits are valid', () => {
+    expect(parseCoOwners('12345\n12345678901234567890').ids.size).toBe(2)
+  })
+})
+
+describe('co-owner press (spec 2026-11-04 AC-1..AC-4)', () => {
+  for (const [data, glyph, label, inert] of [
+    ['yn:y', '👍', 'Да', '✅ Да'],
+    ['yn:n', '👎', 'Нет', '❌ Нет'],
+  ] as const) {
+    test(`AC-1: listed co-owner pressing ${label} in his own DM → one reaction event`, async () => {
+      const { d, calls } = fileDeps(coFile(`${CO}\n`))
+      expect(await handleYesNoPress(press(data, CO, { id: CO, type: 'private' }), d)).toBe(true)
+      expect(calls.notify).toEqual([
+        {
+          content: `(button on message 501: ${label})`,
+          meta: {
+            event: 'reaction',
+            chat_id: String(CO),
+            message_id: '501',
+            user: 'artem',
+            user_id: String(CO),
+            ts: '2026-11-01T10:00:00.000Z',
+            reaction_added: glyph,
+            via: 'button',
+          },
+        },
+      ])
+      expect(calls.edit).toEqual([[[{ text: inert, callback_data: 'yn:x' }]]])
+      expect(calls.answer).toEqual([inert])
+    })
+  }
+  test('AC-2: owner still accepted when the file is absent (owner install: no /etc dir)', async () => {
+    const { d, calls, readerErrors } = fileDeps(coFile(null))
+    await handleYesNoPress(press('yn:y', OWNER, { id: OWNER, type: 'private' }), d)
+    expect(calls.notify.length).toBe(1)
+    expect(readerErrors).toEqual([])
+  })
+  test('AC-2: owner still accepted when the file is malformed', async () => {
+    const { d, calls } = fileDeps(coFile('abc\n'))
+    await handleYesNoPress(press('yn:y', OWNER, { id: OWNER, type: 'private' }), d)
+    expect(calls.notify.length).toBe(1)
+  })
+  const own = { id: CO, type: 'private' }
+  const refused: [string, string | Buffer | null, PressInput][] = [
+    ['an allowlisted DM id not in the file', `${CO}\n`, press('yn:y', OTHER, { id: OTHER, type: 'private' })],
+    ['a co-owner pressing in a group', `${CO}\n`, press('yn:y', CO, { id: -100123, type: 'supergroup' })],
+    ["a co-owner pressing in another person's DM", `${CO}\n`, press('yn:y', CO, { id: OWNER, type: 'private' })],
+    ['file absent', null, press('yn:y', CO, own)],
+    ['file empty', '', press('yn:y', CO, own)],
+    ['bad line 0123456 next to the co-owner', `${CO}\n0123456\n`, press('yn:y', CO, own)],
+    ['bad line abc next to the co-owner', `${CO}\nabc\n`, press('yn:y', CO, own)],
+    ['bad line 1234 next to the co-owner', `${CO}\n1234\n`, press('yn:y', CO, own)],
+    ['a 21-digit id next to the co-owner', `${CO}\n123456789012345678901\n`, press('yn:y', CO, own)],
+    ['two ids on one line', `${CO} ${OTHER}\n`, press('yn:y', CO, own)],
+    ['not UTF-8', Buffer.from([0x37, 0x37, 0xff, 0xfe, 0x0a]), press('yn:y', CO, own)],
+    ['larger than 4096 bytes (a cut line could read as another id)', `${CO}\n`.repeat(500), press('yn:y', CO, own)],
+  ]
+  for (const [name, content, p] of refused) {
+    test(`AC-3: ${name} → «Not authorized.», no event, no edit`, async () => {
+      const f = coFile(null)
+      if (content != null) writeFileSync(f, content)
+      const { d, calls } = fileDeps(f)
+      expect(await handleYesNoPress(p, d)).toBe(true)
+      expect(calls.notify).toEqual([])
+      expect(calls.edit).toEqual([])
+      expect(calls.answer).toEqual(['Not authorized.'])
+    })
+  }
+  test('AC-3: file unreadable → refused + one stderr line', async () => {
+    const f = coFile(null)
+    mkdirSync(f) // a directory where the file should be: reading fails (EISDIR) even as root
+    const { d, calls, readerErrors } = fileDeps(f)
+    await handleYesNoPress(press('yn:y', CO, own), d)
+    expect(calls.notify).toEqual([])
+    expect(calls.answer).toEqual(['Not authorized.'])
+    expect(readerErrors.length).toBe(1)
+  })
+  test('AC-4: fresh read — refused, accepted after add, refused after remove, same deps', async () => {
+    const f = coFile('')
+    const { d, calls } = fileDeps(f)
+    const p = press('yn:y', CO, own)
+    await handleYesNoPress(p, d)
+    writeFileSync(f, `${CO}\n`)
+    await handleYesNoPress(p, d)
+    writeFileSync(f, '')
+    await handleYesNoPress(p, d)
+    expect(calls.notify.length).toBe(1)
+    expect(calls.answer).toEqual(['Not authorized.', '✅ Да', 'Not authorized.'])
+  })
+})
+
 // Source pins: the wiring in server.ts (the handler itself is unit-tested above).
 const SRC = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
 function block(start: string, end: string): string {
@@ -219,6 +343,7 @@ describe('server.ts call sites', () => {
     expect(b).not.toContain('secretary')
     expect(b).not.toContain('emitApprovalSignal')
     expect(b).toContain('ownerId: lockOwnerId(ACCESS_LOCK, readLockedAccess, OWNER_TG_ID)')
+    expect(b).toContain('coOwners: () => readCoOwners(CO_OWNERS_FILE,')
   })
   test('AC-6: the press branch runs before the checklist branch, inside the callback handler', () => {
     const b = block("bot.on('callback_query:data'", 'parseChecklistCallbackData(data)')
