@@ -8,7 +8,11 @@ import { join } from 'path'
 import { homedir, tmpdir } from 'os'
 import {
   answeredKeyboard,
+  doneKeyboard,
   handleYesNoPress,
+  SUFFIX_DONE_OFF,
+  SUFFIX_DONE_ON,
+  wantsDoneButton,
   parseCoOwners,
   parseYesNoData,
   readCoOwners,
@@ -362,5 +366,150 @@ describe('server.ts call sites', () => {
   test('AC-2: the result names the switch state; result still starts with "sent"', () => {
     expect(SRC).toContain('const yesNoNote = yesNo ? (yesNoOn ? SUFFIX_ON : SUFFIX_OFF) : \'\'')
     expect(SRC).toContain("text: result + voiceNote + yesNoNote")
+  })
+})
+
+// «Готово» button (buttons spec sam-data dev/analysis/2026-11-08-buttons-da-gotovo-spec.md §2.4, §5, AC-06):
+// one button under a «do X, tell me» message; a press = ✅ via=button, never 👍.
+describe('done_button: args (AC-06)', () => {
+  test('absent → no button', () => {
+    expect(wantsDoneButton({})).toBeNull()
+    expect(wantsDoneButton({ done_button: undefined })).toBeNull()
+  })
+  test('a label → one row, one button with that label', () => {
+    expect(wantsDoneButton({ done_button: 'Готово' })).toBe('Готово')
+    expect(doneKeyboard('Оплатил')).toEqual([[{ text: 'Оплатил', callback_data: 'yn:d' }]])
+  })
+  for (const [name, extra] of [
+    ['yes_no', { yes_no: true }],
+    ['checklist', { checklist: ['a'] }],
+    ['files', { files: ['/tmp/x.png'] }],
+    ['voice', { voice: true }],
+    ['as_owner_to', { as_owner_to: '123' }],
+  ] as const) {
+    test(`with ${name} → error`, () => {
+      expect(() => wantsDoneButton({ done_button: 'Готово', ...extra })).toThrow(new RegExp(name))
+    })
+  }
+  for (const [name, v] of [
+    ['empty', ''],
+    ['spaces only', '   '],
+    ['a newline', 'Гото\nво'],
+    ['a carriage return', 'Гото\rво'],
+    ['over 32 characters', 'Г'.repeat(33)],
+    ['not a string', true],
+  ] as const) {
+    test(`${name} → error`, () => {
+      expect(() => wantsDoneButton({ done_button: v })).toThrow()
+    })
+  }
+  test('exactly 32 characters (code points) → ok', () => {
+    expect(wantsDoneButton({ done_button: 'Г'.repeat(32) })).toBe('Г'.repeat(32))
+  })
+  test('switch off → the result line says «button off, answer by text»', () => {
+    expect(SUFFIX_DONE_OFF).toContain('button off, answer by text')
+    expect(SUFFIX_DONE_ON).not.toContain('off')
+  })
+})
+
+function donePress(fromId: number, chat: { id: number; type: string } | null, label: string | null = 'Вошёл', data = 'yn:d'): PressInput {
+  const kb = label == null ? undefined : { inline_keyboard: [[{ text: label, callback_data: 'yn:d' }]] }
+  return {
+    data,
+    from: { id: fromId, username: 'artem' },
+    ...(chat ? { message: { message_id: 502, chat, ...(kb ? { reply_markup: kb } : {}) } } : {}),
+  }
+}
+
+describe('done_button: press (AC-06)', () => {
+  test('owner in his DM → one envelope with ✅ + via=button + that message id; keyboard → inert ✅ <label>', async () => {
+    const { d, calls } = deps()
+    expect(await handleYesNoPress(donePress(OWNER, { id: OWNER, type: 'private' }), d)).toBe(true)
+    expect(calls.notify).toEqual([
+      {
+        content: '(button on message 502: Вошёл)',
+        meta: {
+          event: 'reaction',
+          chat_id: String(OWNER),
+          message_id: '502',
+          user: 'artem',
+          user_id: String(OWNER),
+          ts: '2026-11-01T10:00:00.000Z',
+          reaction_added: '✅',
+          via: 'button',
+        },
+      },
+    ])
+    expect(calls.edit).toEqual([[[{ text: '✅ Вошёл', callback_data: 'yn:x' }]]])
+    expect(calls.answer).toEqual(['✅ Вошёл'])
+  })
+  test('label absent from the returned message → «Готово»', async () => {
+    const { d, calls } = deps()
+    await handleYesNoPress(donePress(OWNER, { id: OWNER, type: 'private' }, null), d)
+    expect(calls.notify[0].content).toBe('(button on message 502: Готово)')
+    expect(calls.edit).toEqual([[[{ text: '✅ Готово', callback_data: 'yn:x' }]]])
+  })
+  test('co-owner in their own DM → the same envelope with their user_id', async () => {
+    const { d, calls } = fileDeps(coFile(`${CO}\n`))
+    await handleYesNoPress(donePress(CO, { id: CO, type: 'private' }), d)
+    expect(calls.notify.length).toBe(1)
+    expect(calls.notify[0].meta.user_id).toBe(String(CO))
+    expect(calls.notify[0].meta.chat_id).toBe(String(CO))
+    expect(calls.notify[0].meta.reaction_added).toBe('✅')
+    expect(calls.notify[0].meta.via).toBe('button')
+  })
+  for (const [name, p] of [
+    ['another id', donePress(OTHER, { id: OTHER, type: 'private' })],
+    ['an unknown id in the owner DM', donePress(OTHER, { id: OWNER, type: 'private' })],
+    ['the owner in a group', donePress(OWNER, { id: -100123, type: 'supergroup' })],
+    ['a vanished message', donePress(OWNER, null)],
+  ] as const) {
+    test(`${name} → toast only, no envelope`, async () => {
+      const { d, calls } = deps()
+      expect(await handleYesNoPress(p, d)).toBe(true)
+      expect(calls.notify).toEqual([])
+      expect(calls.edit).toEqual([])
+      expect(calls.answer.length).toBe(1)
+    })
+  }
+  test('press after the swap → «Already answered.», no envelope', async () => {
+    const { d, calls } = deps()
+    await handleYesNoPress(donePress(OWNER, { id: OWNER, type: 'private' }, '✅ Вошёл', 'yn:x'), d)
+    expect(calls.notify).toEqual([])
+    expect(calls.answer).toEqual(['Already answered.'])
+  })
+  test('no done case yields 👍 (or 👎)', async () => {
+    const { d, calls } = fileDeps(coFile(`${CO}\n`))
+    for (const p of [donePress(OWNER, { id: OWNER, type: 'private' }), donePress(CO, { id: CO, type: 'private' }),
+                     donePress(OWNER, { id: OWNER, type: 'private' }, null), donePress(OWNER, { id: OWNER, type: 'private' }, '👍')]) {
+      await handleYesNoPress(p, d)
+    }
+    expect(calls.notify.length).toBe(4)
+    for (const n of calls.notify) {
+      expect(n.meta.reaction_added).toBe('✅')
+      expect(n.meta.reaction_added).not.toContain('👍')
+      expect(n.meta.reaction_added).not.toContain('👎')
+    }
+  })
+})
+
+describe('done_button: server.ts call sites (AC-06)', () => {
+  test('the arg check runs before the secretary and checklist branches', () => {
+    const i = SRC.indexOf('const doneLabel = wantsDoneButton(')
+    expect(i).toBeGreaterThan(0)
+    expect(i).toBeLessThan(SRC.indexOf('if (args.as_owner_to != null) {'))
+    expect(i).toBeLessThan(SRC.indexOf('if (args.checklist != null) {'))
+  })
+  test('same switch as «Да / Нет»; the keyboard goes on the last chunk only', () => {
+    expect(SRC).toContain('const doneOn = doneLabel != null && yesNoButtonsOn(homedir())')
+    expect(SRC).toContain('...(doneOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: doneKeyboard(doneLabel as string) } } : {}),')
+  })
+  test('the result names the switch state; result still starts with "sent"', () => {
+    expect(SRC).toContain("const doneNote = doneLabel != null ? (doneOn ? SUFFIX_DONE_ON : SUFFIX_DONE_OFF) : ''")
+    expect(SRC).toContain('text: result + voiceNote + yesNoNote + doneNote')
+  })
+  test('the tool schema offers done_button; yes_no no longer bans a press for every 👍 question', () => {
+    expect(SRC).toContain('done_button: {')
+    expect(SRC).not.toContain('Never for a question that needs his own 👍')
   })
 })

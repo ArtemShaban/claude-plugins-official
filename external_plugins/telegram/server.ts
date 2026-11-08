@@ -62,7 +62,7 @@ import { appendArchive, archiveRoot } from './tg-archive'
 import { createSecretary, directResultText, loadSecretaryState, previewResultText, secretaryRoot, type SecretaryApi } from './secretary'
 import { catchUp, createKeeper, createOutStore, isOwnDeliveredMedia, type Download } from './chat-store'
 import { clipUtf16 } from './text-clip'
-import { CO_OWNERS_FILE, SUFFIX_OFF, SUFFIX_ON, handleYesNoPress, readCoOwners, wantsYesNo, yesNoButtonsOn, yesNoKeyboard } from './yes-no'
+import { CO_OWNERS_FILE, SUFFIX_DONE_OFF, SUFFIX_DONE_ON, SUFFIX_OFF, SUFFIX_ON, doneKeyboard, handleYesNoPress, readCoOwners, wantsDoneButton, wantsYesNo, yesNoButtonsOn, yesNoKeyboard } from './yes-no'
 import {
   buildChecklist,
   applyToggle,
@@ -1028,7 +1028,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           yes_no: {
             type: 'boolean',
-            description: "Optional. true → a binary question to the owner gets two buttons «Да» «Нет» in one row (D-890). Only the owner or a co-owner may press, in their own DM; the press arrives as the presser's reaction event (user_id = who pressed; reaction_added 👍 for Да, 👎 for Нет) with via=\"button\"; afterwards the message shows the choice. Only when the setting `yes-no-buttons` is on (core default, or his sam-data override); otherwise the text goes plain and the result says the buttons are off. Cannot be combined with checklist, files, voice or as_owner_to. Never for a question that needs his own 👍 — a press is not his 👍 there: a laws slot line, Telegram access, «Выдать инвайт <имя>?», a secretary preview.",
+            description: "Optional. true → a binary question to the owner gets two buttons «Да» «Нет» in one row (D-890). Only the owner or a co-owner may press, in their own DM; the press arrives as the presser's reaction event (user_id = who pressed; reaction_added 👍 for Да, 👎 for Нет) with via=\"button\"; afterwards the message shows the choice. Only when the setting `yes-no-buttons` is on (core default, or his sam-data override); otherwise the text goes plain and the result says the buttons are off. Cannot be combined with checklist, files, voice, as_owner_to or done_button. Where a rule asks for his own 👍 or «да» on one message — a laws slot line, «Выдать инвайт <имя>?», a preview of a message in his name — his «Да» press on that message counts as it, under the same checks (him, his own DM, that very message; his latest 👍 / removal / «Да» / «Нет» decides). Never for Telegram access: there only his own 👍.",
+          },
+          done_button: {
+            type: 'string',
+            description: "Optional. The label of ONE button under a message that gives the person a command or a task for their own hands and waits only for «done» — «Готово», or one fitting the task («Вошёл», «Оплатил»), in their language; one line, at most 32 characters. Only the owner or a co-owner may press, in their own DM; the press arrives as the presser's reaction event with reaction_added ✅ and via=\"button\" and means only «done» — never «да» or consent. Afterwards the button reads «✅ <label>». Same switch as yes_no (`yes-no-buttons`); off → the text goes plain and the result says «button off, answer by text». Cannot be combined with yes_no, checklist, files, voice or as_owner_to.",
           },
           as_owner_to: {
             type: 'string',
@@ -1125,6 +1129,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // «Да / Нет» buttons (D-890, yes-no.ts): refused with checklist/files/voice/secretary.
         const yesNo = wantsYesNo({ yes_no: args.yes_no, checklist: args.checklist, files, voice: args.voice, as_owner_to: args.as_owner_to })
         const yesNoOn = yesNo && yesNoButtonsOn(homedir())
+        // «Готово» button (yes-no.ts, buttons spec 2026-11-08 §2.4): one button, same switch; refused with yes_no too.
+        const doneLabel = wantsDoneButton({ done_button: args.done_button, yes_no: args.yes_no, checklist: args.checklist, files, voice: args.voice, as_owner_to: args.as_owner_to })
+        const doneOn = doneLabel != null && yesNoButtonsOn(homedir())
 
         // Secretary path (spec §2 C, D-876). Always returns or throws, so the
         // plain-reply code below is never affected. Sending in his name happens
@@ -1261,6 +1268,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                 ...threadOpt,
                 ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
                 ...(yesNoOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: yesNoKeyboard() } } : {}),
+                ...(doneOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: doneKeyboard(doneLabel as string) } } : {}),
               }
               const sent =
                 format === 'auto'
@@ -1328,7 +1336,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
         const yesNoNote = yesNo ? (yesNoOn ? SUFFIX_ON : SUFFIX_OFF) : ''
-        return { content: [{ type: 'text', text: result + voiceNote + yesNoNote }] }
+        const doneNote = doneLabel != null ? (doneOn ? SUFFIX_DONE_ON : SUFFIX_DONE_OFF) : ''
+        return { content: [{ type: 'text', text: result + voiceNote + yesNoNote + doneNote }] }
       }
       case 'react': {
         assertAllowedChat(args.chat_id as string)
@@ -1470,8 +1479,8 @@ setInterval(() => {
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
 
-  // «Да / Нет» press (D-890, yes-no.ts): the owner or a co-owner, in their own DM; a reaction
-  // envelope with via="button". Never the secretary or the signed approval channel.
+  // «Да / Нет» and «Готово» press (D-890, yes-no.ts): the owner or a co-owner, in their own DM; a reaction
+  // envelope with via="button" (👍 / 👎 / ✅). Never the secretary or the signed approval channel.
   const yesNoHandled = await handleYesNoPress(
     { data, from: ctx.from, message: ctx.callbackQuery.message },
     {

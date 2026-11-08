@@ -9,9 +9,14 @@
 // co-owner (the admin's /etc/sam-telegram-access/co-owners, read fresh per press;
 // spec sam-data dev/analysis/2026-11-04-yes-no-co-owner-spec.md), in their own DM.
 // It reaches the session as the SAME reaction envelope his 👍/👎 makes,
-// plus `via="button"`, so every 👍/👎 reader works unchanged and the 👍-only
-// rails (tools/owner_approval.py check_thumbs) can refuse it. The press never
-// feeds the secretary preview or the signed approval side-channel.
+// plus `via="button"`, so every 👍/👎 reader works unchanged; tools/owner_approval.py
+// check_thumbs refuses it by default and counts it only where a rail opts in (invite-mint).
+// The press never feeds the secretary preview or the signed approval side-channel.
+//
+// «Готово» (spec sam-data dev/analysis/2026-11-08-buttons-da-gotovo-spec.md §2.4): the reply
+// tool's `done_button: "<label>"` puts ONE button under a «do X, tell me» message, same switch,
+// same press rules. Its press arrives as the same envelope with ✅ (never 👍/👎) + via="button",
+// so «сделал» can never pass as «да»: no approval rail reads ✅.
 //
 // Pure + injected effects (no grammy import), so it is unit-testable.
 
@@ -24,8 +29,12 @@ export const YES_NO_SWITCH = 'yes-no-buttons'
 export const YES = 'yn:y'
 export const NO = 'yn:n'
 export const ANSWERED = 'yn:x'
+export const DONE = 'yn:d'
+export const DONE_DEFAULT_LABEL = 'Готово'
+export const DONE_LABEL_MAX = 32 // our cap, in characters (code points)
+export const DONE_MARK = '✅'
 
-export type Choice = 'y' | 'n'
+export type Choice = 'y' | 'n' | 'd'
 export type Button = { text: string; callback_data: string }
 
 /** Core lives next to sam-data on every install (tools/start-sam.sh, the container image). */
@@ -69,31 +78,80 @@ export function wantsYesNo(args: {
   return true
 }
 
+/** Validates the reply args for the «Готово» button. Returns its label, or null when not asked for.
+ * Throws on a bad label or a forbidden combination (the same five as yes_no, plus yes_no itself). */
+export function wantsDoneButton(args: {
+  done_button?: unknown
+  yes_no?: unknown
+  checklist?: unknown
+  files?: unknown[]
+  voice?: unknown
+  as_owner_to?: unknown
+}): string | null {
+  if (args.done_button == null) return null
+  if (typeof args.done_button !== 'string') throw new Error('done_button must be a string (the button label)')
+  if (/[\r\n\u2028\u2029]/.test(args.done_button)) throw new Error('done_button must be one line')
+  const label = args.done_button.trim()
+  if (label === '') throw new Error('done_button must not be empty')
+  if ([...label].length > DONE_LABEL_MAX) throw new Error(`done_button must be at most ${DONE_LABEL_MAX} characters`)
+  const clash: string[] = []
+  if (args.yes_no != null && args.yes_no !== false) clash.push('yes_no')
+  if (Array.isArray(args.checklist) ? args.checklist.length > 0 : args.checklist != null) clash.push('checklist')
+  if ((args.files ?? []).length > 0) clash.push('files')
+  if (args.voice === true) clash.push('voice')
+  if (args.as_owner_to != null) clash.push('as_owner_to (secretary)')
+  if (clash.length) throw new Error(`done_button cannot be combined with ${clash.join(', ')} — send those as a separate reply`)
+  return label
+}
+
+/** One row, one button: the label (e.g. «Готово», «Вошёл»). */
+export function doneKeyboard(label: string): Button[][] {
+  return [[{ text: label, callback_data: DONE }]]
+}
+
 /** One row, two columns: «Да» «Нет». */
 export function yesNoKeyboard(): Button[][] {
   return [[{ text: 'Да', callback_data: YES }, { text: 'Нет', callback_data: NO }]]
 }
 
-/** After a press: one inert button showing the choice. */
-export function answeredKeyboard(choice: Choice): Button[][] {
-  return [[{ text: choice === 'y' ? '✅ Да' : '❌ Нет', callback_data: ANSWERED }]]
+/** After a press: one inert button showing the choice (for «Готово»: «✅ <label>»). */
+export function answeredKeyboard(choice: Choice, doneLabel: string = DONE_DEFAULT_LABEL): Button[][] {
+  const text = choice === 'y' ? '✅ Да' : choice === 'n' ? '❌ Нет' : `${DONE_MARK} ${doneLabel}`
+  return [[{ text, callback_data: ANSWERED }]]
+}
+
+/** The pressed «Готово» button's label, as Telegram returns it with the message; absent → «Готово». */
+export function doneLabelOf(m: PressInput['message']): string {
+  for (const row of m?.reply_markup?.inline_keyboard ?? []) {
+    for (const b of row) {
+      if (b.callback_data === DONE && typeof b.text === 'string' && b.text.trim() !== '') return b.text.trim()
+    }
+  }
+  return DONE_DEFAULT_LABEL
 }
 
 export function parseYesNoData(data: string): Choice | 'x' | null {
   if (data === YES) return 'y'
   if (data === NO) return 'n'
+  if (data === DONE) return 'd'
   if (data === ANSWERED) return 'x'
   return null
 }
 
 export const SUFFIX_ON = ' +yes/no buttons'
 export const SUFFIX_OFF = ' — yes/no buttons are off on this install; the answer comes by 👍/👎 or text'
+export const SUFFIX_DONE_ON = ' +done button'
+export const SUFFIX_DONE_OFF = ' — button off, answer by text'
 
 export type PressInput = {
   data: string
   from: { id: number; username?: string }
   // callback_query.message; absent when Telegram no longer has it.
-  message?: { message_id: number; chat: { id: number; type: string } }
+  message?: {
+    message_id: number
+    chat: { id: number; type: string }
+    reply_markup?: { inline_keyboard: { text: string; callback_data?: string }[][] }
+  }
 }
 
 // The admin's co-owner list (CLAUDE.md §4 «Co-owners on a client install»: the only source,
@@ -181,7 +239,7 @@ export async function handleYesNoPress(p: PressInput, d: PressDeps): Promise<boo
     await toast('Already answered.')
     return true
   }
-  const label = choice === 'y' ? 'Да' : 'Нет'
+  const label = choice === 'y' ? 'Да' : choice === 'n' ? 'Нет' : doneLabelOf(m)
   const message_id = String(m.message_id)
   await d
     .notify({
@@ -193,13 +251,13 @@ export async function handleYesNoPress(p: PressInput, d: PressDeps): Promise<boo
         user: p.from.username ?? fromId,
         user_id: fromId,
         ts: d.now().toISOString(),
-        reaction_added: choice === 'y' ? '👍' : '👎',
+        reaction_added: choice === 'y' ? '👍' : choice === 'n' ? '👎' : DONE_MARK,
         via: 'button',
       },
     })
     .catch(err => d.logError(`telegram channel: failed to deliver yes/no press to Claude: ${err}`))
   // The keyboard swap is cosmetic; its failure never blocks the event above.
-  await d.editMarkup(answeredKeyboard(choice)).catch(err => d.logError(`telegram channel: yes/no keyboard edit failed: ${err}`))
-  await toast(choice === 'y' ? '✅ Да' : '❌ Нет')
+  await d.editMarkup(answeredKeyboard(choice, label)).catch(err => d.logError(`telegram channel: yes/no keyboard edit failed: ${err}`))
+  await toast(answeredKeyboard(choice, label)[0][0].text)
   return true
 }

@@ -94,8 +94,20 @@ A press counts only from the owner (`user.telegram_chat_id`; the lock's owner in
 mode) in his own DM. It reaches the session as the same `event="reaction"` envelope his
 👍/👎 makes (`reaction_added` 👍 for «Да», 👎 for «Нет») plus `via="button"`; the buttons
 turn into one inert «✅ Да» / «❌ Нет». A press never feeds the secretary preview or the
-signed approval channel, and the 👍-only checks in core refuse an envelope with `via`.
-Code: `yes-no.ts`.
+signed approval channel. Core's 👍 check (`tools/owner_approval.py`) refuses an envelope with
+`via` by default (Telegram access, door teardown); only `admin invite-mint` opts in, where
+«Да» counts as his 👍 and a later «Нет» revokes it. Code: `yes-no.ts`.
+
+### «Готово» button
+
+`reply` with `done_button: "<label>"` puts one button under a message that asks the person
+to do something with their own hands — «Готово», or a label that fits the task («Вошёл»,
+«Оплатил»); one line, at most 32 characters. Same switch (`yes-no-buttons`) and the same
+press rules as «Да / Нет»; off → plain text, the result says «button off, answer by text».
+Refused together with `yes_no`, `checklist`, `files`, `voice`, `as_owner_to`. A press
+arrives as the same reaction envelope with `reaction_added` ✅ and `via="button"` — never
+👍, so «done» can never pass as «yes» — and the button turns into an inert «✅ <label>».
+✅ is not a reaction a person can set by hand (Bot API `ReactionTypeEmoji` list).
 
 ## Photos
 
