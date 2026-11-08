@@ -4,19 +4,25 @@
  * payloads and the tool results. Covers switch on (one `yn:d` button on the LAST chunk only, result «+done button»),
  * switch off (no markup, the off suffix) and every incompatible argument (an error, no send).
  *
- * STATE ISOLATION: HOME and TELEGRAM_STATE_DIR are a fresh mkdtemp dir; the switch is resolved by the REAL core
- * sam_data.py copied into a temp core under that HOME (as yes-no.test.ts does) — never the live sam-data.
+ * STATE ISOLATION: HOME and TELEGRAM_STATE_DIR are a fresh mkdtemp dir; the switch is resolved by a tiny
+ * `sam_data.py` fixture under that HOME's core path that implements only `config-get` (prints exactly true / false,
+ * the contract `yesNoButtonsOn` reads) — self-contained: no neighbouring core checkout, never the live sam-data,
+ * nothing skipped (buttons-da-gotovo r2 f4).
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { join } from 'path'
-import { homedir, tmpdir } from 'os'
+import { tmpdir } from 'os'
 
 const OWNER = 111111111
-const REAL_CORE = Bun.env.SAM_CORE_DIR || join(homedir(), 'Workspace', 'ClaudeProjects', 'sam-core')
-const REAL_SAM_DATA = join(REAL_CORE, 'tools', 'sam_data.py')
-const HAVE_CORE = existsSync(REAL_SAM_DATA)
-if (!HAVE_CORE) console.warn(`done-button.server.test: SKIP — no core sam_data.py at ${REAL_SAM_DATA}`)
+// `python3 sam_data.py config-get <key>` → the key's value from config-defaults.json beside it, as true / false.
+const SAM_DATA_FIXTURE = `import json, os, sys
+if len(sys.argv) != 3 or sys.argv[1] != "config-get":
+    sys.exit(2)
+d = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config-defaults.json")))
+v = d["defaults"][sys.argv[2]]["value"]
+print("true" if v is True else "false")
+`
 
 let dir: string
 let defaultsFile: string
@@ -57,7 +63,6 @@ async function reply(args: Record<string, unknown>): Promise<{ text: string; isE
 }
 
 beforeAll(async () => {
-  if (!HAVE_CORE) return
   dir = mkdtempSync(join(tmpdir(), 'tg-done-button-e2e-'))
   const stateDir = join(dir, 'state')
   mkdirSync(stateDir, { recursive: true })
@@ -70,7 +75,7 @@ beforeAll(async () => {
   writeFileSync(join(data, 'config.json'), JSON.stringify({ user: { telegram_chat_id: String(OWNER) } }))
   const tools = join(dir, 'Workspace', 'ClaudeProjects', 'sam-core', 'tools')
   mkdirSync(tools, { recursive: true })
-  copyFileSync(REAL_SAM_DATA, join(tools, 'sam_data.py'))
+  writeFileSync(join(tools, 'sam_data.py'), SAM_DATA_FIXTURE)
   defaultsFile = join(tools, 'config-defaults.json')
   setSwitch(true)
 
@@ -134,7 +139,7 @@ afterAll(() => {
 
 const LONG = 'aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeee' // > 2 × the 20-char chunk limit
 
-describe.skipIf(!HAVE_CORE)('reply done_button — the real call path (r1 f6)', () => {
+describe('reply done_button — the real call path (r1 f6, self-contained r2 f4)', () => {
   test('switch on: one `yn:d` button with the label on the LAST chunk only; result «+done button»', async () => {
     setSwitch(true)
     const r = await reply({ text: LONG, done_button: 'Вошёл' })
