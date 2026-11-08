@@ -424,3 +424,52 @@ describe('D-883 criterion 4 — start-up catch-up (OB-01)', () => {
     expect(JSON.parse(logs[0]).component).toBe('tg-store-catch-up')
   })
 })
+
+// ── archive-store-fixes §2.C (owner tg 39044): a not-kept file leaves a durable named reason ──────────
+describe('archive-store-fixes AC-5 — files/<msg_id>.missing', () => {
+  const filesDir = () => join(archiveChatDir(archive, MAXIM), 'files')
+  const reason = (msg: number) => JSON.parse(readFileSync(join(filesDir(), `${msg}.missing`), 'utf8'))
+
+  test('regression (video 41167 class): download with no file path → `.missing` no_file_path (before: nothing at all)', async () => {
+    const k = createKeeper({ download: fakeDownload({ result: undefined }).download, log: l => logs.push(l) })
+    expect(await k.keep(archive, MAXIM, 41, 'F41')).toBeUndefined()
+    expect(reason(41).error_class).toBe('no_file_path')
+    expect(typeof reason(41).ts).toBe('string')
+    expect(statSync(join(filesDir(), '41.missing')).mode & 0o777).toBe(0o600)
+    expect(keptFilePath(archive, MAXIM, 41)).toBeUndefined()
+  })
+
+  test('too big by size hint, too big by getFile, too big by bytes → `.missing` too_big each', async () => {
+    const k0 = createKeeper({ download: fakeDownload().download, log: l => logs.push(l) })
+    await k0.keep(archive, MAXIM, 42, 'F42', 21 * 1024 * 1024)
+    const k1 = createKeeper({ download: fakeDownload({ result: 'too_big' }).download, log: l => logs.push(l) })
+    await k1.keep(archive, MAXIM, 43, 'F43')
+    const k2 = createKeeper({ download: fakeDownload().download, log: l => logs.push(l), maxBytes: 3 })
+    await k2.keep(archive, MAXIM, 44, 'F44')
+    expect([42, 43, 44].map(m => reason(m).error_class)).toEqual(['too_big', 'too_big', 'too_big'])
+    expect([42, 43, 44].map(m => keptFilePath(archive, MAXIM, m))).toEqual([undefined, undefined, undefined])
+  })
+
+  test('a download error → `.missing` with the closed class only (no URL, no token)', async () => {
+    const err = Object.assign(new Error('fetch https://api.telegram.org/file/bot123:SECRET/x failed'), { code: 'HTTP_404' })
+    const k = createKeeper({ download: fakeDownload({ throws: err }).download, log: l => logs.push(l) })
+    await k.keep(archive, MAXIM, 45, 'F45')
+    expect(reason(45).error_class).toBe('HTTP_404')
+    expect(readFileSync(join(filesDir(), '45.missing'), 'utf8')).not.toContain('SECRET')
+  })
+
+  test('catchUp retries a row that has only `.missing`; a later success leaves the bytes and no `.missing`', async () => {
+    appendArchive(archive, { ts: '2026-10-27T08:00:00.000Z', chat_id: MAXIM, msg_id: 46, sender_id: MAXIM, senderName: MAXIM, kind: 'video', text: '(video)', file_id: 'F46' })
+    const failing = createKeeper({ download: fakeDownload({ result: undefined }).download, log: l => logs.push(l) })
+    const NOW = new Date('2026-10-29T06:00:00Z')
+    const opts = { archiveRoot: archive, ownerId: OWNER, drafts: () => ({}), log: (l: string) => logs.push(l), now: () => NOW }
+    expect((await catchUp({ ...opts, keeper: failing })).kept).toBe(0)
+    expect(reason(46).error_class).toBe('no_file_path')
+    const d = fakeDownload()
+    const r = await catchUp({ ...opts, keeper: createKeeper({ download: d.download, log: l => logs.push(l) }) })
+    expect(d.calls).toEqual(['F46'])
+    expect(r.kept).toBe(1)
+    expect(readdirSync(filesDir()).sort()).toEqual(['46.oga'])
+    expect(keptFilePath(archive, MAXIM, 46)).toBe(join(filesDir(), '46.oga'))
+  })
+})

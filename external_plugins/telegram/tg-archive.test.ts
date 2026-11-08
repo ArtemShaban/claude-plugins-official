@@ -229,6 +229,13 @@ require('node-fetch').default = fake
         for (const f of readdirSync(join(root, chatDir))) {
           const p = join(root, chatDir, f)
           modes[`${chatDir}/${f}`] = statSync(p).mode & 0o777
+          // archive-store-fixes §2.C: the fake getFile has no file_path, so a file message leaves
+          // files/<msg_id>.missing — the kept-files dir is not a month file; its contents still
+          // join rawArchive (the no-token check covers them).
+          if (statSync(p).isDirectory()) {
+            for (const k of readdirSync(p)) rawArchive += readFileSync(join(p, k), 'utf8')
+            continue
+          }
           rawArchive += readFileSync(p, 'utf8')
           archiveFiles[`${chatDir}/${f}`] = readLines(p)
         }
