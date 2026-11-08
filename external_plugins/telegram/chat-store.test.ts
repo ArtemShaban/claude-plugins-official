@@ -6,7 +6,7 @@
  * fake Bot API; no network, nothing under the real ~/Workspace or ~/.claude is touched.
  */
 import { describe, test, expect, beforeEach } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import {
@@ -471,5 +471,96 @@ describe('archive-store-fixes AC-5 — files/<msg_id>.missing', () => {
     expect(r.kept).toBe(1)
     expect(readdirSync(filesDir()).sort()).toEqual(['46.oga'])
     expect(keptFilePath(archive, MAXIM, 46)).toBe(join(filesDir(), '46.oga'))
+  })
+})
+
+// ── archive-store-fixes r1 (verdict 2026-11-09-archive-store-fixes-codex-r1) ──────────────────────────
+describe('archive-store-fixes r1 f12 — kept bytes never sit next to a stale `.missing`', () => {
+  const filesDir = () => join(archiveChatDir(archive, MAXIM), 'files')
+  const seed = (msg: number) => {
+    mkdirSync(filesDir(), { recursive: true, mode: 0o700 })
+    writeFileSync(join(filesDir(), `${msg}.oga`), 'old bytes', { mode: 0o600 })
+    writeFileSync(join(filesDir(), `${msg}.missing`), '{"ts":"2026-10-27T08:00:00.000Z","error_class":"too_big"}\n', { mode: 0o600 })
+  }
+
+  test('keep(): bytes + stale receipt → bytes stay, receipt gone, no download', async () => {
+    seed(51)
+    const d = fakeDownload()
+    const k = createKeeper({ download: d.download, log: l => logs.push(l) })
+    expect(await k.keep(archive, MAXIM, 51, 'F51')).toBe(join(filesDir(), '51.oga'))
+    expect(d.calls).toEqual([])
+    expect(readFileSync(join(filesDir(), '51.oga'), 'utf8')).toBe('old bytes')
+    expect(existsSync(join(filesDir(), '51.missing'))).toBe(false)
+  })
+
+  test('catchUp(): bytes + stale receipt → receipt gone, no download, not counted as kept', async () => {
+    seed(52)
+    appendArchive(archive, { ts: '2026-10-27T08:00:00.000Z', chat_id: MAXIM, msg_id: 52, sender_id: MAXIM, senderName: MAXIM, kind: 'voice', text: '(voice message)', file_id: 'F52' })
+    const d = fakeDownload()
+    const NOW = new Date('2026-10-29T06:00:00Z')
+    const r = await catchUp({ archiveRoot: archive, ownerId: OWNER, drafts: () => ({}), log: (l: string) => logs.push(l), now: () => NOW,
+      keeper: createKeeper({ download: d.download, log: l => logs.push(l) }) })
+    expect(d.calls).toEqual([])
+    expect(r.kept).toBe(0)
+    expect(readdirSync(filesDir()).sort()).toEqual(['52.oga'])
+  })
+
+  test('a receipt that cannot be removed → one closed error line, the bytes stay', async () => {
+    mkdirSync(join(filesDir(), '53.missing'), { recursive: true }) // unlink on a directory fails (EISDIR / EPERM)
+    writeFileSync(join(filesDir(), '53.oga'), 'old bytes', { mode: 0o600 })
+    const k = createKeeper({ download: fakeDownload().download, log: l => logs.push(l) })
+    expect(await k.keep(archive, MAXIM, 53, 'F53')).toBe(join(filesDir(), '53.oga'))
+    expect(readFileSync(join(filesDir(), '53.oga'), 'utf8')).toBe('old bytes')
+    expect(logs.length).toBe(1)
+    const e = JSON.parse(logs[0])
+    expect(e.component).toBe('tg-keep-file')
+    expect(['EISDIR', 'EPERM']).toContain(e.error_class)
+  })
+})
+
+describe('archive-store-fixes r1 f14 — the reason file never leaves the store', () => {
+  const chatDir = () => archiveChatDir(archive, MAXIM)
+  const outcomes: [string, Parameters<typeof fakeDownload>[0], number | undefined][] = [
+    ['no file path', { result: undefined }, undefined],
+    ['too big by hint', {}, 21 * 1024 * 1024],
+    ['too big by getFile', { result: 'too_big' }, undefined],
+    ['a download error', { throws: Object.assign(new Error('x'), { code: 'HTTP_500' }) }, undefined],
+  ]
+
+  test('`files` is a symlink to an outside dir → nothing created outside, one closed error per outcome', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'r1-f14-outside-'))
+    mkdirSync(chatDir(), { recursive: true, mode: 0o700 })
+    symlinkSync(outside, join(chatDir(), 'files'))
+    let msg = 60
+    for (const [, over, hint] of outcomes) {
+      logs.length = 0
+      const k = createKeeper({ download: fakeDownload(over).download, log: l => logs.push(l) })
+      expect(await k.keep(archive, MAXIM, msg, `F${msg}`, hint)).toBeUndefined()
+      expect(readdirSync(outside)).toEqual([])
+      const unsafe = logs.map(l => JSON.parse(l)).filter(e => e.error_class === 'unsafe_path')
+      expect(unsafe.length).toBe(1)
+      msg++
+    }
+  })
+
+  test('the chat dir itself a symlink → nothing created outside', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'r1-f14-outside-'))
+    mkdirSync(archive, { recursive: true, mode: 0o700 })
+    symlinkSync(outside, chatDir())
+    const k = createKeeper({ download: fakeDownload({ result: undefined }).download, log: l => logs.push(l) })
+    expect(await k.keep(archive, MAXIM, 70, 'F70')).toBeUndefined()
+    expect(readdirSync(outside)).toEqual([])
+    expect(logs.map(l => JSON.parse(l).error_class)).toContain('unsafe_path')
+  })
+
+  test('accepted existing dirs end at 0700, the receipt at 0600', async () => {
+    mkdirSync(join(chatDir(), 'files'), { recursive: true, mode: 0o755 })
+    chmodSync(chatDir(), 0o755)
+    chmodSync(join(chatDir(), 'files'), 0o755)
+    const k = createKeeper({ download: fakeDownload({ result: undefined }).download, log: l => logs.push(l) })
+    await k.keep(archive, MAXIM, 71, 'F71')
+    expect(statSync(chatDir()).mode & 0o777).toBe(0o700)
+    expect(statSync(join(chatDir(), 'files')).mode & 0o777).toBe(0o700)
+    expect(statSync(join(chatDir(), 'files', '71.missing')).mode & 0o777).toBe(0o600)
   })
 })
