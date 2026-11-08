@@ -140,8 +140,14 @@ function deps(ownerId: string | undefined = String(OWNER), coOwners: () => Reado
   return { d, calls }
 }
 
-function press(data: string, fromId: number, chat: { id: number; type: string } | null, messageId = 501): PressInput {
-  return { data, from: { id: fromId, username: 'artem' }, ...(chat ? { message: { message_id: messageId, chat } } : {}) }
+// The message as Telegram returns it with the press: it carries the keyboard that was sent (default «Да» «Нет»).
+function press(data: string, fromId: number, chat: { id: number; type: string } | null, messageId = 501,
+               keyboard: { text: string; callback_data?: string }[][] | null = yesNoKeyboard()): PressInput {
+  return {
+    data,
+    from: { id: fromId, username: 'artem' },
+    ...(chat ? { message: { message_id: messageId, chat, ...(keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {}) } } : {}),
+  }
 }
 
 describe('press acceptance (AC-4)', () => {
@@ -396,7 +402,14 @@ describe('done_button: args (AC-06)', () => {
     ['spaces only', '   '],
     ['a newline', 'Гото\nво'],
     ['a carriage return', 'Гото\rво'],
+    // buttons-da-gotovo r1 f4: every other line breaker
+    ['a vertical tab (U+000B)', 'Гото\u000bво'],
+    ['a form feed (U+000C)', 'Гото\u000cво'],
+    ['a next-line (U+0085)', 'Гото\u0085во'],
+    ['a line separator (U+2028)', 'Гото\u2028во'],
+    ['a paragraph separator (U+2029)', 'Гото\u2029во'],
     ['over 32 characters', 'Г'.repeat(33)],
+    ['33 code points, mixed scripts', 'Selesai 完成 ✅ ' + 'ab'.repeat(9) + 'éé'],
     ['not a string', true],
   ] as const) {
     test(`${name} → error`, () => {
@@ -406,6 +419,12 @@ describe('done_button: args (AC-06)', () => {
   test('exactly 32 characters (code points) → ok', () => {
     expect(wantsDoneButton({ done_button: 'Г'.repeat(32) })).toBe('Г'.repeat(32))
   })
+  for (const label of ['Готово', 'Selesai', 'Done', 'Оплатил ✅', '完成了', 'Вошёл в Gojek', '✅'.repeat(32), 'Я'.repeat(31) + '😀']) {
+    test(`ordinary one-line label ${JSON.stringify(label)} → ok (r1 f4)`, () => {
+      expect([...label].length).toBeLessThanOrEqual(32)
+      expect(wantsDoneButton({ done_button: label })).toBe(label)
+    })
+  }
   test('switch off → the result line says «button off, answer by text»', () => {
     expect(SUFFIX_DONE_OFF).toContain('button off, answer by text')
     expect(SUFFIX_DONE_ON).not.toContain('off')
@@ -443,9 +462,9 @@ describe('done_button: press (AC-06)', () => {
     expect(calls.edit).toEqual([[[{ text: '✅ Вошёл', callback_data: 'yn:x' }]]])
     expect(calls.answer).toEqual(['✅ Вошёл'])
   })
-  test('label absent from the returned message → «Готово»', async () => {
+  test('the «Готово» button with an empty label in the returned message → «Готово»', async () => {
     const { d, calls } = deps()
-    await handleYesNoPress(donePress(OWNER, { id: OWNER, type: 'private' }, null), d)
+    await handleYesNoPress(donePress(OWNER, { id: OWNER, type: 'private' }, ' '), d)
     expect(calls.notify[0].content).toBe('(button on message 502: Готово)')
     expect(calls.edit).toEqual([[[{ text: '✅ Готово', callback_data: 'yn:x' }]]])
   })
@@ -481,7 +500,7 @@ describe('done_button: press (AC-06)', () => {
   test('no done case yields 👍 (or 👎)', async () => {
     const { d, calls } = fileDeps(coFile(`${CO}\n`))
     for (const p of [donePress(OWNER, { id: OWNER, type: 'private' }), donePress(CO, { id: CO, type: 'private' }),
-                     donePress(OWNER, { id: OWNER, type: 'private' }, null), donePress(OWNER, { id: OWNER, type: 'private' }, '👍')]) {
+                     donePress(OWNER, { id: OWNER, type: 'private' }, 'Готово'), donePress(OWNER, { id: OWNER, type: 'private' }, '👍')]) {
       await handleYesNoPress(p, d)
     }
     expect(calls.notify.length).toBe(4)
@@ -491,6 +510,39 @@ describe('done_button: press (AC-06)', () => {
       expect(n.meta.reaction_added).not.toContain('👎')
     }
   })
+})
+
+describe('press bound to a button on that message (buttons-da-gotovo r1 f3)', () => {
+  const own = { id: OWNER, type: 'private' }
+  for (const [name, p] of [
+    ['yn:y on a message with only «Готово» (yn:d)', press('yn:y', OWNER, own, 501, doneKeyboard('Готово'))],
+    ['yn:n on a message with only «Готово» (yn:d)', press('yn:n', OWNER, own, 501, doneKeyboard('Готово'))],
+    ['yn:d on a «Да / Нет» keyboard', press('yn:d', OWNER, own, 501, yesNoKeyboard())],
+    ['yn:y with no keyboard on the message', press('yn:y', OWNER, own, 501, null)],
+    ['yn:d with no keyboard on the message', press('yn:d', OWNER, own, 501, null)],
+    ['yn:y after the swap (only the inert button left)', press('yn:y', OWNER, own, 501, answeredKeyboard('n'))],
+  ] as const) {
+    test(`${name} → refused toast, no envelope, no edit`, async () => {
+      const { d, calls } = deps()
+      expect(await handleYesNoPress(p, d)).toBe(true)
+      expect(calls.notify).toEqual([])
+      expect(calls.edit).toEqual([])
+      expect(calls.answer).toEqual(['Question no longer available.'])
+    })
+  }
+  for (const [name, p, glyph] of [
+    ['«Да» on a «Да / Нет» keyboard', press('yn:y', OWNER, own), '👍'],
+    ['«Нет» on a «Да / Нет» keyboard', press('yn:n', OWNER, own), '👎'],
+    ['«Готово» on a «Готово» keyboard', press('yn:d', OWNER, own, 501, doneKeyboard('Готово')), '✅'],
+  ] as const) {
+    test(`genuine ${name} → its glyph`, async () => {
+      const { d, calls } = deps()
+      await handleYesNoPress(p, d)
+      expect(calls.notify.length).toBe(1)
+      expect(calls.notify[0].meta.reaction_added).toBe(glyph)
+      expect(calls.notify[0].meta.via).toBe('button')
+    })
+  }
 })
 
 describe('done_button: server.ts call sites (AC-06)', () => {

@@ -7,7 +7,8 @@
 // itself (`tools/sam_data.py config-get`; owner tg 41857). Off → a plain message.
 // Press: accepted only from the owner (config.json user.telegram_chat_id) or a
 // co-owner (the admin's /etc/sam-telegram-access/co-owners, read fresh per press;
-// spec sam-data dev/analysis/2026-11-04-yes-no-co-owner-spec.md), in their own DM.
+// spec sam-data dev/analysis/2026-11-04-yes-no-co-owner-spec.md), in their own DM, and only
+// for a button that very message carries (callback data checked against its reply_markup).
 // It reaches the session as the SAME reaction envelope his 👍/👎 makes,
 // plus `via="button"`, so every 👍/👎 reader works unchanged; tools/owner_approval.py
 // check_thumbs refuses it by default and counts it only where a rail opts in (invite-mint).
@@ -90,7 +91,8 @@ export function wantsDoneButton(args: {
 }): string | null {
   if (args.done_button == null) return null
   if (typeof args.done_button !== 'string') throw new Error('done_button must be a string (the button label)')
-  if (/[\r\n\u2028\u2029]/.test(args.done_button)) throw new Error('done_button must be one line')
+  // One line: no control character (C0, DEL, C1 — incl. CR, LF, VT, FF, NEL) and no line / paragraph separator.
+  if (/[\p{Cc}\p{Zl}\p{Zp}]/u.test(args.done_button)) throw new Error('done_button must be one line (no control or line-separator characters)')
   const label = args.done_button.trim()
   if (label === '') throw new Error('done_button must not be empty')
   if ([...label].length > DONE_LABEL_MAX) throw new Error(`done_button must be at most ${DONE_LABEL_MAX} characters`)
@@ -237,6 +239,13 @@ export async function handleYesNoPress(p: PressInput, d: PressDeps): Promise<boo
   }
   if (choice === 'x') {
     await toast('Already answered.')
+    return true
+  }
+  // The data must be a button this very message carries (as Telegram returns it): a forged `yn:y` on a message
+  // with only «Готово», with no keyboard, or after the swap never becomes an envelope (buttons-da-gotovo r1 f3).
+  const carried = (m.reply_markup?.inline_keyboard ?? []).some(row => row.some(b => b.callback_data === p.data))
+  if (!carried) {
+    await toast('Question no longer available.')
     return true
   }
   const label = choice === 'y' ? 'Да' : choice === 'n' ? 'Нет' : doneLabelOf(m)
