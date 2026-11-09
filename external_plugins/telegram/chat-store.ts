@@ -17,8 +17,8 @@
 //
 // Pure fs + injected effects (the Bot API download is server.ts's), so it is unit-testable.
 
-import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'fs'
-import { basename, join } from 'path'
+import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'fs'
+import { join } from 'path'
 import { randomBytes } from 'crypto'
 import type { Transformer } from 'grammy'
 import { archiveChatDir, ensureChatDir, outFilePath, type ArchiveLine } from './tg-archive'
@@ -147,12 +147,25 @@ export function keptFilesDir(root: string, chatId: string): string {
   return join(archiveChatDir(root, chatId), 'files')
 }
 
-/** The kept file of this message, if any (`<msg_id>.<ext>`). Never the `<msg_id>.missing` reason file. */
+/**
+ * The kept file of this message, if any (`<msg_id>.<ext>`): a regular file (never a link, FIFO or directory, r2 n2) in
+ * real store directories. Never the `<msg_id>.missing` reason file. An unsafe store path = not kept.
+ */
 export function keptFilePath(root: string, chatId: string, msgId: number): string | undefined {
   const dir = keptFilesDir(root, chatId)
-  if (!existsSync(dir)) return undefined
-  const name = readdirSync(dir).find(n => n.startsWith(`${msgId}.`) && n !== missingFileName(msgId))
-  return name ? join(dir, name) : undefined
+  let names: string[]
+  try {
+    for (const d of [root, archiveChatDir(root, chatId), dir]) realDir(d)
+    names = readdirSync(dir).sort()
+  } catch {
+    return undefined // absent, or not a real directory: nothing kept there that can be trusted
+  }
+  for (const n of names) {
+    if (!n.startsWith(`${msgId}.`) || n === missingFileName(msgId)) continue
+    const p = join(dir, n)
+    if (lstatSync(p).isFile()) return p
+  }
+  return undefined
 }
 
 /**
@@ -167,26 +180,33 @@ export function missingFileName(msgId: number): string {
 
 
 /**
- * r1 f14: the chat dir and its `files` dir for the reason file — each a real directory (never a link or a file)
- * directly under the store root, forced to 0700. Anything else throws `unsafe_path` (logged as a closed class):
- * nothing is created outside the store.
+ * The store's one safe-path rule (= core tools/lib/store_paths.py `real_dir`; r1 f14, r2 f14/n2): `path` is a real
+ * directory — lstat, so never a link or a file. create → mkdir 0700 when absent (a concurrent EEXIST is fine);
+ * priv → chmod 0700. Anything else throws `unsafe_path` (a closed class for storeErrorLine).
  */
-export function privateFilesDir(root: string, chatId: string): string {
-  const chat = archiveChatDir(root, chatId)
-  const files = join(chat, 'files')
-  const unsafe = () => Object.assign(new Error('unsafe store path'), { code: 'unsafe_path' })
-  mkdirSync(root, { recursive: true, mode: 0o700 })
-  for (const d of [chat, files]) {
+export function realDir(path: string, opts: { create?: boolean; priv?: boolean } = {}): string {
+  if (opts.create) {
     try {
-      mkdirSync(d, { mode: 0o700 })
+      mkdirSync(path, { mode: 0o700 })
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err
     }
-    const st = lstatSync(d)
-    if (!st.isDirectory() || st.isSymbolicLink()) throw unsafe()
-    chmodSync(d, 0o700)
   }
-  if (realpathSync(files) !== join(realpathSync(root), basename(chat), 'files')) throw unsafe()
+  if (!lstatSync(path).isDirectory()) throw Object.assign(new Error('unsafe store path'), { code: 'unsafe_path' })
+  if (opts.priv) chmodSync(path, 0o700)
+  return path
+}
+
+/**
+ * The `files` dir every kept file and reason file is written to: the store root (r2 f14: the root itself too),
+ * the chat dir and `files` — each a real directory, forced to 0700, before anything is created inside. Anything
+ * else throws `unsafe_path`: nothing is created outside the store.
+ */
+export function privateFilesDir(root: string, chatId: string): string {
+  if (!existsSync(root)) mkdirSync(root, { recursive: true, mode: 0o700 })
+  realDir(root, { priv: true })
+  realDir(archiveChatDir(root, chatId), { create: true, priv: true })
+  const files = realDir(keptFilesDir(root, chatId), { create: true, priv: true })
   ensureChatDir(root, chatId) // the root's .gitignore, as every store writer
   return files
 }
@@ -252,10 +272,8 @@ export function createKeeper(deps: { download: Download; log: (line: string) => 
         markMissing(root, chatId, msgId, 'too_big')
         return undefined
       }
-      ensureChatDir(root, chatId)
-      const dir = keptFilesDir(root, chatId)
-      mkdirSync(dir, { recursive: true, mode: 0o700 })
-      const ext = got.ext.replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) || 'bin'
+      const dir = privateFilesDir(root, chatId) // r2 f14/n2: bytes only into real store dirs
+      const ext =got.ext.replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) || 'bin'
       const final = join(dir, `${msgId}.${ext}`)
       const tmp = join(dir, `.${msgId}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
       const fd = openSync(tmp, 'wx', 0o600)

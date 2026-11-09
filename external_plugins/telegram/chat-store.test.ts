@@ -6,7 +6,8 @@
  * fake Bot API; no network, nothing under the real ~/Workspace or ~/.claude is touched.
  */
 import { describe, test, expect, beforeEach } from 'bun:test'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'fs'
+import { execFileSync } from 'child_process'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import {
@@ -562,5 +563,112 @@ describe('archive-store-fixes r1 f14 — the reason file never leaves the store'
     expect(statSync(chatDir()).mode & 0o777).toBe(0o700)
     expect(statSync(join(chatDir(), 'files')).mode & 0o777).toBe(0o700)
     expect(statSync(join(chatDir(), 'files', '71.missing')).mode & 0o777).toBe(0o600)
+  })
+})
+
+describe('archive-store-fixes r2 f14 — the store root itself is never followed', () => {
+  const outcomes: [string, Parameters<typeof fakeDownload>[0], number | undefined][] = [
+    ['no file path', { result: undefined }, undefined],
+    ['too big by hint', {}, 21 * 1024 * 1024],
+    ['too big by getFile', { result: 'too_big' }, undefined],
+    ['a download error', { throws: Object.assign(new Error('x'), { code: 'HTTP_500' }) }, undefined],
+  ]
+
+  test('the archive root a symlink to an outside dir → nothing created outside, one closed unsafe_path per outcome', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'r2-f14-outside-'))
+    mkdirSync(join(samDataDir(home), 'state'), { recursive: true })
+    symlinkSync(outside, archive)
+    let msg = 80
+    for (const [name, over, hint] of outcomes) {
+      logs.length = 0
+      const k = createKeeper({ download: fakeDownload(over).download, log: l => logs.push(l) })
+      expect(await k.keep(archive, MAXIM, msg, `F${msg}`, hint)).toBeUndefined()
+      expect([name, readdirSync(outside)]).toEqual([name, []])
+      expect([name, logs.map(l => JSON.parse(l)).filter(e => e.error_class === 'unsafe_path').length]).toEqual([name, 1])
+      msg++
+    }
+  })
+
+  test('an accepted existing root, chat and files dir all end at 0700', async () => {
+    mkdirSync(join(archiveChatDir(archive, MAXIM), 'files'), { recursive: true, mode: 0o755 })
+    for (const d of [archive, archiveChatDir(archive, MAXIM), join(archiveChatDir(archive, MAXIM), 'files')]) chmodSync(d, 0o755)
+    const k = createKeeper({ download: fakeDownload({ result: undefined }).download, log: l => logs.push(l) })
+    await k.keep(archive, MAXIM, 85, 'F85')
+    for (const d of [archive, archiveChatDir(archive, MAXIM), join(archiveChatDir(archive, MAXIM), 'files')]) {
+      expect([d, statSync(d).mode & 0o777]).toEqual([d, 0o700])
+    }
+  })
+})
+
+describe('archive-store-fixes r2 n2 — only a regular file is kept bytes', () => {
+  const filesDir = () => join(archiveChatDir(archive, MAXIM), 'files')
+  const RECEIPT = '{"ts":"2026-10-27T08:00:00.000Z","error_class":"too_big"}\n'
+  const kinds: [string, (p: string, outsideFile: string) => void][] = [
+    ['a symlink to an outside file', (p, o) => symlinkSync(o, p)],
+    ['a FIFO', p => execFileSync('mkfifo', [p])],
+    ['a directory', p => mkdirSync(p)],
+  ]
+  const seed = (msg: number, make: (p: string, o: string) => void) => {
+    const outside = mkdtempSync(join(tmpdir(), 'r2-n2-outside-'))
+    const outsideFile = join(outside, 'secret.oga')
+    writeFileSync(outsideFile, 'OUTSIDE-BYTES')
+    mkdirSync(filesDir(), { recursive: true, mode: 0o700 })
+    make(join(filesDir(), `${msg}.oga`), outsideFile)
+    writeFileSync(join(filesDir(), `${msg}.missing`), RECEIPT, { mode: 0o600 })
+    return { outsideFile, before: statSync(outsideFile).mtimeMs }
+  }
+  const receiptOk = (msg: number) => {
+    const r = JSON.parse(readFileSync(join(filesDir(), `${msg}.missing`), 'utf8'))
+    return Object.keys(r).sort().join(',') === 'error_class,ts'
+  }
+
+  for (const [i, [name, make]] of kinds.entries()) {
+    test(`keep(): <id>.oga ${name} beside .missing → not trusted: a real try, the reason stays, nothing outside read`, async () => {
+      const msg = 90 + i
+      const { outsideFile, before } = seed(msg, make)
+      expect(keptFilePath(archive, MAXIM, msg)).toBeUndefined()
+      const d = fakeDownload({ result: undefined })
+      const k = createKeeper({ download: d.download, log: l => logs.push(l) })
+      expect(await k.keep(archive, MAXIM, msg, `F${msg}`)).toBeUndefined()
+      expect(d.calls).toEqual([`F${msg}`]) // not the fast path
+      expect(receiptOk(msg)).toBe(true) // the missing outcome is not cleared
+      expect(readFileSync(outsideFile, 'utf8')).toBe('OUTSIDE-BYTES')
+      expect(statSync(outsideFile).mtimeMs).toBe(before)
+    })
+
+    test(`catchUp(): <id>.oga ${name} beside .missing → retried, the reason stays`, async () => {
+      const msg = 95 + i
+      const { outsideFile } = seed(msg, make)
+      appendArchive(archive, { ts: '2026-10-27T08:00:00.000Z', chat_id: MAXIM, msg_id: msg, sender_id: MAXIM, senderName: MAXIM, kind: 'voice', text: '(voice message)', file_id: `F${msg}` })
+      const d = fakeDownload({ result: undefined })
+      const r = await catchUp({ archiveRoot: archive, ownerId: OWNER, drafts: () => ({}), log: (l: string) => logs.push(l), now: () => new Date('2026-10-29T06:00:00Z'),
+        keeper: createKeeper({ download: d.download, log: l => logs.push(l) }) })
+      expect(d.calls).toEqual([`F${msg}`])
+      expect(r.kept).toBe(0)
+      expect(receiptOk(msg)).toBe(true)
+      expect(readFileSync(outsideFile, 'utf8')).toBe('OUTSIDE-BYTES')
+    })
+  }
+
+  test('a later real download over a symlink candidate → regular bytes inside the store, the outside file untouched', async () => {
+    const { outsideFile } = seed(99, kinds[0][1])
+    const k = createKeeper({ download: fakeDownload().download, log: l => logs.push(l) })
+    const p = await k.keep(archive, MAXIM, 99, 'F99')
+    expect(p).toBe(join(filesDir(), '99.oga'))
+    expect(lstatSync(p!).isFile()).toBe(true)
+    expect(readFileSync(p!, 'utf8')).toBe('bytes of F99')
+    expect(existsSync(join(filesDir(), '99.missing'))).toBe(false)
+    expect(readFileSync(outsideFile, 'utf8')).toBe('OUTSIDE-BYTES')
+  })
+
+  test('a regular file keeps the f12 fast path (no download, the stale reason removed)', async () => {
+    mkdirSync(filesDir(), { recursive: true, mode: 0o700 })
+    writeFileSync(join(filesDir(), '89.oga'), 'old bytes', { mode: 0o600 })
+    writeFileSync(join(filesDir(), '89.missing'), RECEIPT, { mode: 0o600 })
+    const d = fakeDownload()
+    const k = createKeeper({ download: d.download, log: l => logs.push(l) })
+    expect(await k.keep(archive, MAXIM, 89, 'F89')).toBe(join(filesDir(), '89.oga'))
+    expect(d.calls).toEqual([])
+    expect(existsSync(join(filesDir(), '89.missing'))).toBe(false)
   })
 })
