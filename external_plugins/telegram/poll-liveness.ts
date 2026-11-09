@@ -43,12 +43,13 @@
  *      <ISO ts> pid=<n> attempt=<k> outcome=ok|timeout|network|http_NNN ms=<attempt ms> next_in_s=<pause|0>
  *    Readers: humans and the D-914 T+7 check. No rotation (bounded per run).
  */
-import { closeSync, constants as fsc, fchmodSync, openSync, renameSync, unlinkSync, writeSync } from 'fs'
+import { closeSync, openSync, renameSync, unlinkSync, writeSync } from 'fs'
 import { join } from 'path'
 import { randomBytes } from 'crypto'
 import { GrammyError, type Bot, type PollingOptions, type Transformer } from 'grammy'
 import type { UserFromGetMe } from 'grammy/types'
 import { withTimeout } from './voice-delivery'
+import { createStateLineWriter } from './state-line'
 
 export const POLL_SLACK_S = 15
 export const POLL_FILE = 'poll.json'
@@ -215,29 +216,8 @@ export function createStartupLog(opts: {
 }): (l: StartupLine) => void {
   const pid = opts.pid ?? process.pid
   const now = opts.nowMs ?? Date.now
-  const log = opts.log ?? ((line: string) => { try { process.stderr.write(line) } catch {} })
-  const file = join(opts.stateDir, STARTUP_LOG)
-  let failing = false
-  return l => {
-    try {
-      // O_NOFOLLOW: never append through a symlink planted at the path.
-      const fd = openSync(file, fsc.O_WRONLY | fsc.O_APPEND | fsc.O_CREAT | fsc.O_NOFOLLOW, 0o600)
-      try {
-        fchmodSync(fd, 0o600)
-        writeSync(fd, formatStartupLine(now(), pid, l))
-      } finally {
-        closeSync(fd)
-      }
-      failing = false
-    } catch (err) {
-      if (!failing) {
-        failing = true
-        const code = (err as { code?: unknown } | null)?.code
-        const safe = typeof code === 'string' && /^[A-Z0-9_]{1,24}$/.test(code) ? code : 'unknown'
-        log(`telegram channel: startup.log write failed (${safe}), startup continues\n`)
-      }
-    }
-  }
+  const write = createStateLineWriter({ file: join(opts.stateDir, STARTUP_LOG), goesOn: 'startup continues', log: opts.log })
+  return l => write(formatStartupLine(now(), pid, l))
 }
 
 class StartupDeadline extends Error {

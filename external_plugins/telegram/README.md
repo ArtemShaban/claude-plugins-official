@@ -117,6 +117,22 @@ local path is included in the `<channel>` notification so the assistant can
 `Read` it. Telegram compresses photos — if you need the original file, send it
 as a document instead (long-press → Send as File).
 
+## Voice journal
+
+Every inbound voice the bridge tries to transcribe leaves one line in
+`~/.claude/channels/telegram/voice.log` (`TELEGRAM_STATE_DIR`; mode 0600, append-only,
+no rotation) — the plugin's stderr is not kept anywhere durable. One line, key=value:
+
+```
+2026-11-09T01:17:47.123Z pid=735 chat=22276 msg=44440 size=12345 dur_s=7 dl=ok dl_ms=400 tr=empty tr_ms=2800 tr_len=0 outcome=placeholder:empty total_ms=3300
+```
+
+`dl` / `tr` = `ok` · `none` (no file: over the cap, no file_path) · `empty` (no words) · an
+error class (`timeout`, `network`, `http_<code>`, `exit_<code>`, `sys_<CODE>`, `error`); `-` = the
+leg did not run. `outcome` = `bridge` (the session got the transcript) or
+`placeholder:<no_cmd|download|transcribe|empty|timeout>` (it got `(voice message)`, or the caption alone). Never the
+transcript, the caption, a path or an error text. Code: `voice-delivery.ts` (`formatVoiceLine`).
+
 ## No history or search
 
 Telegram's Bot API exposes **neither** message history nor search. The bot

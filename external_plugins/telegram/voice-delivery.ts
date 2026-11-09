@@ -17,6 +17,7 @@
 import type { Chat, MessageOrigin, User } from 'grammy/types'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { createStateLineWriter } from './state-line'
 
 // ── per-key FIFO serializer (OB-09 — owner tg 17093, "это оч важно": text1 →
 // voice → text2 must reach the session in that same order, even when the
@@ -353,6 +354,118 @@ export type VoiceDeliveryEffects = {
   download: () => Promise<string | undefined>
   transcribe: (audioPath: string) => Promise<string>
   logNotice: (reason: string) => void
+  /** Per-voice journal (owner tg 44445): filled leg by leg; the caller writes ONE line from it. */
+  journal?: VoiceJournal
+  nowMs?: () => number
+}
+
+// ── per-voice journal (owner tg 44440 → proposal 44442 → «да» 44445) ─────────
+// One line per voice in STATE_DIR/voice.log: what each leg did, how long, and the
+// closed class of an error. Never the transcript, the caption, a file path or an
+// error text (the bot token lives in file URLs and grammY messages).
+
+export type VoiceErrorClass = 'timeout' | 'network' | 'error' | `http_${number}` | `exit_${number}` | `sys_${string}`
+/** A leg's result: ok · none (download gave no file) · empty (no words) · an error class. */
+export type VoiceStepResult = 'ok' | 'none' | 'empty' | VoiceErrorClass
+
+export interface VoiceJournal {
+  dl?: VoiceStepResult
+  dl_ms?: number
+  tr?: VoiceStepResult
+  tr_ms?: number
+  /** Transcript length in UTF-16 units — the length only, never the text. */
+  tr_len?: number
+}
+
+/** Closed-set class of a download / transcribe failure — derived from the error, never copied. */
+export function voiceErrorClass(err: unknown): VoiceErrorClass {
+  const e = err as { message?: unknown; error_code?: unknown; code?: unknown; name?: unknown } | null
+  const msg = typeof e?.message === 'string' ? e.message : ''
+  const http = (n: unknown): VoiceErrorClass | undefined => {
+    const c = typeof n === 'string' ? Number(n) : n
+    return typeof c === 'number' && Number.isInteger(c) && c >= 100 && c <= 999 ? `http_${c}` : undefined
+  }
+  if (/timed out/.test(msg)) return 'timeout'
+  const byCode = http(e?.error_code) ?? http(/HTTP (\d{3})\b/.exec(msg)?.[1])
+  if (byCode) return byCode
+  const exited = /exited (\d{1,3})\b/.exec(msg)?.[1]
+  if (exited != null) return `exit_${Number(exited)}`
+  if (typeof e?.code === 'string' && /^[A-Z0-9_]{1,24}$/.test(e.code)) return `sys_${e.code}`
+  if (e?.name === 'HttpError' || e?.name === 'TypeError') return 'network'
+  return 'error'
+}
+
+/** What the session got: the bridge transcript, or the placeholder and the one reason why. */
+export type VoiceOutcome =
+  | 'bridge'
+  | 'placeholder:no_cmd'
+  | 'placeholder:download'
+  | 'placeholder:transcribe'
+  | 'placeholder:empty'
+  | 'placeholder:timeout'
+
+/** The outcome of a finished delivery: what the session got, and for the placeholder the first leg that failed. */
+export function voiceOutcomeOf(o: {
+  cmdConfigured: boolean
+  journal: VoiceJournal
+  deliveredBridge: boolean
+  timedOut: boolean
+}): VoiceOutcome {
+  const j = o.journal
+  if (o.deliveredBridge) return 'bridge'
+  if (!o.cmdConfigured) return 'placeholder:no_cmd'
+  if (o.timedOut) return 'placeholder:timeout'
+  if (j.dl !== 'ok') return 'placeholder:download'
+  if (j.tr === 'empty') return 'placeholder:empty'
+  return 'placeholder:transcribe'
+}
+
+export interface VoiceLineFields {
+  chat: string
+  msg: number | undefined
+  size?: number
+  durS?: number
+  journal: VoiceJournal
+  outcome: VoiceOutcome
+  totalMs: number
+}
+
+const VOICE_RESULT_RE = /^(ok|none|empty|timeout|network|error|http_[0-9]{3}|exit_[0-9]{1,3}|sys_[A-Z0-9_]{1,24})$/
+const OUTCOME_LINE_RE = /^(bridge|placeholder:(no_cmd|download|transcribe|empty|timeout))$/
+
+/** One voice.log line, key=value; an absent field is `-`, so every line has the same keys. */
+export function formatVoiceLine(tsMs: number, pid: number, f: VoiceLineFields): string {
+  const num = (n: number | undefined) =>
+    typeof n === 'number' && Number.isFinite(n) && n >= 0 ? String(Math.round(n)) : '-'
+  const res = (r: string | undefined) => (r == null ? '-' : VOICE_RESULT_RE.test(r) ? r : 'error')
+  const chat = /^-?[0-9]{1,20}$/.test(f.chat) ? f.chat : '-'
+  const outcome = OUTCOME_LINE_RE.test(f.outcome) ? f.outcome : 'placeholder:transcribe'
+  const j = f.journal
+  return (
+    `${new Date(tsMs).toISOString()} pid=${num(pid)} chat=${chat} msg=${num(f.msg)}` +
+    ` size=${num(f.size)} dur_s=${num(f.durS)}` +
+    ` dl=${res(j.dl)} dl_ms=${num(j.dl_ms)} tr=${res(j.tr)} tr_ms=${num(j.tr_ms)} tr_len=${num(j.tr_len)}` +
+    ` outcome=${outcome} total_ms=${num(f.totalMs)}\n`
+  )
+}
+
+export const VOICE_LOG = 'voice.log'
+
+/** Appender for STATE_DIR/voice.log. Never throws (fail-open): a logging fault never touches delivery. */
+export function createVoiceLog(opts: {
+  stateDir: string
+  pid?: number
+  nowMs?: () => number
+  log?: (line: string) => void
+}): (f: VoiceLineFields) => void {
+  const pid = opts.pid ?? process.pid
+  const now = opts.nowMs ?? Date.now
+  const write = createStateLineWriter({ file: join(opts.stateDir, VOICE_LOG), goesOn: 'delivery continues', log: opts.log })
+  return f => {
+    try {
+      write(formatVoiceLine(now(), pid, f))
+    } catch {}
+  }
 }
 
 export async function deliverVoiceTranscript(
@@ -368,13 +481,20 @@ export async function deliverVoiceTranscript(
     return fallback
   }
 
+  // Journal writes are plain field sets on a caller-owned object — they cannot throw.
+  const j: VoiceJournal = fx.journal ?? {}
+  const now = fx.nowMs ?? Date.now
+
   let audioPath: string | undefined
   let downloadErr: unknown
+  const dlStart = now()
   try {
     audioPath = await fx.download()
   } catch (err) {
     downloadErr = err
   }
+  j.dl_ms = now() - dlStart
+  j.dl = audioPath ? 'ok' : downloadErr !== undefined ? voiceErrorClass(downloadErr) : 'none'
   if (!audioPath) {
     fx.logNotice(
       `voice download failed/skipped — falling back to placeholder${downloadErr ? `: ${downloadErr}` : ''}`,
@@ -383,16 +503,23 @@ export async function deliverVoiceTranscript(
   }
 
   let transcript: string
+  const trStart = now()
   try {
     transcript = (await fx.transcribe(audioPath)).trim()
   } catch (err) {
+    j.tr_ms = now() - trStart
+    j.tr = voiceErrorClass(err)
     fx.logNotice(`voice transcription failed — falling back to placeholder: ${err}`)
     return fallback
   }
+  j.tr_ms = now() - trStart
+  j.tr_len = transcript.length
   if (!transcript) {
+    j.tr = 'empty'
     fx.logNotice('voice transcription produced empty output (silence?) — falling back to placeholder')
     return fallback
   }
+  j.tr = 'ok'
 
   // Caption is preserved (R9): caption, blank line, transcript.
   const text = caption ? `${caption}\n\n${transcript}` : transcript

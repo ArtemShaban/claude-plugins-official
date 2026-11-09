@@ -73,6 +73,7 @@ import {
   type ChecklistItem,
 } from './checklist'
 import {
+  createVoiceLog,
   deliverVoiceTranscript,
   DOWNLOAD_TIMEOUT_MS,
   forwardDateMeta,
@@ -83,7 +84,9 @@ import {
   userVoiceConfig,
   voiceAuthor,
   whisperTimeoutMs,
+  voiceOutcomeOf,
   withTimeout,
+  type VoiceJournal,
 } from './voice-delivery'
 import { chooseAccess, detectLockMode, lockOwnerId, lockedAccessReader, ownerGate } from './access-lock'
 import { spawn } from 'child_process'
@@ -255,6 +258,8 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 const SHUTDOWN_LOG = join(STATE_DIR, 'shutdown.log')
+// One line per incoming voice (owner tg 44445): STATE_DIR/voice.log — plugin stderr is kept nowhere.
+const voiceLog = createVoiceLog({ stateDir: STATE_DIR, log: safeStderr })
 
 // Append one line to shutdown.log so post-mortem analysis can find the cause.
 // Synchronous write — the process may exit immediately after. Never throws
@@ -2343,8 +2348,14 @@ async function handleInbound(
       const sizeHint = attachment.size
       const voiceLogNotice = (reason: string) =>
         safeStderr(`telegram channel: voice transcribe (chat=${chat_id} msg=${msgId ?? '?'}): ${reason}\n`)
+      // Per-voice journal: the delivery fills it leg by leg; ONE line is written below, after the
+      // outer timeout settles, so a timed-out voice still gets exactly one line (with the legs done so far).
+      const journal: VoiceJournal = {}
+      const voiceStart = Date.now()
+      let envelopeTimedOut = false
       const envelope = await withTimeout(
         deliverVoiceTranscript(TRANSCRIBE_CMD != null, ctx.message?.caption, author, {
+          journal,
           // D-883: someone else's voice is delivered from the chat store (its transcript lands
           // next to it — core transcribe.sh); his own, or a store failure, keeps the inbox path.
           download: async () =>
@@ -2378,10 +2389,30 @@ async function handleInbound(
         // per the owner's "чем проще чем лучше" order (tg 17096): it bounds
         // the chain, which is the actual failure mode (a permanently wedged
         // chat), not a resource leak on an already-rare stalled connection.
-        () => voiceLogNotice(`voice envelope timed out after ${timeoutMs + DOWNLOAD_TIMEOUT_MS}ms`),
-      ).catch(() => ({ text: ctx.message?.caption ?? '(voice message)', meta: {} }))
+        () => {
+          envelopeTimedOut = true
+          voiceLogNotice(`voice envelope timed out after ${timeoutMs + DOWNLOAD_TIMEOUT_MS}ms`)
+        },
+      ).catch(() => ({ text: ctx.message?.caption ?? '(voice message)', meta: {} as Record<string, string> }))
       bodyText = envelope.text
       voiceMeta = envelope.meta
+      // Fail-open: voiceLog never throws; the extra try keeps even a bug here off the delivery path.
+      try {
+        voiceLog({
+          chat: chat_id,
+          msg: msgId,
+          size: sizeHint,
+          durS: attachment.duration,
+          journal: { ...journal },
+          outcome: voiceOutcomeOf({
+            cmdConfigured: TRANSCRIBE_CMD != null,
+            journal,
+            deliveredBridge: voiceMeta.transcript_source === 'bridge',
+            timedOut: envelopeTimedOut,
+          }),
+          totalMs: Date.now() - voiceStart,
+        })
+      } catch {}
     } else if (downloadImage) {
       imagePath = await withTimeout(
         downloadImage(),
