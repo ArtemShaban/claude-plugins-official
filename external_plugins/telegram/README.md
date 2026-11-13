@@ -93,7 +93,8 @@ off, or not resolvable → the text goes plain and the result says the buttons a
 A press counts only from the owner (`user.telegram_chat_id`; the lock's owner in locked
 mode) in his own DM. It reaches the session as the same `event="reaction"` envelope his
 👍/👎 makes (`reaction_added` 👍 for «Да», 👎 for «Нет») plus `via="button"`; the buttons
-turn into one inert «✅ Да» / «❌ Нет». A press never feeds the secretary preview or the
+turn into one inert «✅ Да» / «❌ Нет». Captions and toasts follow config `user.language` as it is at
+that moment (ru / en / id, else en; `ui-lang.ts`); the envelope stays «Да» / «Нет» in every language. A press never feeds the secretary preview or the
 signed approval channel. Core's 👍 check (`tools/owner_approval.py`) refuses an envelope with
 `via` by default (Telegram access, door teardown); only `admin invite-mint` opts in, where
 «Да» counts as his 👍 and a later «Нет» revokes it. Code: `yes-no.ts`.

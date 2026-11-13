@@ -22,7 +22,7 @@ import {
   type PressDeps,
   type PressInput,
 } from './yes-no'
-import { UI_CAPTIONS, type UiLang, uiLang } from './ui-lang'
+import { UI_CAPTIONS, type UiLang, uiLang, uiLangOf } from './ui-lang'
 
 const OWNER = 111222333
 const OTHER = 444555666
@@ -362,7 +362,7 @@ describe('server.ts call sites', () => {
     expect(b).toContain('if (yesNoHandled) return')
   })
   test('AC-1: the keyboard goes on the last chunk only, and only when the switch is on', () => {
-    expect(SRC).toContain('...(yesNoOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: yesNoKeyboard(UI_LANG) } } : {}),')
+    expect(SRC).toContain('...(yesNoOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: yesNoKeyboard(uiLangOf(homedir())) } } : {}),')
     expect(SRC).toContain('const yesNoOn = yesNo && yesNoButtonsOn(homedir())')
   })
   test('AC-3: the arg check runs before the secretary and checklist branches', () => {
@@ -605,10 +605,29 @@ describe('ui language (tg 46811)', () => {
       expect(t.calls.answer).toEqual([UI_CAPTIONS[lang].notAuthorized, UI_CAPTIONS[lang].alreadyAnswered])
     })
   }
-  test('server.ts: the language is read once from the config language and passed to the keyboard and the press', () => {
+  test('server.ts: the language is resolved at the keyboard and at the press, never once at start (review F1)', () => {
     const SRC = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-    expect(SRC).toContain('const UI_LANG = uiLang(USER_VOICE_LANG)')
-    expect(SRC).toContain('      lang: UI_LANG,\n')
+    expect(SRC).toContain('inline_keyboard: yesNoKeyboard(uiLangOf(homedir())) }')
+    expect(SRC).toContain('      lang: uiLangOf(homedir()),\n')
+    expect(SRC).not.toContain('UI_LANG')
     expect(SRC).not.toContain('yesNoKeyboard()')
+  })
+  test('language written mid-session (onboarding step 0) → the next keyboard and press use it, no restart (review F1)', async () => {
+    const h = mkdtempSync(join(tmpdir(), 'ui-lang-home-'))
+    const dataDir = join(h, 'Workspace', 'ClaudeProjects', 'sam-data')
+    mkdirSync(dataDir, { recursive: true })
+    const cfg = join(dataDir, 'config.json')
+    writeFileSync(cfg, JSON.stringify({ user: { telegram_chat_id: String(OWNER) } }))
+    expect(yesNoKeyboard(uiLangOf(h))).toEqual([[{ text: 'Yes', callback_data: 'yn:y' }, { text: 'No', callback_data: 'yn:n' }]])
+    writeFileSync(cfg, JSON.stringify({ user: { telegram_chat_id: String(OWNER), language: 'ru' } }))
+    const kb = yesNoKeyboard(uiLangOf(h))
+    expect(kb).toEqual([[{ text: 'Да', callback_data: 'yn:y' }, { text: 'Нет', callback_data: 'yn:n' }]])
+    const { d, calls } = deps(String(OWNER), () => new Set(), uiLangOf(h))
+    await handleYesNoPress(press('yn:y', OWNER, { id: OWNER, type: 'private' }, 501, kb), d)
+    expect(calls.answer).toEqual(['✅ Да'])
+    expect(calls.notify[0].content).toBe('(button on message 501: Да)')
+    expect(calls.notify[0].meta.reaction_added).toBe('👍')
+    expect(calls.notify[0].meta.via).toBe('button')
+    expect(uiLangOf(join(h, 'no-such-home'))).toBe('en')
   })
 })
