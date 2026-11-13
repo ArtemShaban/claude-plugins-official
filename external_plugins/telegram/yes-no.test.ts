@@ -8,7 +8,11 @@ import { join } from 'path'
 import { homedir, tmpdir } from 'os'
 import {
   answeredKeyboard,
+  doneKeyboard,
   handleYesNoPress,
+  SUFFIX_DONE_OFF,
+  SUFFIX_DONE_ON,
+  wantsDoneButton,
   parseCoOwners,
   parseYesNoData,
   readCoOwners,
@@ -18,6 +22,7 @@ import {
   type PressDeps,
   type PressInput,
 } from './yes-no'
+import { UI_CAPTIONS, type UiLang, uiLang, uiLangOf } from './ui-lang'
 
 const OWNER = 111222333
 const OTHER = 444555666
@@ -82,11 +87,11 @@ describe.skipIf(!HAVE_CORE)('switch = core default ⊕ override (AC-1/AC-2 input
 
 describe('keyboard (AC-1)', () => {
   test('one row, exactly «Да» «Нет»', () => {
-    expect(yesNoKeyboard()).toEqual([[{ text: 'Да', callback_data: 'yn:y' }, { text: 'Нет', callback_data: 'yn:n' }]])
+    expect(yesNoKeyboard('ru')).toEqual([[{ text: 'Да', callback_data: 'yn:y' }, { text: 'Нет', callback_data: 'yn:n' }]])
   })
   test('answered = one inert button', () => {
-    expect(answeredKeyboard('y')).toEqual([[{ text: '✅ Да', callback_data: 'yn:x' }]])
-    expect(answeredKeyboard('n')).toEqual([[{ text: '❌ Нет', callback_data: 'yn:x' }]])
+    expect(answeredKeyboard('y', 'ru')).toEqual([[{ text: '✅ Да', callback_data: 'yn:x' }]])
+    expect(answeredKeyboard('n', 'ru')).toEqual([[{ text: '❌ Нет', callback_data: 'yn:x' }]])
   })
   test('callback data', () => {
     expect(parseYesNoData('yn:y')).toBe('y')
@@ -122,10 +127,11 @@ describe('wantsYesNo (AC-3)', () => {
   })
 })
 
-function deps(ownerId: string | undefined = String(OWNER), coOwners: () => ReadonlySet<string> = () => new Set()) {
+function deps(ownerId: string | undefined = String(OWNER), coOwners: () => ReadonlySet<string> = () => new Set(), lang: UiLang = 'ru') {
   const calls = { answer: [] as string[], edit: [] as unknown[], notify: [] as { content: string; meta: Record<string, string> }[], errors: [] as string[] }
   const d: PressDeps = {
     ownerId,
+    lang,
     coOwners,
     answer: async t => { calls.answer.push(t) },
     editMarkup: async k => { calls.edit.push(k) },
@@ -136,8 +142,14 @@ function deps(ownerId: string | undefined = String(OWNER), coOwners: () => Reado
   return { d, calls }
 }
 
-function press(data: string, fromId: number, chat: { id: number; type: string } | null, messageId = 501): PressInput {
-  return { data, from: { id: fromId, username: 'artem' }, ...(chat ? { message: { message_id: messageId, chat } } : {}) }
+// The message as Telegram returns it with the press: it carries the keyboard that was sent (default «Да» «Нет»).
+function press(data: string, fromId: number, chat: { id: number; type: string } | null, messageId = 501,
+               keyboard: { text: string; callback_data?: string }[][] | null = yesNoKeyboard('ru')): PressInput {
+  return {
+    data,
+    from: { id: fromId, username: 'artem' },
+    ...(chat ? { message: { message_id: messageId, chat, ...(keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {}) } } : {}),
+  }
 }
 
 describe('press acceptance (AC-4)', () => {
@@ -196,7 +208,7 @@ describe('accepted press (AC-5)', () => {
     await handleYesNoPress(press('yn:x', OWNER, { id: OWNER, type: 'private' }), d)
     expect(calls.notify).toEqual([])
     expect(calls.edit).toEqual([])
-    expect(calls.answer).toEqual(['Already answered.'])
+    expect(calls.answer).toEqual(['Уже ответили.'])
   })
   test('edit failure never blocks the event', async () => {
     const { d, calls } = deps()
@@ -301,7 +313,7 @@ describe('co-owner press (spec 2026-11-04 AC-1..AC-4)', () => {
       expect(await handleYesNoPress(p, d)).toBe(true)
       expect(calls.notify).toEqual([])
       expect(calls.edit).toEqual([])
-      expect(calls.answer).toEqual(['Not authorized.'])
+      expect(calls.answer).toEqual(['Нет доступа.'])
     })
   }
   test('AC-3: file unreadable → refused + one stderr line', async () => {
@@ -310,7 +322,7 @@ describe('co-owner press (spec 2026-11-04 AC-1..AC-4)', () => {
     const { d, calls, readerErrors } = fileDeps(f)
     await handleYesNoPress(press('yn:y', CO, own), d)
     expect(calls.notify).toEqual([])
-    expect(calls.answer).toEqual(['Not authorized.'])
+    expect(calls.answer).toEqual(['Нет доступа.'])
     expect(readerErrors.length).toBe(1)
   })
   test('AC-4: fresh read — refused, accepted after add, refused after remove, same deps', async () => {
@@ -323,7 +335,7 @@ describe('co-owner press (spec 2026-11-04 AC-1..AC-4)', () => {
     writeFileSync(f, '')
     await handleYesNoPress(p, d)
     expect(calls.notify.length).toBe(1)
-    expect(calls.answer).toEqual(['Not authorized.', '✅ Да', 'Not authorized.'])
+    expect(calls.answer).toEqual(['Нет доступа.', '✅ Да', 'Нет доступа.'])
   })
 })
 
@@ -350,7 +362,7 @@ describe('server.ts call sites', () => {
     expect(b).toContain('if (yesNoHandled) return')
   })
   test('AC-1: the keyboard goes on the last chunk only, and only when the switch is on', () => {
-    expect(SRC).toContain('...(yesNoOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: yesNoKeyboard() } } : {}),')
+    expect(SRC).toContain('...(yesNoOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: yesNoKeyboard(uiLangOf(homedir())) } } : {}),')
     expect(SRC).toContain('const yesNoOn = yesNo && yesNoButtonsOn(homedir())')
   })
   test('AC-3: the arg check runs before the secretary and checklist branches', () => {
@@ -362,5 +374,260 @@ describe('server.ts call sites', () => {
   test('AC-2: the result names the switch state; result still starts with "sent"', () => {
     expect(SRC).toContain('const yesNoNote = yesNo ? (yesNoOn ? SUFFIX_ON : SUFFIX_OFF) : \'\'')
     expect(SRC).toContain("text: result + voiceNote + yesNoNote")
+  })
+})
+
+// «Готово» button (buttons spec sam-data dev/analysis/2026-11-08-buttons-da-gotovo-spec.md §2.4, §5, AC-06):
+// one button under a «do X, tell me» message; a press = ✅ via=button, never 👍.
+describe('done_button: args (AC-06)', () => {
+  test('absent → no button', () => {
+    expect(wantsDoneButton({})).toBeNull()
+    expect(wantsDoneButton({ done_button: undefined })).toBeNull()
+  })
+  test('a label → one row, one button with that label', () => {
+    expect(wantsDoneButton({ done_button: 'Готово' })).toBe('Готово')
+    expect(doneKeyboard('Оплатил')).toEqual([[{ text: 'Оплатил', callback_data: 'yn:d' }]])
+  })
+  for (const [name, extra] of [
+    ['yes_no', { yes_no: true }],
+    ['checklist', { checklist: ['a'] }],
+    ['files', { files: ['/tmp/x.png'] }],
+    ['voice', { voice: true }],
+    ['as_owner_to', { as_owner_to: '123' }],
+  ] as const) {
+    test(`with ${name} → error`, () => {
+      expect(() => wantsDoneButton({ done_button: 'Готово', ...extra })).toThrow(new RegExp(name))
+    })
+  }
+  for (const [name, v] of [
+    ['empty', ''],
+    ['spaces only', '   '],
+    ['a newline', 'Гото\nво'],
+    ['a carriage return', 'Гото\rво'],
+    // buttons-da-gotovo r1 f4: every other line breaker
+    ['a vertical tab (U+000B)', 'Гото\u000bво'],
+    ['a form feed (U+000C)', 'Гото\u000cво'],
+    ['a next-line (U+0085)', 'Гото\u0085во'],
+    ['a line separator (U+2028)', 'Гото\u2028во'],
+    ['a paragraph separator (U+2029)', 'Гото\u2029во'],
+    ['over 32 characters', 'Г'.repeat(33)],
+    ['33 code points, mixed scripts', 'Selesai 完成 ✅ ' + 'ab'.repeat(9) + 'éé'],
+    ['not a string', true],
+  ] as const) {
+    test(`${name} → error`, () => {
+      expect(() => wantsDoneButton({ done_button: v })).toThrow()
+    })
+  }
+  test('exactly 32 characters (code points) → ok', () => {
+    expect(wantsDoneButton({ done_button: 'Г'.repeat(32) })).toBe('Г'.repeat(32))
+  })
+  for (const label of ['Готово', 'Selesai', 'Done', 'Оплатил ✅', '完成了', 'Вошёл в Gojek', '✅'.repeat(32), 'Я'.repeat(31) + '😀']) {
+    test(`ordinary one-line label ${JSON.stringify(label)} → ok (r1 f4)`, () => {
+      expect([...label].length).toBeLessThanOrEqual(32)
+      expect(wantsDoneButton({ done_button: label })).toBe(label)
+    })
+  }
+  test('switch off → the result line says «button off, answer by text»', () => {
+    expect(SUFFIX_DONE_OFF).toContain('button off, answer by text')
+    expect(SUFFIX_DONE_ON).not.toContain('off')
+  })
+})
+
+function donePress(fromId: number, chat: { id: number; type: string } | null, label: string | null = 'Вошёл', data = 'yn:d'): PressInput {
+  const kb = label == null ? undefined : { inline_keyboard: [[{ text: label, callback_data: 'yn:d' }]] }
+  return {
+    data,
+    from: { id: fromId, username: 'artem' },
+    ...(chat ? { message: { message_id: 502, chat, ...(kb ? { reply_markup: kb } : {}) } } : {}),
+  }
+}
+
+describe('done_button: press (AC-06)', () => {
+  test('owner in his DM → one envelope with ✅ + via=button + that message id; keyboard → inert ✅ <label>', async () => {
+    const { d, calls } = deps()
+    expect(await handleYesNoPress(donePress(OWNER, { id: OWNER, type: 'private' }), d)).toBe(true)
+    expect(calls.notify).toEqual([
+      {
+        content: '(button on message 502: Вошёл)',
+        meta: {
+          event: 'reaction',
+          chat_id: String(OWNER),
+          message_id: '502',
+          user: 'artem',
+          user_id: String(OWNER),
+          ts: '2026-11-01T10:00:00.000Z',
+          reaction_added: '✅',
+          via: 'button',
+        },
+      },
+    ])
+    expect(calls.edit).toEqual([[[{ text: '✅ Вошёл', callback_data: 'yn:x' }]]])
+    expect(calls.answer).toEqual(['✅ Вошёл'])
+  })
+  test('the «Готово» button with an empty label in the returned message → «Готово»', async () => {
+    const { d, calls } = deps()
+    await handleYesNoPress(donePress(OWNER, { id: OWNER, type: 'private' }, ' '), d)
+    expect(calls.notify[0].content).toBe('(button on message 502: Готово)')
+    expect(calls.edit).toEqual([[[{ text: '✅ Готово', callback_data: 'yn:x' }]]])
+  })
+  test('co-owner in their own DM → the same envelope with their user_id', async () => {
+    const { d, calls } = fileDeps(coFile(`${CO}\n`))
+    await handleYesNoPress(donePress(CO, { id: CO, type: 'private' }), d)
+    expect(calls.notify.length).toBe(1)
+    expect(calls.notify[0].meta.user_id).toBe(String(CO))
+    expect(calls.notify[0].meta.chat_id).toBe(String(CO))
+    expect(calls.notify[0].meta.reaction_added).toBe('✅')
+    expect(calls.notify[0].meta.via).toBe('button')
+  })
+  for (const [name, p] of [
+    ['another id', donePress(OTHER, { id: OTHER, type: 'private' })],
+    ['an unknown id in the owner DM', donePress(OTHER, { id: OWNER, type: 'private' })],
+    ['the owner in a group', donePress(OWNER, { id: -100123, type: 'supergroup' })],
+    ['a vanished message', donePress(OWNER, null)],
+  ] as const) {
+    test(`${name} → toast only, no envelope`, async () => {
+      const { d, calls } = deps()
+      expect(await handleYesNoPress(p, d)).toBe(true)
+      expect(calls.notify).toEqual([])
+      expect(calls.edit).toEqual([])
+      expect(calls.answer.length).toBe(1)
+    })
+  }
+  test('press after the swap → «Already answered.», no envelope', async () => {
+    const { d, calls } = deps()
+    await handleYesNoPress(donePress(OWNER, { id: OWNER, type: 'private' }, '✅ Вошёл', 'yn:x'), d)
+    expect(calls.notify).toEqual([])
+    expect(calls.answer).toEqual(['Уже ответили.'])
+  })
+  test('no done case yields 👍 (or 👎)', async () => {
+    const { d, calls } = fileDeps(coFile(`${CO}\n`))
+    for (const p of [donePress(OWNER, { id: OWNER, type: 'private' }), donePress(CO, { id: CO, type: 'private' }),
+                     donePress(OWNER, { id: OWNER, type: 'private' }, 'Готово'), donePress(OWNER, { id: OWNER, type: 'private' }, '👍')]) {
+      await handleYesNoPress(p, d)
+    }
+    expect(calls.notify.length).toBe(4)
+    for (const n of calls.notify) {
+      expect(n.meta.reaction_added).toBe('✅')
+      expect(n.meta.reaction_added).not.toContain('👍')
+      expect(n.meta.reaction_added).not.toContain('👎')
+    }
+  })
+})
+
+describe('press bound to a button on that message (buttons-da-gotovo r1 f3)', () => {
+  const own = { id: OWNER, type: 'private' }
+  for (const [name, p] of [
+    ['yn:y on a message with only «Готово» (yn:d)', press('yn:y', OWNER, own, 501, doneKeyboard('Готово'))],
+    ['yn:n on a message with only «Готово» (yn:d)', press('yn:n', OWNER, own, 501, doneKeyboard('Готово'))],
+    ['yn:d on a «Да / Нет» keyboard', press('yn:d', OWNER, own, 501, yesNoKeyboard('ru'))],
+    ['yn:y with no keyboard on the message', press('yn:y', OWNER, own, 501, null)],
+    ['yn:d with no keyboard on the message', press('yn:d', OWNER, own, 501, null)],
+    ['yn:y after the swap (only the inert button left)', press('yn:y', OWNER, own, 501, answeredKeyboard('n', 'ru'))],
+  ] as const) {
+    test(`${name} → refused toast, no envelope, no edit`, async () => {
+      const { d, calls } = deps()
+      expect(await handleYesNoPress(p, d)).toBe(true)
+      expect(calls.notify).toEqual([])
+      expect(calls.edit).toEqual([])
+      expect(calls.answer).toEqual(['Вопрос уже неактуален.'])
+    })
+  }
+  for (const [name, p, glyph] of [
+    ['«Да» on a «Да / Нет» keyboard', press('yn:y', OWNER, own), '👍'],
+    ['«Нет» on a «Да / Нет» keyboard', press('yn:n', OWNER, own), '👎'],
+    ['«Готово» on a «Готово» keyboard', press('yn:d', OWNER, own, 501, doneKeyboard('Готово')), '✅'],
+  ] as const) {
+    test(`genuine ${name} → its glyph`, async () => {
+      const { d, calls } = deps()
+      await handleYesNoPress(p, d)
+      expect(calls.notify.length).toBe(1)
+      expect(calls.notify[0].meta.reaction_added).toBe(glyph)
+      expect(calls.notify[0].meta.via).toBe('button')
+    })
+  }
+})
+
+describe('done_button: server.ts call sites (AC-06)', () => {
+  test('the arg check runs before the secretary and checklist branches', () => {
+    const i = SRC.indexOf('const doneLabel = wantsDoneButton(')
+    expect(i).toBeGreaterThan(0)
+    expect(i).toBeLessThan(SRC.indexOf('if (args.as_owner_to != null) {'))
+    expect(i).toBeLessThan(SRC.indexOf('if (args.checklist != null) {'))
+  })
+  test('same switch as «Да / Нет»; the keyboard goes on the last chunk only', () => {
+    expect(SRC).toContain('const doneOn = doneLabel != null && yesNoButtonsOn(homedir())')
+    expect(SRC).toContain('...(doneOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: doneKeyboard(doneLabel as string) } } : {}),')
+  })
+  test('the result names the switch state; result still starts with "sent"', () => {
+    expect(SRC).toContain("const doneNote = doneLabel != null ? (doneOn ? SUFFIX_DONE_ON : SUFFIX_DONE_OFF) : ''")
+    expect(SRC).toContain('text: result + voiceNote + yesNoNote + doneNote')
+  })
+  test('the tool schema offers done_button; yes_no no longer bans a press for every 👍 question', () => {
+    expect(SRC).toContain('done_button: {')
+    expect(SRC).not.toContain('Never for a question that needs his own 👍')
+  })
+})
+
+// Captions in the person's language (owner tg 46811: an English message got a Russian «✅ Да» button).
+// Only what the person sees changes; callback data and the envelope stay byte-identical.
+describe('ui language (tg 46811)', () => {
+  test('uiLang: ru / en / id and their regional forms; unknown, auto, absent → en', () => {
+    for (const [raw, want] of [['ru', 'ru'], ['RU', 'ru'], ['ru-RU', 'ru'], ['en', 'en'], ['en_US', 'en'], ['id', 'id'], ['id-ID', 'id'],
+                               ['auto', 'en'], ['', 'en'], ['de', 'en'], [undefined, 'en'], [7, 'en']] as const) {
+      expect(uiLang(raw)).toBe(want)
+    }
+  })
+  for (const [lang, yes, no, done] of [['ru', 'Да', 'Нет', 'Готово'], ['en', 'Yes', 'No', 'Done'], ['id', 'Ya', 'Tidak', 'Selesai']] as const) {
+    test(`${lang}: keyboard «${yes} / ${no}», data unchanged; inert ✅ ${yes} / ❌ ${no}`, () => {
+      expect(yesNoKeyboard(lang)).toEqual([[{ text: yes, callback_data: 'yn:y' }, { text: no, callback_data: 'yn:n' }]])
+      expect(answeredKeyboard('y', lang)).toEqual([[{ text: `✅ ${yes}`, callback_data: 'yn:x' }]])
+      expect(answeredKeyboard('n', lang)).toEqual([[{ text: `❌ ${no}`, callback_data: 'yn:x' }]])
+      expect(answeredKeyboard('d', lang)).toEqual([[{ text: `✅ ${done}`, callback_data: 'yn:x' }]])
+    })
+    test(`${lang}: «Да» press → the SAME envelope as in Russian (content «Да», 👍, via=button); keyboard + toast in ${lang}`, async () => {
+      const { d, calls } = deps(String(OWNER), () => new Set(), lang)
+      await handleYesNoPress(press('yn:y', OWNER, { id: OWNER, type: 'private' }, 501, yesNoKeyboard(lang)), d)
+      expect(calls.notify.length).toBe(1)
+      expect(calls.notify[0].content).toBe('(button on message 501: Да)')
+      expect(calls.notify[0].meta.reaction_added).toBe('👍')
+      expect(calls.notify[0].meta.via).toBe('button')
+      expect(calls.edit).toEqual([[[{ text: `✅ ${yes}`, callback_data: 'yn:x' }]]])
+      expect(calls.answer).toEqual([`✅ ${yes}`])
+    })
+    test(`${lang}: «done» press with no label on the message → «${done}»; toasts in ${lang}`, async () => {
+      const { d, calls } = deps(String(OWNER), () => new Set(), lang)
+      await handleYesNoPress(donePress(OWNER, { id: OWNER, type: 'private' }, ' '), d)
+      expect(calls.notify[0].content).toBe(`(button on message 502: ${done})`)
+      expect(calls.notify[0].meta.reaction_added).toBe('✅')
+      const t = deps(String(OWNER), () => new Set(), lang)
+      await handleYesNoPress(press('yn:y', OTHER, { id: OTHER, type: 'private' }), t.d)
+      await handleYesNoPress(press('yn:x', OWNER, { id: OWNER, type: 'private' }), t.d)
+      expect(t.calls.answer).toEqual([UI_CAPTIONS[lang].notAuthorized, UI_CAPTIONS[lang].alreadyAnswered])
+    })
+  }
+  test('server.ts: the language is resolved at the keyboard and at the press, never once at start (review F1)', () => {
+    const SRC = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    expect(SRC).toContain('inline_keyboard: yesNoKeyboard(uiLangOf(homedir())) }')
+    expect(SRC).toContain('      lang: uiLangOf(homedir()),\n')
+    expect(SRC).not.toContain('UI_LANG')
+    expect(SRC).not.toContain('yesNoKeyboard()')
+  })
+  test('language written mid-session (onboarding step 0) → the next keyboard and press use it, no restart (review F1)', async () => {
+    const h = mkdtempSync(join(tmpdir(), 'ui-lang-home-'))
+    const dataDir = join(h, 'Workspace', 'ClaudeProjects', 'sam-data')
+    mkdirSync(dataDir, { recursive: true })
+    const cfg = join(dataDir, 'config.json')
+    writeFileSync(cfg, JSON.stringify({ user: { telegram_chat_id: String(OWNER) } }))
+    expect(yesNoKeyboard(uiLangOf(h))).toEqual([[{ text: 'Yes', callback_data: 'yn:y' }, { text: 'No', callback_data: 'yn:n' }]])
+    writeFileSync(cfg, JSON.stringify({ user: { telegram_chat_id: String(OWNER), language: 'ru' } }))
+    const kb = yesNoKeyboard(uiLangOf(h))
+    expect(kb).toEqual([[{ text: 'Да', callback_data: 'yn:y' }, { text: 'Нет', callback_data: 'yn:n' }]])
+    const { d, calls } = deps(String(OWNER), () => new Set(), uiLangOf(h))
+    await handleYesNoPress(press('yn:y', OWNER, { id: OWNER, type: 'private' }, 501, kb), d)
+    expect(calls.answer).toEqual(['✅ Да'])
+    expect(calls.notify[0].content).toBe('(button on message 501: Да)')
+    expect(calls.notify[0].meta.reaction_added).toBe('👍')
+    expect(calls.notify[0].meta.via).toBe('button')
+    expect(uiLangOf(join(h, 'no-such-home'))).toBe('en')
   })
 })
