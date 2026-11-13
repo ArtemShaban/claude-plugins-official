@@ -63,6 +63,7 @@ import { createSecretary, directResultText, loadSecretaryState, previewResultTex
 import { catchUp, createKeeper, createOutStore, isOwnDeliveredMedia, type Download } from './chat-store'
 import { clipUtf16 } from './text-clip'
 import { CO_OWNERS_FILE, SUFFIX_DONE_OFF, SUFFIX_DONE_ON, SUFFIX_OFF, SUFFIX_ON, doneKeyboard, handleYesNoPress, readCoOwners, wantsDoneButton, wantsYesNo, yesNoButtonsOn, yesNoKeyboard } from './yes-no'
+import { uiLang } from './ui-lang'
 import {
   buildChecklist,
   applyToggle,
@@ -220,6 +221,9 @@ if (!ARCHIVE_ROOT) {
 }
 // Language of voice-reply bubbles: the same config language; none => 'ru'.
 const TTS_LANG = ttsLang(USER_VOICE_LANG)
+// Language of the plugin's own captions (yes/no and «done» buttons, their toasts): the same config
+// language; ru/en/id, anything else → en (ui-lang.ts; owner tg 46811).
+const UI_LANG = uiLang(USER_VOICE_LANG)
 if (!OWNER_TG_ID) {
   safeStderr(
     'telegram channel: config.json user.telegram_chat_id not set — every voice message will get voice_trust="data" (fail-safe)\n',
@@ -1267,7 +1271,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               const sendOpts = {
                 ...threadOpt,
                 ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-                ...(yesNoOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: yesNoKeyboard() } } : {}),
+                ...(yesNoOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: yesNoKeyboard(UI_LANG) } } : {}),
                 ...(doneOn && i === chunks.length - 1 ? { reply_markup: { inline_keyboard: doneKeyboard(doneLabel as string) } } : {}),
               }
               const sent =
@@ -1485,6 +1489,7 @@ bot.on('callback_query:data', async ctx => {
     { data, from: ctx.from, message: ctx.callbackQuery.message },
     {
       ownerId: lockOwnerId(ACCESS_LOCK, readLockedAccess, OWNER_TG_ID),
+      lang: UI_LANG,
       coOwners: () => readCoOwners(CO_OWNERS_FILE, line => safeStderr(line + '\n')),
       answer: text => ctx.answerCallbackQuery({ text }),
       editMarkup: keyboard => ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: keyboard } }),

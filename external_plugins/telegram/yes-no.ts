@@ -25,13 +25,13 @@ import { spawnSync } from 'child_process'
 import { closeSync, openSync, readSync } from 'fs'
 import { join } from 'path'
 import { LOCK_DIR } from './access-lock'
+import { type UiLang, captions } from './ui-lang'
 
 export const YES_NO_SWITCH = 'yes-no-buttons'
 export const YES = 'yn:y'
 export const NO = 'yn:n'
 export const ANSWERED = 'yn:x'
 export const DONE = 'yn:d'
-export const DONE_DEFAULT_LABEL = 'Готово'
 export const DONE_LABEL_MAX = 32 // our cap, in characters (code points)
 export const DONE_MARK = '✅'
 
@@ -111,25 +111,27 @@ export function doneKeyboard(label: string): Button[][] {
   return [[{ text: label, callback_data: DONE }]]
 }
 
-/** One row, two columns: «Да» «Нет». */
-export function yesNoKeyboard(): Button[][] {
-  return [[{ text: 'Да', callback_data: YES }, { text: 'Нет', callback_data: NO }]]
+/** One row, two columns: «Да» «Нет» — captions in the person's language (ui-lang.ts); data unchanged. */
+export function yesNoKeyboard(lang: UiLang): Button[][] {
+  const c = captions(lang)
+  return [[{ text: c.yes, callback_data: YES }, { text: c.no, callback_data: NO }]]
 }
 
-/** After a press: one inert button showing the choice (for «Готово»: «✅ <label>»). */
-export function answeredKeyboard(choice: Choice, doneLabel: string = DONE_DEFAULT_LABEL): Button[][] {
-  const text = choice === 'y' ? '✅ Да' : choice === 'n' ? '❌ Нет' : `${DONE_MARK} ${doneLabel}`
+/** After a press: one inert button showing the choice (for «Готово»: «✅ <label>»), in the person's language. */
+export function answeredKeyboard(choice: Choice, lang: UiLang, doneLabel: string = captions(lang).done): Button[][] {
+  const c = captions(lang)
+  const text = choice === 'y' ? `✅ ${c.yes}` : choice === 'n' ? `❌ ${c.no}` : `${DONE_MARK} ${doneLabel}`
   return [[{ text, callback_data: ANSWERED }]]
 }
 
-/** The pressed «Готово» button's label, as Telegram returns it with the message; absent → «Готово». */
-export function doneLabelOf(m: PressInput['message']): string {
+/** The pressed «Готово» button's label, as Telegram returns it with the message; absent → the language's «done». */
+export function doneLabelOf(m: PressInput['message'], lang: UiLang): string {
   for (const row of m?.reply_markup?.inline_keyboard ?? []) {
     for (const b of row) {
       if (b.callback_data === DONE && typeof b.text === 'string' && b.text.trim() !== '') return b.text.trim()
     }
   }
-  return DONE_DEFAULT_LABEL
+  return captions(lang).done
 }
 
 export function parseYesNoData(data: string): Choice | 'x' | null {
@@ -205,6 +207,8 @@ export function readCoOwners(path: string, logError: (line: string) => void): Se
 
 export type PressDeps = {
   ownerId: string | undefined
+  // The person's language (config user.language through ui-lang.ts uiLang): captions and toasts only.
+  lang: UiLang
   // The co-owner ids, read fresh on each call (readCoOwners). Called only for a non-owner press.
   coOwners: () => ReadonlySet<string>
   answer: (text: string) => Promise<unknown>
@@ -222,33 +226,37 @@ export async function handleYesNoPress(p: PressInput, d: PressDeps): Promise<boo
   const choice = parseYesNoData(p.data)
   if (choice == null) return false
   const toast = (t: string) => d.answer(t).catch(() => {})
+  const c = captions(d.lang)
   const fromId = String(p.from.id)
   const isOwner = !!d.ownerId && fromId === d.ownerId
   if (!isOwner && !d.coOwners().has(fromId)) {
-    await toast('Not authorized.')
+    await toast(c.notAuthorized)
     return true
   }
   const m = p.message
   if (m == null) {
-    await toast('Question no longer available.')
+    await toast(c.noLonger)
     return true
   }
   if (m.chat.type !== 'private' || String(m.chat.id) !== fromId) {
-    await toast('Not authorized.')
+    await toast(c.notAuthorized)
     return true
   }
   if (choice === 'x') {
-    await toast('Already answered.')
+    await toast(c.alreadyAnswered)
     return true
   }
   // The data must be a button this very message carries (as Telegram returns it): a forged `yn:y` on a message
   // with only «Готово», with no keyboard, or after the swap never becomes an envelope (buttons-da-gotovo r1 f3).
   const carried = (m.reply_markup?.inline_keyboard ?? []).some(row => row.some(b => b.callback_data === p.data))
   if (!carried) {
-    await toast('Question no longer available.')
+    await toast(c.noLonger)
     return true
   }
-  const label = choice === 'y' ? 'Да' : choice === 'n' ? 'Нет' : doneLabelOf(m)
+  // The envelope label stays «Да» / «Нет» in every language (byte-identical for the session's readers);
+  // only the «done» label is the button's own text, as before.
+  const doneLabel = choice === 'd' ? doneLabelOf(m, d.lang) : ''
+  const label = choice === 'y' ? 'Да' : choice === 'n' ? 'Нет' : doneLabel
   const message_id = String(m.message_id)
   await d
     .notify({
@@ -266,7 +274,8 @@ export async function handleYesNoPress(p: PressInput, d: PressDeps): Promise<boo
     })
     .catch(err => d.logError(`telegram channel: failed to deliver yes/no press to Claude: ${err}`))
   // The keyboard swap is cosmetic; its failure never blocks the event above.
-  await d.editMarkup(answeredKeyboard(choice, label)).catch(err => d.logError(`telegram channel: yes/no keyboard edit failed: ${err}`))
-  await toast(answeredKeyboard(choice, label)[0][0].text)
+  const answered = answeredKeyboard(choice, d.lang, doneLabel || undefined)
+  await d.editMarkup(answered).catch(err => d.logError(`telegram channel: yes/no keyboard edit failed: ${err}`))
+  await toast(answered[0][0].text)
   return true
 }
