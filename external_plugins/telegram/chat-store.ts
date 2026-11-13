@@ -17,7 +17,7 @@
 //
 // Pure fs + injected effects (the Bot API download is server.ts's), so it is unit-testable.
 
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeSync } from 'fs'
+import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'fs'
 import { join } from 'path'
 import { randomBytes } from 'crypto'
 import type { Transformer } from 'grammy'
@@ -44,15 +44,18 @@ export type OutLine = {
 
 /** `{ts, component, error_class, action_taken}` (dev-rules §5). Only a closed class — never the error text (it can hold the token's URL). */
 export function storeErrorLine(component: string, err: unknown, action: string, now: Date = new Date()): string {
+  return JSON.stringify({ ts: now.toISOString(), component, error_class: errorClassOf(err), action_taken: action }) + '\n'
+}
+
+/** The closed error class of storeErrorLine: a short code, else a short name, else 'unknown'. */
+export function errorClassOf(err: unknown): string {
   const code = (err as { code?: unknown } | null)?.code
   const name = (err as { name?: unknown } | null)?.name
-  const cls =
-    typeof code === 'string' && /^[A-Za-z0-9_]{1,32}$/.test(code)
-      ? code
-      : typeof name === 'string' && /^[A-Za-z0-9_]{1,32}$/.test(name)
-        ? name
-        : 'unknown'
-  return JSON.stringify({ ts: now.toISOString(), component, error_class: cls, action_taken: action }) + '\n'
+  return typeof code === 'string' && /^[A-Za-z0-9_]{1,32}$/.test(code)
+    ? code
+    : typeof name === 'string' && /^[A-Za-z0-9_]{1,32}$/.test(name)
+      ? name
+      : 'unknown'
 }
 
 // ── 1. our sends ─────────────────────────────────────────────────────────
@@ -144,12 +147,68 @@ export function keptFilesDir(root: string, chatId: string): string {
   return join(archiveChatDir(root, chatId), 'files')
 }
 
-/** The kept file of this message, if any (`<msg_id>.<ext>`). */
+/**
+ * The kept file of this message, if any (`<msg_id>.<ext>`): a regular file (never a link, FIFO or directory, r2 n2) in
+ * real store directories. Never the `<msg_id>.missing` reason file. An unsafe store path = not kept.
+ */
 export function keptFilePath(root: string, chatId: string, msgId: number): string | undefined {
   const dir = keptFilesDir(root, chatId)
-  if (!existsSync(dir)) return undefined
-  const name = readdirSync(dir).find(n => n.startsWith(`${msgId}.`))
-  return name ? join(dir, name) : undefined
+  let names: string[]
+  try {
+    for (const d of [root, archiveChatDir(root, chatId), dir]) realDir(d)
+    names = readdirSync(dir).sort()
+  } catch {
+    return undefined // absent, or not a real directory: nothing kept there that can be trusted
+  }
+  for (const n of names) {
+    if (!n.startsWith(`${msgId}.`) || n === missingFileName(msgId)) continue
+    const p = join(dir, n)
+    if (lstatSync(p).isFile()) return p
+  }
+  return undefined
+}
+
+/**
+ * archive-store-fixes §2.C (owner tg 39044): a file that was not kept leaves a durable named reason,
+ * `files/<msg_id>.missing` = one JSON line `{ts, error_class}` — `too_big`, `no_file_path`, or the
+ * closed class of storeErrorLine. stderr alone was persisted nowhere (video 41167). keptFilePath never
+ * returns it, so catch-up still retries the row; a later success removes it.
+ */
+export function missingFileName(msgId: number): string {
+  return `${msgId}.missing`
+}
+
+
+/**
+ * The store's one safe-path rule (= core tools/lib/store_paths.py `real_dir`; r1 f14, r2 f14/n2): `path` is a real
+ * directory — lstat, so never a link or a file. create → mkdir 0700 when absent (a concurrent EEXIST is fine);
+ * priv → chmod 0700. Anything else throws `unsafe_path` (a closed class for storeErrorLine).
+ */
+export function realDir(path: string, opts: { create?: boolean; priv?: boolean } = {}): string {
+  if (opts.create) {
+    try {
+      mkdirSync(path, { mode: 0o700 })
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err
+    }
+  }
+  if (!lstatSync(path).isDirectory()) throw Object.assign(new Error('unsafe store path'), { code: 'unsafe_path' })
+  if (opts.priv) chmodSync(path, 0o700)
+  return path
+}
+
+/**
+ * The `files` dir every kept file and reason file is written to: the store root (r2 f14: the root itself too),
+ * the chat dir and `files` — each a real directory, forced to 0700, before anything is created inside. Anything
+ * else throws `unsafe_path`: nothing is created outside the store.
+ */
+export function privateFilesDir(root: string, chatId: string): string {
+  if (!existsSync(root)) mkdirSync(root, { recursive: true, mode: 0o700 })
+  realDir(root, { priv: true })
+  realDir(archiveChatDir(root, chatId), { create: true, priv: true })
+  const files = realDir(keptFilesDir(root, chatId), { create: true, priv: true })
+  ensureChatDir(root, chatId) // the root's .gitignore, as every store writer
+  return files
 }
 
 /** His own voice and photo in a bot chat: delivery already keeps them (inbox + owner-log-media, D-197). */
@@ -169,26 +228,52 @@ export function createKeeper(deps: { download: Download; log: (line: string) => 
   const fail = (err: unknown, action: string) => {
     try { deps.log(storeErrorLine('tg-keep-file', err, action, now())) } catch {}
   }
+  /** The durable reason (§2.C). Never throws: a failure here is one more stderr line. */
+  const markMissing = (root: string, chatId: string, msgId: number, errorClass: string) => {
+    try {
+      const dir = privateFilesDir(root, chatId)
+      const tmp = join(dir, `.${msgId}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
+      writeFileSync(tmp, JSON.stringify({ ts: now().toISOString(), error_class: errorClass }) + '\n', { mode: 0o600, flag: 'wx' })
+      renameSync(tmp, join(dir, missingFileName(msgId)))
+    } catch (err) {
+      fail(err, `reason file of msg ${msgId} not written`)
+    }
+  }
+
+  /** r1 f12: bytes are kept → no reason file may stay. A failed removal is loud; the bytes stay either way. */
+  const clearMissing = (root: string, chatId: string, msgId: number) => {
+    try {
+      unlinkSync(join(keptFilesDir(root, chatId), missingFileName(msgId)))
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') fail(err, `stale reason file of msg ${msgId} not removed; the kept file stays`)
+    }
+  }
 
   async function run(root: string, chatId: string, msgId: number, fileId: string, sizeHint?: number): Promise<string | undefined> {
     try {
       const have = keptFilePath(root, chatId, msgId)
-      if (have) return have
+      if (have) {
+        clearMissing(root, chatId, msgId)
+        return have
+      }
       const tooBig = { code: 'too_big' }
       if (sizeHint != null && sizeHint > max) {
         fail(tooBig, `file of msg ${msgId} not kept (> 20 MB)`)
+        markMissing(root, chatId, msgId, 'too_big')
         return undefined
       }
       const got = await deps.download(fileId)
-      if (got === undefined) return undefined
-      if (got === 'too_big' || got.bytes.length > max) {
-        fail(tooBig, `file of msg ${msgId} not kept (> 20 MB)`)
+      if (got === undefined) {
+        markMissing(root, chatId, msgId, 'no_file_path')
         return undefined
       }
-      ensureChatDir(root, chatId)
-      const dir = keptFilesDir(root, chatId)
-      mkdirSync(dir, { recursive: true, mode: 0o700 })
-      const ext = got.ext.replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) || 'bin'
+      if (got === 'too_big' || got.bytes.length > max) {
+        fail(tooBig, `file of msg ${msgId} not kept (> 20 MB)`)
+        markMissing(root, chatId, msgId, 'too_big')
+        return undefined
+      }
+      const dir = privateFilesDir(root, chatId) // r2 f14/n2: bytes only into real store dirs
+      const ext =got.ext.replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) || 'bin'
       const final = join(dir, `${msgId}.${ext}`)
       const tmp = join(dir, `.${msgId}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
       const fd = openSync(tmp, 'wx', 0o600)
@@ -203,9 +288,11 @@ export function createKeeper(deps: { download: Download; log: (line: string) => 
         try { unlinkSync(tmp) } catch {}
         throw err
       }
+      clearMissing(root, chatId, msgId) // a later success: bytes, no reason left
       return final
     } catch (err) {
       fail(err, `file of msg ${msgId} not kept; delivery unaffected`)
+      markMissing(root, chatId, msgId, errorClassOf(err))
       return undefined
     }
   }
@@ -274,7 +361,11 @@ export async function catchUp(deps: CatchUpDeps): Promise<{ kept: number; backfi
           for (const l of readJsonLines<ArchiveLine>(join(dir, name))) {
             if (!l.file_id || l.msg_id == null || typeof l.ts !== 'string' || l.ts < cutoff) continue
             if (isArchive && isOwnDeliveredMedia(l.kind, l.sender_id, deps.ownerId)) continue
-            if (keptFilePath(root, l.chat_id, l.msg_id)) continue
+            if (keptFilePath(root, l.chat_id, l.msg_id)) {
+              // r1 f12: bytes next to a stale reason file → keep()'s fast path removes it (no download, not counted)
+              if (existsSync(join(keptFilesDir(root, l.chat_id), missingFileName(l.msg_id)))) await deps.keeper.keep(root, l.chat_id, l.msg_id, l.file_id)
+              continue
+            }
             if (await deps.keeper.keep(root, l.chat_id, l.msg_id, l.file_id)) kept++
           }
         }
