@@ -62,7 +62,7 @@ import { appendArchive, archiveRoot } from './tg-archive'
 import { createSecretary, directResultText, loadSecretaryState, previewResultText, secretaryRoot, type SecretaryApi } from './secretary'
 import { catchUp, createKeeper, createOutStore, isOwnDeliveredMedia, type Download } from './chat-store'
 import { clipUtf16 } from './text-clip'
-import { CO_OWNERS_FILE, SUFFIX_DONE_OFF, SUFFIX_DONE_ON, SUFFIX_OFF, SUFFIX_ON, doneKeyboard, handleYesNoPress, readCoOwners, wantsDoneButton, wantsYesNo, yesNoButtonsOn, yesNoKeyboard } from './yes-no'
+import { CO_OWNERS_FILE, SUFFIX_DONE_NOT_HERE, SUFFIX_DONE_OFF, SUFFIX_DONE_ON, SUFFIX_NOT_HERE, SUFFIX_OFF, SUFFIX_ON, buttonsCanCount, createButtonsLog, doneKeyboard, handleYesNoPress, readCoOwners, wantsDoneButton, wantsYesNo, yesNoButtonsOn, yesNoKeyboard } from './yes-no'
 import { uiLangOf } from './ui-lang'
 import {
   buildChecklist,
@@ -262,6 +262,8 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 const SHUTDOWN_LOG = join(STATE_DIR, 'shutdown.log')
 // One line per incoming voice (owner tg 44445): STATE_DIR/voice.log — plugin stderr is kept nowhere.
 const voiceLog = createVoiceLog({ stateDir: STATE_DIR, log: safeStderr })
+// One line per «Да / Нет» / «Готово» press (D-1049, spec §5): STATE_DIR/buttons.log.
+const buttonsLog = createButtonsLog({ stateDir: STATE_DIR, log: safeStderr })
 
 // Append one line to shutdown.log so post-mortem analysis can find the cause.
 // Synchronous write — the process may exit immediately after. Never throws
@@ -630,6 +632,17 @@ function assertAllowedChat(chat_id: string): void {
   const access = loadAccess()
   const result = checkOutboundAllowed(access, chat_id)
   if (!result.allowed) throw new Error(result.reason)
+}
+
+// «Да / Нет» / «Готово» keyboards go only where a press by the owner or a co-owner can count
+// (D-1049): yes-no.ts buttonsCanCount — the same predicate the press handler uses.
+function buttonsCountIn(chat_id: string): boolean {
+  return buttonsCanCount(
+    chat_id,
+    loadAccess(),
+    lockOwnerId(ACCESS_LOCK, readLockedAccess, OWNER_TG_ID),
+    readCoOwners(CO_OWNERS_FILE, line => safeStderr(line + '\n')),
+  )
 }
 
 // Secretary bot in the owner's personal Telegram (Telegram Business; spec sam-data
@@ -1038,11 +1051,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           yes_no: {
             type: 'boolean',
-            description: "Optional. true → a binary question to the owner gets two buttons «Да» «Нет» in one row (D-890). Only the owner or a co-owner may press, in their own DM; the press arrives as the presser's reaction event (user_id = who pressed; reaction_added 👍 for Да, 👎 for Нет) with via=\"button\"; afterwards the message shows the choice. Only when the setting `yes-no-buttons` is on (core default, or his sam-data override); otherwise the text goes plain and the result says the buttons are off. Cannot be combined with checklist, files, voice, as_owner_to or done_button. Three messages that need his own 👍 or «да» take the buttons too, and his «Да» press counts as it, under the same checks (him, his own DM, that very message; his latest 👍 / removal / «Да» / «Нет» decides): a laws slot line, «Выдать инвайт <имя>?», a preview of a message in his name. Any other message that needs his own 👍 — Telegram access (tools/tg-access-change.py), door teardown — goes without the buttons: no press counts there, «Нет» included (CLAUDE.md §10).",
+            description: "Optional. true → a binary question to the owner gets two buttons «Да» «Нет» in one row (D-890). Only the owner or a co-owner may press, in their own DM or a group of the access list that lets them in; elsewhere the text goes plain and the result says a press would not count in this chat. The press arrives as the presser's reaction event (chat_id = the chat it was pressed in; user_id = who pressed; reaction_added 👍 for Да, 👎 for Нет) with via=\"button\"; afterwards the message shows the choice. Only when the setting `yes-no-buttons` is on (core default, or his sam-data override); otherwise the text goes plain and the result says the buttons are off. Cannot be combined with checklist, files, voice, as_owner_to or done_button. Three messages that need his own 👍 or «да» take the buttons too, and his «Да» press counts as it, under the same checks (him, his own DM or a group of the access list that lets him in, that very message — the same chat_id and message_id; his latest 👍 / removal / «Да» / «Нет» decides): a laws slot line, «Выдать инвайт <имя>?» (in his own DM only, never a group — D-1049), a preview of a message in his name. Any other message that needs his own 👍 — Telegram access (tools/tg-access-change.py), door teardown — goes without the buttons: no press counts there, «Нет» included (CLAUDE.md §10).",
           },
           done_button: {
             type: 'string',
-            description: "Optional. The label of ONE button under a message that gives the person a command or a task for their own hands and waits only for «done» — «Готово», or one fitting the task («Вошёл», «Оплатил»), in their language; one line, at most 32 characters. Only the owner or a co-owner may press, in their own DM; the press arrives as the presser's reaction event with reaction_added ✅ and via=\"button\" and means only «done» — never «да» or consent. Afterwards the button reads «✅ <label>». Same switch as yes_no (`yes-no-buttons`); off → the text goes plain and the result says «button off, answer by text». Cannot be combined with yes_no, checklist, files, voice or as_owner_to.",
+            description: "Optional. The label of ONE button under a message that gives the person a command or a task for their own hands and waits only for «done» — «Готово», or one fitting the task («Вошёл», «Оплатил»), in their language; one line, at most 32 characters. Only the owner or a co-owner may press, in their own DM or a group of the access list that lets them in (elsewhere the text goes plain and the result says a press would not count in this chat); the press arrives as the presser's reaction event with reaction_added ✅ and via=\"button\" and means only «done» — never «да» or consent. Afterwards the button reads «✅ <label>». Same switch as yes_no (`yes-no-buttons`); off → the text goes plain and the result says «button off, answer by text». Cannot be combined with yes_no, checklist, files, voice or as_owner_to.",
           },
           as_owner_to: {
             type: 'string',
@@ -1138,10 +1151,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         // «Да / Нет» buttons (D-890, yes-no.ts): refused with checklist/files/voice/secretary.
         const yesNo = wantsYesNo({ yes_no: args.yes_no, checklist: args.checklist, files, voice: args.voice, as_owner_to: args.as_owner_to })
-        const yesNoOn = yesNo && yesNoButtonsOn(homedir())
+        const yesNoHere = yesNo && buttonsCountIn(chat_id)
+        const yesNoOn = yesNoHere && yesNoButtonsOn(homedir())
         // «Готово» button (yes-no.ts, buttons spec 2026-11-08 §2.4): one button, same switch; refused with yes_no too.
         const doneLabel = wantsDoneButton({ done_button: args.done_button, yes_no: args.yes_no, checklist: args.checklist, files, voice: args.voice, as_owner_to: args.as_owner_to })
-        const doneOn = doneLabel != null && yesNoButtonsOn(homedir())
+        const doneHere = doneLabel != null && buttonsCountIn(chat_id)
+        const doneOn = doneHere && yesNoButtonsOn(homedir())
 
         // Secretary path (spec §2 C, D-876). Always returns or throws, so the
         // plain-reply code below is never affected. Sending in his name happens
@@ -1345,8 +1360,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
-        const yesNoNote = yesNo ? (yesNoOn ? SUFFIX_ON : SUFFIX_OFF) : ''
-        const doneNote = doneLabel != null ? (doneOn ? SUFFIX_DONE_ON : SUFFIX_DONE_OFF) : ''
+        const yesNoNote = yesNo ? (yesNoOn ? SUFFIX_ON : !yesNoHere ? SUFFIX_NOT_HERE : SUFFIX_OFF) : ''
+        const doneNote = doneLabel != null ? (doneOn ? SUFFIX_DONE_ON : !doneHere ? SUFFIX_DONE_NOT_HERE : SUFFIX_DONE_OFF) : ''
         return { content: [{ type: 'text', text: result + voiceNote + yesNoNote + doneNote }] }
       }
       case 'react': {
@@ -1485,7 +1500,8 @@ setInterval(() => {
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
 
-  // «Да / Нет» and «Готово» press (D-890, yes-no.ts): the owner or a co-owner, in their own DM; a reaction
+  // «Да / Нет» and «Готово» press (D-890, yes-no.ts): the owner or a co-owner, in their own DM or a group of the
+  // access list that lets them in (D-1049, pressCounts); a reaction
   // envelope with via="button" (👍 / 👎 / ✅). Never the secretary or the signed approval channel.
   const yesNoHandled = await handleYesNoPress(
     { data, from: ctx.from, message: ctx.callbackQuery.message },
@@ -1493,6 +1509,8 @@ bot.on('callback_query:data', async ctx => {
       ownerId: lockOwnerId(ACCESS_LOCK, readLockedAccess, OWNER_TG_ID),
       lang: uiLangOf(homedir()),
       coOwners: () => readCoOwners(CO_OWNERS_FILE, line => safeStderr(line + '\n')),
+      access: () => loadAccess(),
+      buttonsLog,
       answer: text => ctx.answerCallbackQuery({ text }),
       editMarkup: keyboard => ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: keyboard } }),
       notify: n => mcp.notification({ method: 'notifications/claude/channel', params: n }),

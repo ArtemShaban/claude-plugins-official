@@ -15,6 +15,12 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 const OWNER = 111111111
+const OTHER = 222222222 // another allowlisted DM person — not the owner, not a co-owner
+// D-1049 (spec sam-data dev/specs/2026-11-14-buttons-in-groups-spec.md AC-1 / AC-3): groups of the access list.
+const G_OPEN = -1001000000001 // allowFrom empty → the owner's press counts
+const G_OMIT = -1001000000002 // allowFrom names someone else only → it does not
+const G_QUIET = -1001000000003 // wakeOnMention:false → it does not
+const G_NONE = -1001000000009 // not in the access list
 // `python3 sam_data.py config-get <key>` → the key's value from config-defaults.json beside it, as true / false.
 const SAM_DATA_FIXTURE = `import json, os, sys
 if len(sys.argv) != 3 or sys.argv[1] != "config-get":
@@ -27,6 +33,10 @@ print("true" if v is True else "false")
 let dir: string
 let defaultsFile: string
 let callsLog: string
+let updatesFile: string
+let stateDirG: string
+const notifications: any[] = []
+let nextUpdate = 1
 let child: ReturnType<typeof Bun.spawn> | null = null
 let stdoutBuf = ''
 let stderr = ''
@@ -67,8 +77,14 @@ beforeAll(async () => {
   const stateDir = join(dir, 'state')
   mkdirSync(stateDir, { recursive: true })
   // A small chunk limit, so one text becomes three chunks (last-chunk placement).
+  stateDirG = stateDir
   writeFileSync(join(stateDir, 'access.json'), JSON.stringify({
-    dmPolicy: 'allowlist', allowFrom: [String(OWNER)], groups: {}, pending: {}, textChunkLimit: 20, chunkMode: 'length',
+    dmPolicy: 'allowlist', allowFrom: [String(OWNER), String(OTHER)], pending: {}, textChunkLimit: 20, chunkMode: 'length',
+    groups: {
+      [String(G_OPEN)]: { requireMention: true, allowFrom: [] },
+      [String(G_OMIT)]: { requireMention: true, allowFrom: [String(OTHER)] },
+      [String(G_QUIET)]: { requireMention: true, allowFrom: [], wakeOnMention: false },
+    },
   }))
   const data = join(dir, 'Workspace', 'ClaudeProjects', 'sam-data')
   mkdirSync(data, { recursive: true })
@@ -81,10 +97,14 @@ beforeAll(async () => {
 
   callsLog = join(dir, 'sends.log')
   writeFileSync(callsLog, '')
+  updatesFile = join(dir, 'updates.json')
+  writeFileSync(updatesFile, '[]')
   const preload = join(dir, 'fake-bot-api.ts')
   writeFileSync(preload, /* ts */ `
 import { appendFileSync } from 'fs'
+import { readFileSync, writeFileSync } from 'fs'
 const LOG = ${JSON.stringify(callsLog)}
+const UPDATES = ${JSON.stringify(updatesFile)}
 let next = 700
 const fake = async (url: any, init?: any) => {
   const method = String(url).split('/').pop()!
@@ -92,7 +112,16 @@ const fake = async (url: any, init?: any) => {
   try { payload = JSON.parse(init?.body ?? '{}') } catch {}
   let result: unknown = true
   if (method === 'getMe') result = { id: 1, is_bot: true, first_name: 'bot', username: 'test_bot' }
-  else if (method === 'getUpdates') { await new Promise(r => setTimeout(r, 300)); result = [] }
+  else if (method === 'getUpdates') {
+    await new Promise(r => setTimeout(r, 100))
+    let q: any[] = []
+    try { q = JSON.parse(readFileSync(UPDATES, 'utf8')) } catch {}
+    writeFileSync(UPDATES, '[]')
+    result = q
+  }
+  else if (method === 'answerCallbackQuery' || method === 'editMessageReplyMarkup') {
+    appendFileSync(LOG, JSON.stringify({ method, text: payload.text ?? null, chat_id: payload.chat_id ?? null, reply_markup: payload.reply_markup ?? null }) + '\\n')
+  }
   else if (method.startsWith('send')) {
     appendFileSync(LOG, JSON.stringify({ method, text: payload.text, reply_markup: payload.reply_markup ?? null }) + '\\n')
     result = { message_id: next++, date: 1, chat: { id: Number(payload.chat_id), type: 'private' }, text: payload.text }
@@ -120,6 +149,7 @@ require('node-fetch').default = fake
         try {
           const m = JSON.parse(line)
           if (typeof m.id === 'number') responses.set(m.id, m)
+          else if (m.method === 'notifications/claude/channel') notifications.push(m.params)
         } catch {}
       }
     }
@@ -191,5 +221,107 @@ describe('reply done_button — the real call path (r1 f6, self-contained r2 f4)
       expect(r.isError).toBe(true)
       expect(r.sent).toEqual([])
     })
+  }
+})
+
+// ── D-1049: buttons in an allowlisted group work exactly as in DM — the real server path ────────
+describe('buttons in groups — send side (AC-3)', () => {
+  for (const [kind, args, onSuffix, notHere] of [
+    ['yes_no', { yes_no: true }, ' +yes/no buttons', ' — no yes/no buttons: a press would not count in this chat; the answer comes by 👍/👎 or text'],
+    ['done_button', { done_button: 'Готово' }, ' +done button', ' — no button: a press would not count in this chat, answer by text'],
+  ] as const) {
+    for (const [name, chat, ok] of [
+      ["the owner's DM", OWNER, true],
+      ['an allowlisted group that lets him in', G_OPEN, true],
+      ["another person's DM", OTHER, false],
+      ['a wakeOnMention:false group', G_QUIET, false],
+      ['an allowlisted group whose allowFrom omits him', G_OMIT, false],
+    ] as const) {
+      test(`${kind} into ${name} → ${ok ? 'keyboard' : 'plain + the not-here suffix'}`, async () => {
+        setSwitch(true)
+        const r = await reply({ chat_id: String(chat), text: 'вопрос?', ...args })
+        expect(r.isError, r.text + stderr.slice(-1000)).toBe(false)
+        expect(r.text.startsWith('sent ')).toBe(true)
+        expect(r.sent.length).toBe(1)
+        if (ok) {
+          expect(r.text.endsWith(onSuffix)).toBe(true)
+          expect(r.sent[0].reply_markup).not.toBeNull()
+        } else {
+          expect(r.text.endsWith(notHere)).toBe(true)
+          expect(r.sent[0].reply_markup).toBeNull()
+        }
+      })
+    }
+  }
+})
+
+function logLines(): string[] {
+  try { return readFileSync(join(stateDirG, 'buttons.log'), 'utf8').split('\n').filter(Boolean) } catch { return [] }
+}
+function calls(method: string): any[] {
+  return sends().filter(s => s.method === method)
+}
+
+async function pressE2E(fromId: number, chat: { id: number; type: string }, data: string, keyboard: any[][]) {
+  const before = { n: notifications.length, answers: calls('answerCallbackQuery').length, edits: calls('editMessageReplyMarkup').length, log: logLines().length }
+  const id = nextUpdate++
+  writeFileSync(updatesFile, JSON.stringify([{
+    update_id: id,
+    callback_query: {
+      id: `q${id}`, chat_instance: 'ci', data,
+      from: { id: fromId, is_bot: false, first_name: 'x', username: 'artem' },
+      message: { message_id: 233, date: 1, chat, text: 'вопрос?', reply_markup: { inline_keyboard: keyboard } },
+    },
+  }]))
+  const until = Date.now() + 10000
+  while (calls('answerCallbackQuery').length === before.answers || logLines().length === before.log) {
+    if (Date.now() > until) throw new Error(`press not handled; stderr: ${stderr.slice(-1500)}`)
+    await new Promise(r => setTimeout(r, 25))
+  }
+  await new Promise(r => setTimeout(r, 50))
+  return {
+    notes: notifications.slice(before.n),
+    answers: calls('answerCallbackQuery').slice(before.answers),
+    edits: calls('editMessageReplyMarkup').slice(before.edits),
+    log: logLines().slice(before.log),
+  }
+}
+
+describe('buttons in groups — press through the real callback path (AC-1 yn:d, AC-4, AC-5)', () => {
+  const DONE_KB = [[{ text: 'Готово', callback_data: 'yn:d' }]]
+  const YN_KB = [[{ text: 'Да', callback_data: 'yn:y' }, { text: 'Нет', callback_data: 'yn:n' }]]
+  const sg = (id: number) => ({ id, type: 'supergroup' })
+  const dm = (id: number) => ({ id, type: 'private' })
+  for (const [data, kb] of [['yn:d', DONE_KB], ['yn:y', YN_KB]] as const) {
+    for (const [name, from, chat, outcome] of [
+      ['owner in own DM', OWNER, dm(OWNER), 'accepted'],
+      ['owner in an allowlisted group with empty allowFrom', OWNER, sg(G_OPEN), 'accepted'],
+      ['another member in that group', OTHER, sg(G_OPEN), 'refused:not-owner'],
+      ['owner in a group not in the access list', OWNER, sg(G_NONE), 'refused:not-here'],
+      ['owner in an allowlisted group whose allowFrom omits him', OWNER, sg(G_OMIT), 'refused:not-here'],
+      ['owner in a wakeOnMention:false group', OWNER, sg(G_QUIET), 'refused:not-here'],
+      ["owner in another person's DM", OWNER, dm(OTHER), 'refused:not-here'],
+    ] as const) {
+      test(`${data}: ${name} → ${outcome}`, async () => {
+        const r = await pressE2E(from, chat, data, kb as any)
+        expect(r.log.length).toBe(1)
+        expect(r.log[0]).toContain(` outcome=${outcome} `)
+        expect(r.log[0]).not.toContain('artem')
+        expect(r.answers.length).toBe(1)
+        const press = r.notes.filter(n => n.meta?.via === 'button')
+        if (outcome === 'accepted') {
+          expect(press.length).toBe(1)
+          expect(press[0].meta).toMatchObject({ event: 'reaction', chat_id: String(chat.id), message_id: '233', user_id: String(from), via: 'button' })
+          expect(Object.keys(press[0].meta).sort()).toEqual(['chat_id', 'event', 'message_id', 'reaction_added', 'ts', 'user', 'user_id', 'via'])
+          expect(r.edits.length).toBe(1)
+          expect(r.log[0]).toContain(`chat_id=${chat.id} `)
+        } else {
+          expect(press).toEqual([])
+          expect(r.edits).toEqual([])
+          expect(r.answers[0].text).toBe('Not authorized.') // config has no user.language → en
+          if (from === OTHER) expect(r.log[0]).not.toContain(String(OTHER))
+        }
+      })
+    }
   }
 })

@@ -7,8 +7,11 @@
 // itself (`tools/sam_data.py config-get`; owner tg 41857). Off → a plain message.
 // Press: accepted only from the owner (config.json user.telegram_chat_id) or a
 // co-owner (the admin's /etc/sam-telegram-access/co-owners, read fresh per press;
-// spec sam-data dev/analysis/2026-11-04-yes-no-co-owner-spec.md), in their own DM, and only
-// for a button that very message carries (callback data checked against its reply_markup).
+// spec sam-data dev/analysis/2026-11-04-yes-no-co-owner-spec.md), in their own DM or a group of the
+// access list that lets them in (pressCounts; D-1049, spec sam-data
+// dev/specs/2026-11-14-buttons-in-groups-spec.md), and only for a button that very message carries
+// (callback data checked against its reply_markup). The send side asks the same predicate
+// (buttonsCanCount): no keyboard where no press could count. One buttons.log line per press.
 // It reaches the session as the SAME reaction envelope his 👍/👎 makes,
 // plus `via="button"`, so every 👍/👎 reader works unchanged; tools/owner_approval.py
 // check_thumbs refuses it by default and counts it only where a rail opts in (invite-mint).
@@ -25,6 +28,8 @@ import { spawnSync } from 'child_process'
 import { closeSync, openSync, readSync } from 'fs'
 import { join } from 'path'
 import { LOCK_DIR } from './access-lock'
+import { type GroupGatePolicy, groupReactionAllowed } from './group-access'
+import { createStateLineWriter } from './state-line'
 import { type UiLang, captions } from './ui-lang'
 
 export const YES_NO_SWITCH = 'yes-no-buttons'
@@ -146,6 +151,102 @@ export const SUFFIX_ON = ' +yes/no buttons'
 export const SUFFIX_OFF = ' — yes/no buttons are off on this install; the answer comes by 👍/👎 or text'
 export const SUFFIX_DONE_ON = ' +done button'
 export const SUFFIX_DONE_OFF = ' — button off, answer by text'
+export const SUFFIX_NOT_HERE = ' — no yes/no buttons: a press would not count in this chat; the answer comes by 👍/👎 or text'
+export const SUFFIX_DONE_NOT_HERE = ' — no button: a press would not count in this chat, answer by text'
+
+/** The access list in force (server.ts loadAccess(), read fresh — the lock on a client install). */
+export type PressAccess = { groups: Record<string, GroupGatePolicy> }
+
+/** THE one rule «a press can count here» (D-1049), used by the press and by the send:
+ * the presser's own DM (a private chat's id is the user's id), or a group of the access list in
+ * force whose gate already lets that person's reaction reach the session (groupReactionAllowed:
+ * allowFrom empty or naming them; wakeOnMention:false → never). */
+export function pressCounts(chatId: string | number, presserId: string, access: PressAccess): boolean {
+  const chat = String(chatId)
+  if (presserId === '') return false
+  if (chat === presserId) return true
+  const groups = access.groups ?? {}
+  if (!Object.prototype.hasOwnProperty.call(groups, chat)) return false
+  const policy = groups[chat]
+  return policy != null && typeof policy === 'object' && groupReactionAllowed(policy, presserId)
+}
+
+/** Send side: buttons go only where a press by the owner or a co-owner could count. */
+export function buttonsCanCount(
+  chatId: string | number,
+  access: PressAccess,
+  ownerId: string | undefined,
+  coOwners: ReadonlySet<string>,
+): boolean {
+  if (ownerId && pressCounts(chatId, ownerId, access)) return true
+  for (const co of coOwners) if (pressCounts(chatId, co, access)) return true
+  return false
+}
+
+// ── buttons.log: one line per «Да / Нет» / «Готово» callback (spec §5) ─────────────────────────
+// Never message text, a username, a token, or the id of a presser who is not the owner / a co-owner.
+export const BUTTONS_LOG = 'buttons.log'
+export type PressOutcome =
+  | 'accepted'
+  | 'refused:not-owner'
+  | 'refused:not-here'
+  | 'refused:no-message'
+  | 'refused:answered'
+  | 'refused:not-carried'
+export type ButtonLineFields = {
+  chatType: string | undefined
+  chatId: string | undefined
+  topic: boolean
+  msg: number | undefined
+  data: string
+  who: 'owner' | 'co-owner' | 'other'
+  outcome: PressOutcome
+  answer: string // 'ok' | 'failed:<class>'
+  edit?: string // 'failed:<class>' only
+  notify?: string // 'failed:<class>' only
+}
+
+/** The failure class of a thrown value: its error name (+ Telegram error_code), never its message. */
+export function failureClass(err: unknown): string {
+  const e = err as { name?: unknown; error_code?: unknown } | null
+  const name = typeof e?.name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(e.name) ? e.name : 'error'
+  const code = typeof e?.error_code === 'number' && Number.isInteger(e.error_code) ? `_${e.error_code}` : ''
+  return name + code
+}
+
+export function formatButtonLine(tsMs: number, pid: number, f: ButtonLineFields): string {
+  const chat = f.chatType === 'private' || f.chatType === 'group' || f.chatType === 'supergroup' ? f.chatType : '-'
+  // A private chat's id is its user's id: logged only when that user is the owner / a co-owner.
+  const idOk = f.chatId != null && /^-?[0-9]{1,20}$/.test(f.chatId) && !(chat === 'private' && f.who === 'other')
+  const chatId = idOk ? f.chatId : '-'
+  const msg = f.msg != null && Number.isInteger(f.msg) && f.msg >= 0 ? String(f.msg) : '-'
+  const data = /^yn:[ynxd]$/.test(f.data) ? f.data : '-'
+  const res = (v: string) => (/^(ok|failed:[A-Za-z0-9_]{1,48})$/.test(v) ? v : 'failed:error')
+  return (
+    `${new Date(tsMs).toISOString()} pid=${pid} chat=${chat} chat_id=${chatId} topic=${f.topic ? 'y' : 'n'}` +
+    ` msg=${msg} data=${data} who=${f.who} outcome=${f.outcome} answer=${res(f.answer)}` +
+    (f.edit != null ? ` edit=${res(f.edit)}` : '') +
+    (f.notify != null ? ` notify=${res(f.notify)}` : '') +
+    '\n'
+  )
+}
+
+/** Appender for STATE_DIR/buttons.log (0600, append-only, never throws — state-line.ts). */
+export function createButtonsLog(opts: {
+  stateDir: string
+  pid?: number
+  nowMs?: () => number
+  log?: (line: string) => void
+}): (f: ButtonLineFields) => void {
+  const pid = opts.pid ?? process.pid
+  const now = opts.nowMs ?? Date.now
+  const write = createStateLineWriter({ file: join(opts.stateDir, BUTTONS_LOG), goesOn: 'the press goes on', log: opts.log })
+  return f => {
+    try {
+      write(formatButtonLine(now(), pid, f))
+    } catch {}
+  }
+}
 
 export type PressInput = {
   data: string
@@ -154,6 +255,8 @@ export type PressInput = {
   message?: {
     message_id: number
     chat: { id: number; type: string }
+    message_thread_id?: number
+    is_topic_message?: boolean
     reply_markup?: { inline_keyboard: { text: string; callback_data?: string }[][] }
   }
 }
@@ -211,6 +314,10 @@ export type PressDeps = {
   lang: UiLang
   // The co-owner ids, read fresh on each call (readCoOwners). Called only for a non-owner press.
   coOwners: () => ReadonlySet<string>
+  // The access list in force, read fresh on each press (server.ts loadAccess()).
+  access: () => PressAccess
+  // One buttons.log line per press (createButtonsLog); absent → no line.
+  buttonsLog?: (f: ButtonLineFields) => void
   answer: (text: string) => Promise<unknown>
   editMarkup: (keyboard: Button[][]) => Promise<unknown>
   notify: (n: { content: string; meta: Record<string, string> }) => Promise<unknown>
@@ -225,34 +332,63 @@ export type PressDeps = {
 export async function handleYesNoPress(p: PressInput, d: PressDeps): Promise<boolean> {
   const choice = parseYesNoData(p.data)
   if (choice == null) return false
-  const toast = (t: string) => d.answer(t).catch(() => {})
+  const m = p.message
+  const line: ButtonLineFields = {
+    chatType: m?.chat.type,
+    chatId: m ? String(m.chat.id) : undefined,
+    topic: m != null && (m.is_topic_message === true || m.message_thread_id != null),
+    msg: m?.message_id,
+    data: p.data,
+    who: 'other',
+    outcome: 'refused:not-owner',
+    answer: 'ok',
+  }
+  try {
+    await pressBody(p, d, choice, line)
+  } finally {
+    try { d.buttonsLog?.(line) } catch {}
+  }
+  return true
+}
+
+async function pressBody(p: PressInput, d: PressDeps, choice: Choice | 'x', line: ButtonLineFields): Promise<void> {
+  const toast = (t: string) => d.answer(t).then(() => {}, err => { line.answer = `failed:${failureClass(err)}` })
   const c = captions(d.lang)
   const fromId = String(p.from.id)
   const isOwner = !!d.ownerId && fromId === d.ownerId
-  if (!isOwner && !d.coOwners().has(fromId)) {
+  if (isOwner) line.who = 'owner'
+  else if (d.coOwners().has(fromId)) line.who = 'co-owner'
+  else {
+    line.outcome = 'refused:not-owner'
     await toast(c.notAuthorized)
-    return true
+    return
   }
   const m = p.message
   if (m == null) {
+    line.outcome = 'refused:no-message'
     await toast(c.noLonger)
-    return true
+    return
   }
-  if (m.chat.type !== 'private' || String(m.chat.id) !== fromId) {
+  // D-1049: the one rule «a press can count here» — own DM, or a group of the access list that lets them in.
+  if (!pressCounts(m.chat.id, fromId, d.access())) {
+    line.outcome = 'refused:not-here'
     await toast(c.notAuthorized)
-    return true
+    return
   }
   if (choice === 'x') {
+    line.outcome = 'refused:answered'
     await toast(c.alreadyAnswered)
-    return true
+    return
   }
   // The data must be a button this very message carries (as Telegram returns it): a forged `yn:y` on a message
   // with only «Готово», with no keyboard, or after the swap never becomes an envelope (buttons-da-gotovo r1 f3).
   const carried = (m.reply_markup?.inline_keyboard ?? []).some(row => row.some(b => b.callback_data === p.data))
   if (!carried) {
+    line.outcome = 'refused:not-carried'
     await toast(c.noLonger)
-    return true
+    return
   }
+  line.outcome = 'accepted'
   // The envelope label stays «Да» / «Нет» in every language (byte-identical for the session's readers);
   // only the «done» label is the button's own text, as before.
   const doneLabel = choice === 'd' ? doneLabelOf(m, d.lang) : ''
@@ -272,10 +408,15 @@ export async function handleYesNoPress(p: PressInput, d: PressDeps): Promise<boo
         via: 'button',
       },
     })
-    .catch(err => d.logError(`telegram channel: failed to deliver yes/no press to Claude: ${err}`))
+    .catch(err => {
+      line.notify = `failed:${failureClass(err)}`
+      d.logError(`telegram channel: failed to deliver yes/no press to Claude: ${err}`)
+    })
   // The keyboard swap is cosmetic; its failure never blocks the event above.
   const answered = answeredKeyboard(choice, d.lang, doneLabel || undefined)
-  await d.editMarkup(answered).catch(err => d.logError(`telegram channel: yes/no keyboard edit failed: ${err}`))
+  await d.editMarkup(answered).catch(err => {
+    line.edit = `failed:${failureClass(err)}`
+    d.logError(`telegram channel: yes/no keyboard edit failed: ${err}`)
+  })
   await toast(answered[0][0].text)
-  return true
 }
