@@ -12,20 +12,16 @@
  *   Bun's documented per-request switch (Bun 1.4.0 docs, runtime/networking/fetch: «Disable connection reuse for this
  *   request»; «You can disable it [connection pooling] per-request with `keepalive: false`»). Bun 1.4.0 fetch speaks
  *   HTTP/1.1 only, so there is no multiplexing to share either; tg-download.r1.test.ts proves it on a warm pool.
- *   The first attempt whose file GET answers 2xx headers owns the body and the other attempt is aborted at that
- *   moment, so at most one body per file is ever read; an earlier answer without a body (no_file, too_big from
- *   metadata) wins as before. Never a 3rd attempt; no hedge once attempt 1 has headers.
- * - One fixed ceiling for every transfer, TRANSFER_CEILING_BYTES (no per-caller limit: every caller wants the Bot API
- *   limit). Content-Length over it, or the bytes actually read going over it (Telegram's file_size is optional and may
- *   be wrong) → too_big, body cancelled. The body is assembled in ONE resizable buffer grown in place: no chunk list,
- *   no final copy, so one transfer holds at most the ceiling.
+ *   The first attempt to return the COMPLETE file wins and the other is aborted; an attempt that fails (also
+ *   mid-body) leaves the other running, and the download fails only when no attempt is left. Never a 3rd attempt;
+ *   no hedge once attempt 1 has its file-GET headers.
+ * - Each attempt reads at most TRANSFER_CEILING_BYTES (the Bot API getFile limit): Content-Length over it, or the
+ *   bytes actually read going over it (Telegram's file_size is optional and may be wrong) → too_big, body cancelled.
  * - Single-flight per file_id: a call while that file is in flight joins its transfer and gets the same answer. The
  *   entry is dropped when the download settles — a failure is never reused.
- * - At most MAX_PARALLEL_TRANSFERS file_ids transfer at once (more wait in order; the cap clock runs while waiting),
- *   so bodies in memory never exceed MAX_PARALLEL_TRANSFERS × TRANSFER_CEILING_BYTES.
  * - DOWNLOAD_CAP_MS hard cap: all attempts aborted, entry dropped, a `timed out` error.
- * - Every error that leaves this module is rebuilt from a closed class: never the URL (= never the token), never
- *   Telegram's description text.
+ * - Every error that leaves this module passes one boundary (`closedError`): never the URL (= never the token), never
+ *   Telegram's description text, never a `cause` — also for a failure inside the module itself.
  * - When the hedge fires, one bare TCP connect to api.telegram.org:443 (PROBE_CAP_MS cap) is recorded in the
  *   journal — «следующий сбой сам покажет, чья сторона». Never on the happy path, never awaited by delivery.
  *
@@ -36,10 +32,8 @@ import { connect } from 'node:net'
 export const HEDGE_MS = 8_000
 export const DOWNLOAD_CAP_MS = 180_000
 export const PROBE_CAP_MS = 5_000
-/** The most one transfer ever reads: the Bot API's getFile limit («files of up to 20MB»), = server.ts MAX_DOWNLOAD_BYTES. */
+/** The most one attempt ever reads: the Bot API's getFile limit («files of up to 20MB»), = server.ts MAX_DOWNLOAD_BYTES. */
 export const TRANSFER_CEILING_BYTES = 20 * 1024 * 1024
-/** Distinct file_ids downloading at once; with one body per file, body memory ≤ 4 × 20 MiB. */
-export const MAX_PARALLEL_TRANSFERS = 4
 
 const TG_API = 'https://api.telegram.org/bot'
 const TG_FILE = 'https://api.telegram.org/file/bot'
@@ -110,6 +104,11 @@ function networkError(err: unknown): TelegramDownloadError {
   })
 }
 
+/** The one exit for errors: ours pass as they are (already closed); anything else becomes a fieldless internal error. */
+function closedError(err: unknown): TelegramDownloadError {
+  return err instanceof TelegramDownloadError ? err : new TelegramDownloadError('telegram file download failed: internal')
+}
+
 /** One bare TCP connect to api.telegram.org:443 — ms, or `timeout` past the cap, or `error`. Never throws. */
 export function tcpProbe(host = 'api.telegram.org', port = 443, capMs = PROBE_CAP_MS): Promise<ProbeResult> {
   return new Promise(resolve => {
@@ -140,26 +139,6 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
   const now = opts.nowMs ?? Date.now
   type Entry = { promise: Promise<DownloadResult>; journal: DownloadJournal }
   const inflight = new Map<string, Entry>()
-  // Transfer slots (MAX_PARALLEL_TRANSFERS); `waiting` = the starts of transfers that have no slot yet, in order.
-  let active = 0
-  const waiting: (() => void)[] = []
-  const acquire = (go: () => void) => {
-    if (active < MAX_PARALLEL_TRANSFERS) {
-      active++
-      go()
-    } else waiting.push(go)
-  }
-  const release = () => {
-    const next = waiting.shift()
-    if (next) next()
-    else active--
-  }
-  // Bytes in body buffers still being read (read-only, for tests and diagnosis).
-  const mem = { now: 0, peak: 0 }
-  const held = (d: number) => {
-    mem.now += d
-    if (mem.now > mem.peak) mem.peak = mem.now
-  }
 
   async function get(url: string, signal: AbortSignal, fresh: boolean, json?: unknown): Promise<Response> {
     try {
@@ -188,7 +167,7 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
 
   type AttemptState = { phase: DownloadPhase; gf_ms?: number; fx_ms?: number }
 
-  /** The whole body, or null once it is over the ceiling. One buffer grown in place: no chunk list, no final copy. */
+  /** The whole body, or null once it is over the ceiling (by Content-Length or by the running count). */
   async function readCapped(res: Response, signal: AbortSignal): Promise<Uint8Array | null> {
     const declared = Number(res.headers.get('content-length'))
     if (Number.isFinite(declared) && declared > TRANSFER_CEILING_BYTES) {
@@ -197,25 +176,25 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
     }
     const reader = res.body?.getReader()
     if (!reader) return new Uint8Array(0)
-    // Resizable ArrayBuffer: the ceiling is reserved address space, only written bytes take memory (Bun 1.4.0).
-    const buf = new ArrayBuffer(0, { maxByteLength: TRANSFER_CEILING_BYTES })
-    const out = new Uint8Array(buf) // tracks buf's length
-    try {
-      for (;;) {
-        const { done, value } = await body(() => reader.read(), signal)
-        if (done) return new Uint8Array(buf, 0, buf.byteLength)
-        const at = buf.byteLength
-        if (at + value.byteLength > TRANSFER_CEILING_BYTES) {
-          void reader.cancel().catch(() => {})
-          return null
-        }
-        buf.resize(at + value.byteLength)
-        held(value.byteLength)
-        out.set(value, at)
+    const chunks: Uint8Array[] = []
+    let total = 0
+    for (;;) {
+      const { done, value } = await body(() => reader.read(), signal)
+      if (done) break
+      total += value.byteLength
+      if (total > TRANSFER_CEILING_BYTES) {
+        void reader.cancel().catch(() => {})
+        return null
       }
-    } finally {
-      held(-buf.byteLength)
+      chunks.push(value)
     }
+    const out = new Uint8Array(total)
+    let at = 0
+    for (const c of chunks) {
+      out.set(c, at)
+      at += c.byteLength
+    }
+    return out
   }
 
   async function attempt(
@@ -224,7 +203,6 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
     signal: AbortSignal,
     fresh: boolean,
     onPhase: () => void,
-    claimBody: () => boolean,
   ): Promise<Fetched> {
     const t0 = now()
     const gfRes = await get(`${apiBase}${opts.token}/getFile`, signal, fresh, { file_id: fileId })
@@ -251,11 +229,6 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
       void res.body?.cancel().catch(() => {})
       throw new TelegramDownloadError(`file download failed: HTTP ${res.status}`, { code: `HTTP_${res.status}` })
     }
-    if (!claimBody()) {
-      // The sibling got its headers first and owns the body: this attempt reads none of it.
-      void res.body?.cancel().catch(() => {})
-      throw new TelegramDownloadError('telegram file download aborted', { name: 'AbortError' })
-    }
     st.phase = 'body'
     onPhase()
     const bytes = await readCapped(res, signal)
@@ -274,13 +247,10 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
     const attempts: { ctrl: AbortController; st: AttemptState }[] = []
     let settled = false
     let pending = 0
-    let slot = false
-    /** The attempt that owns the body (0 = none yet); once set, only its outcome settles the download. */
-    let owner = 0
     let hedgeTimer: ReturnType<typeof setTimeout> | undefined
     let capTimer: ReturnType<typeof setTimeout> | undefined
 
-    const promise = new Promise<DownloadResult>((resolve, reject) => {
+    entry.promise = new Promise<DownloadResult>((resolve, reject) => {
       const finish = (fn: () => void) => {
         if (settled) return
         settled = true
@@ -288,8 +258,6 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
         clearTimeout(capTimer)
         for (const a of attempts) a.ctrl.abort()
         inflight.delete(fileId)
-        if (slot) release()
-        else if (waiting.includes(go)) waiting.splice(waiting.indexOf(go), 1) // timed out while waiting for a slot
         fn()
       }
       const syncPhase = () => {
@@ -304,35 +272,25 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
         attempts.push({ ctrl, st })
         journal.dl_att = n
         pending++
-        const claimBody = () => {
-          if (owner !== 0 || settled) return false
-          owner = n
-          clearTimeout(hedgeTimer)
-          for (const a of attempts) if (a.ctrl !== ctrl) a.ctrl.abort()
-          return true
-        }
-        attempt(fileId, st, ctrl.signal, n > 1, syncPhase, claimBody).then(
-          got => {
-            pending--
-            if (owner !== 0 && owner !== n) return
+        attempt(fileId, st, ctrl.signal, n > 1, syncPhase).then(
+          got =>
             finish(() => {
               journal.dl_win = n
               if (st.gf_ms != null) journal.gf_ms = st.gf_ms
               if (st.fx_ms != null) journal.fx_ms = st.fx_ms
               journal.dl_phase = 'done'
               resolve({ ...got, journal } as DownloadResult)
-            })
-          },
+            }),
           err => {
             pending--
-            // The body owner's failure is final. Before that: wait for a running sibling, fail only when nothing
-            // is left (no retry — spec «Left out»).
-            if (owner === n || (owner === 0 && pending === 0)) finish(() => reject(err))
+            // One attempt failed (also mid-body): the other keeps going; fail only when none is left (no retry).
+            if (pending === 0) finish(() => reject(closedError(err)))
           },
         )
       }
       const hedge = () => {
-        if (settled || owner !== 0) return
+        // Only while attempt 1 has no file-GET headers: a streaming body is never fetched twice.
+        if (settled || PHASE_ORDER[attempts[0].st.phase] > PHASE_ORDER.headers) return
         void probe()
           .then(r => {
             journal.probe_ms = r
@@ -342,18 +300,13 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
           })
         launch()
       }
-      function go() {
-        slot = true
-        launch()
-        hedgeTimer = setTimeout(hedge, hedgeMs)
-      }
-      acquire(go)
+      launch()
+      hedgeTimer = setTimeout(hedge, hedgeMs)
       capTimer = setTimeout(
         () => finish(() => reject(new TelegramDownloadError(`telegram file download timed out after ${capMs}ms`))),
         capMs,
       )
     })
-    entry.promise = promise
     return entry
   }
 
@@ -369,5 +322,5 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
     return entry.promise
   }
 
-  return { downloadTelegramFile, inflightCount: () => inflight.size, buffered: () => ({ ...mem }) }
+  return { downloadTelegramFile, inflightCount: () => inflight.size }
 }
