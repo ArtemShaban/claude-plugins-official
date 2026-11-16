@@ -18,6 +18,7 @@ import type { Chat, MessageOrigin, User } from 'grammy/types'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createStateLineWriter } from './state-line'
+import type { DownloadJournal } from './tg-download'
 
 // ── per-key FIFO serializer (OB-09 — owner tg 17093, "это оч важно": text1 →
 // voice → text2 must reach the session in that same order, even when the
@@ -119,7 +120,19 @@ export function whisperTimeoutMs(durationSeconds: number): number {
 // not scaled by attachment size/duration — Telegram's own 20MB cap already
 // bounds transfer size, so this only needs to cover ordinary network
 // slowness, not a large-file allowance.
-export const DOWNLOAD_TIMEOUT_MS = 30_000
+//
+// D-1066 (spec sam-data dev/analysis/2026-11-16-tg-file-download-fix-spec.md §2 B): the voice now waits for its
+// file on its OWN clock — deliverVoiceTranscript bounds the download wait at DOWNLOAD_TIMEOUT_MS (90 s), so a late
+// file can no longer spend whisper's share of the envelope (47819/48003: file at 88.5 s, whisper left 1.4 s). The
+// shared download itself (tg-download.ts) runs on to its 180 s cap, so the session's download_attachment can join
+// it. The envelope stays voiceEnvelopeMs() = whisper budget + this. Photos keep 30 s (PHOTO_DOWNLOAD_TIMEOUT_MS).
+export const DOWNLOAD_TIMEOUT_MS = 90_000
+export const PHOTO_DOWNLOAD_TIMEOUT_MS = 30_000
+
+/** The voice route's outer envelope: the whisper budget plus the bounded download wait (server.ts uses this). */
+export function voiceEnvelopeMs(whisperMs: number): number {
+  return whisperMs + DOWNLOAD_TIMEOUT_MS
+}
 
 // ── voice author + trust (OB-05/06/07/08, §6.1/§6.5) ───────────────────────
 
@@ -357,6 +370,8 @@ export type VoiceDeliveryEffects = {
   /** Per-voice journal (owner tg 44445): filled leg by leg; the caller writes ONE line from it. */
   journal?: VoiceJournal
   nowMs?: () => number
+  /** How long the voice waits for its file (default DOWNLOAD_TIMEOUT_MS); the download itself is not aborted. */
+  downloadTimeoutMs?: number
 }
 
 // ── per-voice journal (owner tg 44440 → proposal 44442 → «да» 44445) ─────────
@@ -375,6 +390,8 @@ export interface VoiceJournal {
   tr_ms?: number
   /** Transcript length in UTF-16 units — the length only, never the text. */
   tr_len?: number
+  /** The shared download's live journal (tg-download.ts, D-1066): attempts, winner, getFile/file ms, phase, probe. */
+  net?: DownloadJournal
 }
 
 /** Closed-set class of a download / transcribe failure — derived from the error, never copied. */
@@ -441,13 +458,22 @@ export function formatVoiceLine(tsMs: number, pid: number, f: VoiceLineFields): 
   const chat = /^-?[0-9]{1,20}$/.test(f.chat) ? f.chat : '-'
   const outcome = OUTCOME_LINE_RE.test(f.outcome) ? f.outcome : 'placeholder:transcribe'
   const j = f.journal
+  // D-1066 download keys, closed sets; `-` when absent (no shared download, e.g. no TRANSCRIBE_CMD or the store path).
+  const n = j.net
+  const att = (a: number | undefined) => (a === 1 || a === 2 ? String(a) : '-')
+  const phase = n && DL_PHASES.has(n.dl_phase) ? n.dl_phase : '-'
+  const probe = n?.probe_ms === 'timeout' || n?.probe_ms === 'error' ? n.probe_ms : num(n?.probe_ms as number | undefined)
   return (
     `${new Date(tsMs).toISOString()} pid=${num(pid)} chat=${chat} msg=${num(f.msg)}` +
     ` size=${num(f.size)} dur_s=${num(f.durS)}` +
     ` dl=${res(j.dl)} dl_ms=${num(j.dl_ms)} tr=${res(j.tr)} tr_ms=${num(j.tr_ms)} tr_len=${num(j.tr_len)}` +
-    ` outcome=${outcome} total_ms=${num(f.totalMs)}\n`
+    ` outcome=${outcome} total_ms=${num(f.totalMs)}` +
+    ` dl_att=${att(n?.dl_att)} dl_win=${att(n?.dl_win)} gf_ms=${num(n?.gf_ms)} fx_ms=${num(n?.fx_ms)}` +
+    ` dl_phase=${phase} probe_ms=${probe}\n`
   )
 }
+
+const DL_PHASES = new Set(['done', 'getfile', 'headers', 'body'])
 
 export const VOICE_LOG = 'voice.log'
 
@@ -489,7 +515,10 @@ export async function deliverVoiceTranscript(
   let downloadErr: unknown
   const dlStart = now()
   try {
-    audioPath = await fx.download()
+    // The voice's own bound on the file (D-1066 §2 B): past it → dl=timeout → placeholder:download; the shared
+    // download is not aborted here (a later download_attachment of the same file joins it).
+    const wait = fx.downloadTimeoutMs ?? DOWNLOAD_TIMEOUT_MS
+    audioPath = await withTimeout(fx.download(), wait, () => {})
   } catch (err) {
     downloadErr = err
   }

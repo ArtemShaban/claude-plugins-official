@@ -75,7 +75,8 @@ import {
 import {
   createVoiceLog,
   deliverVoiceTranscript,
-  DOWNLOAD_TIMEOUT_MS,
+  PHOTO_DOWNLOAD_TIMEOUT_MS,
+  voiceEnvelopeMs,
   forwardDateMeta,
   forwardOriginMeta,
   serialize,
@@ -88,6 +89,7 @@ import {
   withTimeout,
   type VoiceJournal,
 } from './voice-delivery'
+import { createTelegramDownloader, type DownloadJournal } from './tg-download'
 import { chooseAccess, detectLockMode, lockOwnerId, lockedAccessReader, ownerGate } from './access-lock'
 import { spawn } from 'child_process'
 import { createPollLiveness, createStartupLog, runStartupLoop } from './poll-liveness'
@@ -374,6 +376,9 @@ process.on('uncaughtException', (err: any) => {
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
+// The ONE Telegram file download (D-1066, tg-download.ts): hedged 2nd attempt at 8 s, single-flight per
+// file_id, 180 s cap. Every site below goes through it; nothing else here calls getFile or builds a file URL.
+const { downloadTelegramFile } = createTelegramDownloader({ token: TOKEN })
 // getUpdates time limit (poll timeout + 15 s) + the poll.json heartbeat the core
 // watchdog reads — poll-liveness.ts. Only getUpdates is touched.
 const pollLiveness = createPollLiveness({ stateDir: STATE_DIR, log: safeStderr })
@@ -385,13 +390,10 @@ const BUSINESS_ROOT = ARCHIVE_ROOT ? secretaryRoot(homedir()) : undefined
 // The one Bot API read the store adds (getFile; amends D-637 OB-11 — the secretary's own
 // SecretaryApi stays two methods). 'too_big' / undefined → nothing kept.
 const fetchTelegramFile: Download = async fileId => {
-  const file = await bot.api.getFile(fileId)
-  if (!file.file_path) return undefined
-  if (file.file_size != null && file.file_size > MAX_DOWNLOAD_BYTES) return 'too_big'
-  const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`)
-  if (!res.ok) throw Object.assign(new Error('file download failed'), { code: `HTTP_${res.status}` })
-  const ext = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
-  return { bytes: new Uint8Array(await res.arrayBuffer()), ext }
+  const got = await downloadTelegramFile(fileId, { maxBytes: MAX_DOWNLOAD_BYTES })
+  if (got.status === 'no_file') return undefined
+  if (got.status === 'too_big') return 'too_big'
+  return { bytes: got.bytes, ext: got.ext || 'bin' }
 }
 const keeper = createKeeper({ download: fetchTelegramFile, log: safeStderr, maxBytes: MAX_DOWNLOAD_BYTES })
 // Every message we send (reply tool, previews, approvals, D-876 direct sends, reports, echoes)
@@ -1356,20 +1358,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'download_attachment': {
         const file_id = args.file_id as string
-        const file = await bot.api.getFile(file_id)
-        if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-        const res = await fetch(url)
-        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-        const buf = Buffer.from(await res.arrayBuffer())
-        // file_path is from Telegram (trusted), but strip to safe chars anyway
-        // so nothing downstream can be tricked by an unexpected extension.
-        const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
-        const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
-        const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+        // Joins the bridge's in-flight download of the same file (D-1066 single-flight) instead of a second one.
+        const got = await downloadTelegramFile(file_id, { maxBytes: MAX_DOWNLOAD_BYTES })
+        if (got.status === 'no_file') throw new Error('Telegram returned no file_path — file may have expired')
+        if (got.status === 'too_big') throw new Error('file is over the 20MB bot download cap')
+        // ext / uniqueId come back stripped to safe chars (tg-download.ts).
+        const ext = got.ext || 'bin'
+        const uniqueId = got.uniqueId || 'dl'
         const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
         mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
-        writeFileSync(path, buf)
+        writeFileSync(path, got.bytes)
         return { content: [{ type: 'text', text: path }] }
       }
       case 'secretary_watch': {
@@ -1683,15 +1681,12 @@ bot.on('message:photo', async ctx => {
       const kept = await keepOthersMedia(ctx, best.file_id, best.file_size)
       if (kept) return kept
       try {
-        const file = await ctx.api.getFile(best.file_id)
-        if (!file.file_path) return undefined
-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-        const res = await fetch(url)
-        const buf = Buffer.from(await res.arrayBuffer())
-        const ext = file.file_path.split('.').pop() ?? 'jpg'
-        const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
+        const got = await downloadTelegramFile(best.file_id, { maxBytes: MAX_DOWNLOAD_BYTES })
+        if (got.status !== 'ok') return undefined
+        const ext = got.ext || 'jpg'
+        const path = join(INBOX_DIR, `${Date.now()}-${got.uniqueId || 'photo'}.${ext}`)
         mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
-        writeFileSync(path, buf)
+        writeFileSync(path, got.bytes)
         return path
       } catch (err) {
         process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
@@ -1929,8 +1924,8 @@ function safeName(s: string | undefined): string | undefined {
 }
 
 // Download a Telegram file by file_id into the idea-inbox attachments/ dir.
-// Reuses the getFile + fetch pattern (cf. download_attachment / the work-route
-// photo download above). Shared by voice (transcribe-on-capture) and photo
+// Goes through the one shared downloadTelegramFile (tg-download.ts, D-1066), like
+// download_attachment / the work-route photo download above. Shared by voice (transcribe-on-capture) and photo
 // (downloadIdeaAttachment, below) — kept as ONE function rather than a near-
 // duplicate per kind. Returns the local path, or undefined when no file is
 // available (expired / over the 20MB cap). Throws on a network/HTTP error (the
@@ -1941,26 +1936,21 @@ async function downloadFileToInbox(
   dir: string,
   sizeHint: number | undefined,
   extFallback: string,
+  onStart?: (journal: DownloadJournal) => void,
 ): Promise<string | undefined> {
   if (sizeHint != null && sizeHint > MAX_DOWNLOAD_BYTES) {
     safeStderr(`telegram channel: file ${file_id} is ${sizeHint}B > 20MB cap — skipping download\n`)
     return undefined
   }
-  const file = await bot.api.getFile(file_id)
-  if (!file.file_path) return undefined
-  if (file.file_size != null && file.file_size > MAX_DOWNLOAD_BYTES) return undefined
-  const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`file download failed: HTTP ${res.status}`)
-  const buf = Buffer.from(await res.arrayBuffer())
-  // file_path is Telegram-controlled (trusted) but strip to safe chars anyway.
-  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : extFallback
-  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || extFallback
-  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'file'
+  const got = await downloadTelegramFile(file_id, { maxBytes: MAX_DOWNLOAD_BYTES, onStart })
+  if (got.status !== 'ok') return undefined
+  // ext / uniqueId come back stripped to safe chars (tg-download.ts).
+  const ext = got.ext || extFallback
+  const uniqueId = got.uniqueId || 'file'
   const attachDir = join(dir, 'attachments')
   mkdirSync(attachDir, { recursive: true })
   const path = join(attachDir, `${Date.now()}-${uniqueId}.${ext}`)
-  writeFileSync(path, buf)
+  writeFileSync(path, got.bytes)
   return path
 }
 
@@ -2326,7 +2316,7 @@ async function handleInbound(
 
     // F4 fix (analysis/2026-09-17-voice-bridge-u3-verdict.md): every leg that
     // can hang (the voice envelope's own download, which has NO bound of its
-    // own — a bare `fetch` in downloadFileToInbox — and the pre-existing
+    // own at the time — a bare `fetch` in downloadFileToInbox; since D-1066 also bounded inside — and the pre-existing
     // photo downloadImage() leg) is wrapped in the already-tested
     // `withTimeout` so this chain SLOT is always bounded and this chat's
     // `serialize` key can never wedge behind a stalled TCP connection to
@@ -2360,7 +2350,7 @@ async function handleInbound(
           // next to it — core transcribe.sh); his own, or a store failure, keeps the inbox path.
           download: async () =>
             (await keepOthersMedia(ctx, fileId, sizeHint)) ??
-            downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga'),
+            downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga', net => (journal.net = net)),
           // Whisper mutex (§6.3, EXTRAS(2)): the SAME serialize() keyed on a
           // fixed 'whisper' key bounds concurrent whisper runs to 1 across ALL
           // chats (whisper is ~1.5GB RSS on a 16GB miniK) — a slow voice in
@@ -2380,18 +2370,13 @@ async function handleInbound(
         // deliverVoiceTranscript can spend time on (download, then
         // transcribe), since this outer timer runs concurrently with, not
         // instead of, runTranscribeCmd's own inner one.
-        timeoutMs + DOWNLOAD_TIMEOUT_MS,
-        // NAMED LIMITATION (mirrors voice-delivery.ts's withTimeout doc +
-        // M1's whisper-kill comment): there is no handle to abort the
-        // underlying `fetch` in downloadFileToInbox (no AbortController
-        // wired through), so onTimeout here only unblocks THIS chain slot —
-        // the dangling network request is abandoned, not killed. Acceptable
-        // per the owner's "чем проще чем лучше" order (tg 17096): it bounds
-        // the chain, which is the actual failure mode (a permanently wedged
-        // chat), not a resource leak on an already-rare stalled connection.
+        // D-1066: the download wait is bounded INSIDE deliverVoiceTranscript (DOWNLOAD_TIMEOUT_MS), so the
+        // download can no longer spend whisper's share; the shared download itself is bounded by its own
+        // 180 s cap in tg-download.ts (attempts aborted there), not by this timer.
+        voiceEnvelopeMs(timeoutMs),
         () => {
           envelopeTimedOut = true
-          voiceLogNotice(`voice envelope timed out after ${timeoutMs + DOWNLOAD_TIMEOUT_MS}ms`)
+          voiceLogNotice(`voice envelope timed out after ${voiceEnvelopeMs(timeoutMs)}ms`)
         },
       ).catch(() => ({ text: ctx.message?.caption ?? '(voice message)', meta: {} as Record<string, string> }))
       bodyText = envelope.text
@@ -2416,8 +2401,8 @@ async function handleInbound(
     } else if (downloadImage) {
       imagePath = await withTimeout(
         downloadImage(),
-        DOWNLOAD_TIMEOUT_MS,
-        () => safeStderr(`telegram channel: image download (chat=${chat_id} msg=${msgId ?? '?'}) timed out after ${DOWNLOAD_TIMEOUT_MS}ms\n`),
+        PHOTO_DOWNLOAD_TIMEOUT_MS,
+        () => safeStderr(`telegram channel: image download (chat=${chat_id} msg=${msgId ?? '?'}) timed out after ${PHOTO_DOWNLOAD_TIMEOUT_MS}ms\n`),
       ).catch(() => undefined)
     }
 

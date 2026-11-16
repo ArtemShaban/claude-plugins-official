@@ -133,6 +133,23 @@ leg did not run. `outcome` = `bridge` (the session got the transcript) or
 `placeholder:<no_cmd|download|transcribe|empty|timeout>` (it got `(voice message)`, or the caption alone). Never the
 transcript, the caption, a path or an error text. Code: `voice-delivery.ts` (`formatVoiceLine`).
 
+Download keys (D-1066), appended to the same line:
+`dl_att=<1|2> dl_win=<1|2|-> gf_ms=<getFile ms of the winner> fx_ms=<file GET ms of the winner>
+dl_phase=<done|getfile|headers|body> probe_ms=<ms|timeout|error|->`. `dl_phase` = where the most advanced attempt
+was when the voice stopped waiting; `probe_ms` = one bare TCP connect to api.telegram.org:443, made only when the
+second attempt fired. Reading a stall: `probe_ms` fast + `getfile` on both attempts → Telegram's side;
+`probe_ms` slow / `timeout` → our network path; `dl_win=2` → a per-connection stall the second attempt cured.
+The core control-plane leg `tg-voice-delivery` reads this file.
+
+## File downloads
+
+Every Telegram file download (the voice route, photos, `download_attachment`, the chat-store keeper) goes through
+one helper, `tg-download.ts` (`downloadTelegramFile`): if attempt 1 has no response headers after 8 s, a second
+attempt starts on a fresh connection and the first full answer wins (the other is aborted); a second request for
+the same `file_id` while it is in flight joins it instead of downloading again; a hard cap of 180 s aborts
+everything. The voice waits for its file at most 90 s (`DOWNLOAD_TIMEOUT_MS`), then gets the whisper budget on top.
+It is the only place that builds the file URL (it carries the bot token); its errors carry only a closed class.
+
 ## No history or search
 
 Telegram's Bot API exposes **neither** message history nor search. The bot
