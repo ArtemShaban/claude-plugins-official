@@ -390,7 +390,7 @@ const BUSINESS_ROOT = ARCHIVE_ROOT ? secretaryRoot(homedir()) : undefined
 // The one Bot API read the store adds (getFile; amends D-637 OB-11 — the secretary's own
 // SecretaryApi stays two methods). 'too_big' / undefined → nothing kept.
 const fetchTelegramFile: Download = async fileId => {
-  const got = await downloadTelegramFile(fileId, { maxBytes: MAX_DOWNLOAD_BYTES })
+  const got = await downloadTelegramFile(fileId)
   if (got.status === 'no_file') return undefined
   if (got.status === 'too_big') return 'too_big'
   return { bytes: got.bytes, ext: got.ext || 'bin' }
@@ -1359,7 +1359,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'download_attachment': {
         const file_id = args.file_id as string
         // Joins the bridge's in-flight download of the same file (D-1066 single-flight) instead of a second one.
-        const got = await downloadTelegramFile(file_id, { maxBytes: MAX_DOWNLOAD_BYTES })
+        const got = await downloadTelegramFile(file_id)
         if (got.status === 'no_file') throw new Error('Telegram returned no file_path — file may have expired')
         if (got.status === 'too_big') throw new Error('file is over the 20MB bot download cap')
         // ext / uniqueId come back stripped to safe chars (tg-download.ts).
@@ -1681,7 +1681,7 @@ bot.on('message:photo', async ctx => {
       const kept = await keepOthersMedia(ctx, best.file_id, best.file_size)
       if (kept) return kept
       try {
-        const got = await downloadTelegramFile(best.file_id, { maxBytes: MAX_DOWNLOAD_BYTES })
+        const got = await downloadTelegramFile(best.file_id)
         if (got.status !== 'ok') return undefined
         const ext = got.ext || 'jpg'
         const path = join(INBOX_DIR, `${Date.now()}-${got.uniqueId || 'photo'}.${ext}`)
@@ -1942,7 +1942,7 @@ async function downloadFileToInbox(
     safeStderr(`telegram channel: file ${file_id} is ${sizeHint}B > 20MB cap — skipping download\n`)
     return undefined
   }
-  const got = await downloadTelegramFile(file_id, { maxBytes: MAX_DOWNLOAD_BYTES, onStart })
+  const got = await downloadTelegramFile(file_id, { onStart })
   if (got.status !== 'ok') return undefined
   // ext / uniqueId come back stripped to safe chars (tg-download.ts).
   const ext = got.ext || extFallback

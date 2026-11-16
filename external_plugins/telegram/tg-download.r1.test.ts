@@ -1,10 +1,10 @@
-// The one Telegram file download — review round r1 cases (D-1066; Codex r1 f1, f2, f3, f5, f6:
+// The one Telegram file download — review rounds r1 + r2 (D-1066; Codex r1 f2, f3, f5, f6:
 // ~/.local/state/sam/codex-agent-runs/20261116T031735Z-driver-tg-file-download-r1/out.json).
 // Hermetic: a local fake Bot API on 127.0.0.1 or a mocked global fetch, a fake token, no live state.
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo, Socket } from 'node:net'
-import { createTelegramDownloader, TelegramDownloadError, TRANSFER_CEILING_BYTES } from './tg-download'
+import { createTelegramDownloader, MAX_PARALLEL_TRANSFERS, TelegramDownloadError, TRANSFER_CEILING_BYTES } from './tg-download'
 import { voiceErrorClass } from './voice-delivery'
 
 const TOKEN = '123456789:AAH-SECRET-fake-token-for-tests'
@@ -116,117 +116,225 @@ function trackTimers() {
   }
 }
 
-describe('f1 — one transfer per file_id, each caller keeps its own maxBytes', () => {
-  for (const order of ['small limit first', 'large limit first'] as const) {
-    test(order, async () => {
-      let release: () => void = () => {}
-      const f = await fakeApi((kind, _n, _req, res) => {
-        if (kind === 'getfile') return void (release = () => okGetFile(res))
-        okFile(res)
-      })
-      const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 60_000 })
-      const limits = order === 'small limit first' ? [4, 1_000] : [1_000, 4]
-      const journals: unknown[] = []
-      const calls = limits.map(maxBytes => dl.downloadTelegramFile('F', { maxBytes, onStart: j => journals.push(j) }))
-      expect(dl.inflightCount()).toBe(1)
-      while (f.requests.length === 0) await sleep(10) // getFile reached the fake API and waits for release()
-      release()
-      const got = await Promise.all(calls)
-      const small = got[limits.indexOf(4)]
-      const large = got[limits.indexOf(1_000)]
-      expect(small.status).toBe('too_big')
-      expect(large.status).toBe('ok')
-      if (large.status === 'ok') expect([...large.bytes]).toEqual([...FILE])
-      expect(f.requests.filter(r => r.kind === 'getfile').length).toBe(1)
-      expect(f.requests.filter(r => r.kind === 'file').length).toBe(1)
-      expect(journals[0]).toBe(journals[1]) // one shared live journal
-      expect(small.journal).toBe(large.journal)
-      expect(dl.inflightCount()).toBe(0)
-    })
+// Round r2 (Codex r2 ~/.local/state/sam/codex-agent-runs/20261116T034251Z-driver-tg-file-download-r2/out.json):
+// one fixed ceiling, no per-caller limit (every server.ts caller passed the same 20 MiB) → r2 f1 and f2 are moot by
+// construction; these cases prove it, and r2 f3 (one body per file, no assembly copy, ≤ 4 transfers at once).
+const MiB = 1024 * 1024
+
+/** Write `total` bytes with backpressure; stop early once the client is gone; `end` → finish the response. */
+function pump(res: ServerResponse, total: number, end: boolean, onWrite: (n: number) => void = () => {}) {
+  const chunk = Buffer.alloc(256 * 1024, 7)
+  let sent = 0
+  const next = () => {
+    while (!res.destroyed && sent < total) {
+      const n = Math.min(chunk.length, total - sent)
+      sent += n
+      onWrite(n)
+      if (!res.write(n === chunk.length ? chunk : chunk.subarray(0, n))) return void res.once('drain', next)
+    }
+    if (end && !res.destroyed) res.end()
   }
-})
+  next()
+}
 
-describe('f3 — maxBytes holds on the bytes actually read, not only on Telegram metadata', () => {
-  const over = new Uint8Array(9) // maxBytes 8 + 1
-
+describe('the fixed 20 MiB ceiling holds on the bytes actually read (r1 f3, r2)', () => {
   for (const meta of [{ name: 'file_size omitted', extra: { file_size: undefined } }, { name: 'file_size under-reported', extra: { file_size: 4 } }]) {
-    test(`${meta.name}, maxBytes+1 bytes returned → too_big, response closed, entry dropped`, async () => {
+    test(`${meta.name}, ceiling+1 bytes and the response held open → too_big, response closed, entry dropped`, async () => {
       const f = await fakeApi((kind, _n, _req, res) => {
         if (kind === 'getfile') return okGetFile(res, meta.extra)
-        // maxBytes+1 bytes and the response kept open: only the byte count can end it, and the cut must abort it.
-        res.writeHead(200)
-        res.write(Buffer.from(over))
+        res.writeHead(200) // no Content-Length: only the byte count can end it, and the cut must abort it
+        pump(res, TRANSFER_CEILING_BYTES + 1, false)
       })
       const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe })
-      const got = await dl.downloadTelegramFile('F', { maxBytes: 8 })
+      const got = await dl.downloadTelegramFile('F')
       expect(got.status).toBe('too_big')
       expect(dl.inflightCount()).toBe(0)
-      const fileSock = f.requests.find(r => r.kind === 'file')!.socket
-      expect(await waitClosed(f, fileSock)).toBe(true)
-    })
+      expect(dl.buffered().now).toBe(0)
+      expect(await waitClosed(f, f.requests.find(r => r.kind === 'file')!.socket)).toBe(true)
+    }, 15_000)
   }
 
-  test('an endless body is cut at the limit while streaming (aborted, never buffered whole)', async () => {
-    let written = 0
-    let serverSawClose = false
+  test('Content-Length over the ceiling → too_big before the body is read', async () => {
     const f = await fakeApi((kind, _n, _req, res) => {
       if (kind === 'getfile') return okGetFile(res, { file_size: undefined })
-      res.writeHead(200)
-      res.on('close', () => (serverSawClose = true))
-      const chunk = Buffer.alloc(16 * 1024)
-      const pump = () => {
-        if (res.destroyed || written > 50 * 1024 * 1024) return
-        written += chunk.length
-        res.write(chunk)
-        setTimeout(pump, 1)
-      }
-      pump()
-    })
-    const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe })
-    const got = await dl.downloadTelegramFile('F', { maxBytes: 100_000 })
-    expect(got.status).toBe('too_big')
-    expect(dl.inflightCount()).toBe(0)
-    const fileSock = f.requests.find(r => r.kind === 'file')!.socket
-    expect(await waitClosed(f, fileSock)).toBe(true)
-    await sleep(100)
-    expect(serverSawClose).toBe(true)
-    expect(written).toBeLessThan(5 * 1024 * 1024) // stopped long before the 50 MB the server would send
-  }, 15_000)
-
-  test('the fixed transfer ceiling (20 MiB, the Bot API getFile limit) holds even for a caller with no real limit', async () => {
-    expect(TRANSFER_CEILING_BYTES).toBe(20 * 1024 * 1024)
-    let written = 0
-    const f = await fakeApi((kind, _n, _req, res) => {
-      if (kind === 'getfile') return okGetFile(res, { file_size: undefined })
-      res.writeHead(200)
-      const chunk = Buffer.alloc(256 * 1024)
-      const pump = () => {
-        if (res.destroyed || written > 200 * 1024 * 1024) return
-        written += chunk.length
-        if (res.write(chunk)) setImmediate(pump)
-        else res.once('drain', pump)
-      }
-      pump()
-    })
-    const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe })
-    const got = await dl.downloadTelegramFile('F', { maxBytes: Number.MAX_SAFE_INTEGER })
-    expect(got.status).toBe('too_big')
-    expect(dl.inflightCount()).toBe(0)
-    expect(written).toBeLessThan(TRANSFER_CEILING_BYTES + 32 * 1024 * 1024)
-  }, 30_000)
-
-  test('Content-Length over the limit → too_big before the body is read', async () => {
-    const f = await fakeApi((kind, _n, _req, res) => {
-      if (kind === 'getfile') return okGetFile(res, { file_size: undefined })
-      res.writeHead(200, { 'content-length': String(10_000_000) })
+      res.writeHead(200, { 'content-length': String(TRANSFER_CEILING_BYTES + 1) })
       res.write(Buffer.alloc(1024))
     })
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe })
-    const got = await dl.downloadTelegramFile('F', { maxBytes: 1_000 })
+    const got = await dl.downloadTelegramFile('F')
     expect(got.status).toBe('too_big')
-    const fileSock = f.requests.find(r => r.kind === 'file')!.socket
-    expect(await waitClosed(f, fileSock)).toBe(true)
+    expect(dl.buffered().peak).toBe(0)
+    expect(await waitClosed(f, f.requests.find(r => r.kind === 'file')!.socket)).toBe(true)
   })
+
+  test('a body of exactly the ceiling: ok, assembled once in place (peak = 1× the body, the result IS that buffer)', async () => {
+    const f = await fakeApi((kind, _n, _req, res) => {
+      if (kind === 'getfile') return okGetFile(res, { file_size: undefined })
+      res.writeHead(200) // chunked: no size known up front
+      pump(res, TRANSFER_CEILING_BYTES, true)
+    })
+    const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe })
+    const got = await dl.downloadTelegramFile('F')
+    expect(got.status).toBe('ok')
+    if (got.status !== 'ok') return
+    expect(got.bytes.byteLength).toBe(TRANSFER_CEILING_BYTES)
+    expect(got.bytes[0]).toBe(7)
+    expect(got.bytes[TRANSFER_CEILING_BYTES - 1]).toBe(7)
+    expect(dl.buffered()).toEqual({ now: 0, peak: TRANSFER_CEILING_BYTES }) // never 2× during assembly
+    // No final copy: the returned bytes are a view of the one assembly buffer, exactly the body long.
+    expect((got.bytes.buffer as ArrayBuffer).resizable).toBe(true)
+    expect(got.bytes.buffer.byteLength).toBe(TRANSFER_CEILING_BYTES)
+    expect(dl.inflightCount()).toBe(0)
+  }, 15_000)
+
+  test('r2 f2: a junk caller limit (NaN, undefined, ±Infinity, negative, string) is ignored — an endless body stops at the ceiling', async () => {
+    for (const junk of [Number.NaN, undefined, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, '5']) {
+      let written = 0
+      let serverSawClose = false
+      const f = await fakeApi((kind, _n, _req, res) => {
+        if (kind === 'getfile') return okGetFile(res, { file_size: undefined })
+        res.writeHead(200)
+        res.on('close', () => (serverSawClose = true))
+        pump(res, 200 * MiB, false, n => (written += n))
+      })
+      const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, capMs: 20_000 })
+      const got = await dl.downloadTelegramFile('F', { maxBytes: junk } as never).catch(e => e)
+      expect(got.status).toBe('too_big')
+      expect(JSON.stringify(got)).not.toContain(SECRET)
+      expect(dl.inflightCount()).toBe(0)
+      expect(dl.buffered()).toEqual({ now: 0, peak: expect.any(Number) })
+      expect(dl.buffered().peak).toBeLessThanOrEqual(TRANSFER_CEILING_BYTES)
+      expect(await waitClosed(f, f.requests.find(r => r.kind === 'file')!.socket)).toBe(true)
+      await sleep(50)
+      expect(serverSawClose).toBe(true)
+      expect(written).toBeLessThan(TRANSFER_CEILING_BYTES + 32 * MiB) // socket buffers, never the 200 MiB
+    }
+  }, 60_000)
+})
+
+describe('r2 f1: a caller arriving while the cut is cancelling the body gets the same terminal answer', () => {
+  test('the stream cancel hook starts a second caller: both too_big (one transfer), no truncated ok; a call after settle fetches anew', async () => {
+    const realFetch = globalThis.fetch
+    const calls = { getfile: 0, file: 0 }
+    let dl: ReturnType<typeof createTelegramDownloader>
+    let late: Promise<unknown> | undefined
+    let inflightAtCancel = -1
+    globalThis.fetch = (async (u: string | URL | Request) => {
+      if (String(u).includes('/getFile')) {
+        calls.getfile++
+        return new Response(JSON.stringify({ ok: true, result: { file_id: 'F', file_unique_id: 'U', file_path: 'voice/f.oga' } }))
+      }
+      calls.file++
+      let sent = 0
+      return new Response(
+        new ReadableStream({
+          pull(c) {
+            sent += MiB
+            c.enqueue(new Uint8Array(MiB))
+            if (sent > 64 * MiB) c.close() // never reached: the cut comes at 20 MiB
+          },
+          cancel() {
+            if (late) return
+            inflightAtCancel = dl.inflightCount()
+            late = dl.downloadTelegramFile('F') // the irreversible cut is happening right now
+          },
+        }),
+      )
+    }) as typeof fetch
+    try {
+      dl = createTelegramDownloader({ token: TOKEN, probe, hedgeMs: 60_000 })
+      const first = await dl.downloadTelegramFile('F')
+      expect(late).toBeDefined()
+      const second = (await late) as typeof first
+      expect(first.status).toBe('too_big')
+      expect(second.status).toBe('too_big') // the only limit is the ceiling: over it for every caller
+      expect(second).toBe(first) // joined the same transfer
+      expect(inflightAtCancel).toBe(1)
+      expect(calls).toEqual({ getfile: 1, file: 1 })
+      expect(dl.inflightCount()).toBe(0)
+      expect(dl.buffered().now).toBe(0)
+      const after = await dl.downloadTelegramFile('F') // the entry was dropped on settle: a new transfer
+      expect(after.status).toBe('too_big')
+      expect(calls).toEqual({ getfile: 2, file: 2 })
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  }, 15_000)
+})
+
+describe('r2 f3: one body per file, at most MAX_PARALLEL_TRANSFERS transfers at once', () => {
+  test('both hedged attempts get headers at the same moment → only the first reads a body, the other is aborted', async () => {
+    const held: ServerResponse[] = []
+    const fileSockets: Socket[] = []
+    const f = await fakeApi((kind, n, req, res) => {
+      if (kind === 'getfile') return n === 1 ? void setTimeout(() => okGetFile(res, { file_size: undefined }), 150) : okGetFile(res, { file_size: undefined })
+      held.push(res)
+      fileSockets.push(req.socket)
+      if (held.length < 2) return
+      for (const r of held) r.writeHead(200) // both bodies start in the same tick
+      for (const r of held) pump(r, TRANSFER_CEILING_BYTES, true)
+    })
+    const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 })
+    const got = await dl.downloadTelegramFile('F')
+    expect(got.status).toBe('ok')
+    if (got.status === 'ok') expect(got.bytes.byteLength).toBe(TRANSFER_CEILING_BYTES)
+    expect(got.journal.dl_att).toBe(2)
+    expect(dl.buffered()).toEqual({ now: 0, peak: TRANSFER_CEILING_BYTES }) // one body, not two
+    // file requests arrive attempt 2 first (its getFile was instant), then attempt 1
+    const loser = got.journal.dl_win === 2 ? fileSockets[1] : fileSockets[0]
+    expect(await waitClosed(f, loser)).toBe(true)
+    expect(dl.inflightCount()).toBe(0)
+  }, 20_000)
+
+  test('6 file_ids at once: never more than 4 transfers, body memory ≤ 4 bodies, all succeed', async () => {
+    let open = 0
+    let maxOpen = 0
+    const f = await fakeApi((kind, _n, _req, res) => {
+      open++
+      maxOpen = Math.max(maxOpen, open)
+      res.on('close', () => open--)
+      if (kind === 'getfile') return void setTimeout(() => okGetFile(res, { file_size: undefined }), 20)
+      res.writeHead(200)
+      pump(res, 8 * MiB, true)
+    })
+    const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 60_000 })
+    const got = await Promise.all(['A', 'B', 'C', 'D', 'E', 'F'].map(id => dl.downloadTelegramFile(id)))
+    for (const g of got) {
+      expect(g.status).toBe('ok')
+      if (g.status === 'ok') expect(g.bytes.byteLength).toBe(8 * MiB)
+    }
+    expect(maxOpen).toBe(MAX_PARALLEL_TRANSFERS) // the cap was reached and held
+    expect(dl.buffered().peak).toBeLessThanOrEqual(MAX_PARALLEL_TRANSFERS * 8 * MiB)
+    expect(dl.buffered().now).toBe(0)
+    expect(f.requests.filter(r => r.kind === 'getfile').length).toBe(6)
+    expect(dl.inflightCount()).toBe(0)
+  }, 30_000)
+
+  test('queued transfers time out cleanly: the cap clock runs while waiting, nothing keeps running, no slot leaks', async () => {
+    let mode: 'stall' | 'ok' = 'stall'
+    const f = await fakeApi((kind, _n, _req, res) => {
+      if (mode === 'stall') return never()
+      return kind === 'getfile' ? okGetFile(res) : okFile(res)
+    })
+    const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 60_000, capMs: 300 })
+    const t0 = performance.now()
+    const errs = await Promise.all(['A', 'B', 'C', 'D', 'E', 'F'].map(id => dl.downloadTelegramFile(id).catch(e => e)))
+    // All 6 end at their own 300 ms cap, the 2 queued ones too (not 300 ms after they got a slot).
+    expect(performance.now() - t0).toBeLessThan(550)
+    expect(errs.map(e => voiceErrorClass(e))).toEqual(Array(6).fill('timeout'))
+    expect(dl.inflightCount()).toBe(0)
+    await sleep(50)
+    const seen = f.requests.length
+    expect(seen).toBeGreaterThanOrEqual(MAX_PARALLEL_TRANSFERS) // a queued one may start in a freed slot, then hit its cap
+    expect(seen).toBeLessThanOrEqual(6)
+    await sleep(300)
+    expect(f.requests.length).toBe(seen) // nothing starts after its download settled
+    for (const s of f.sockets) expect(await waitClosed(f, s)).toBe(true)
+    mode = 'ok'
+    const again = await Promise.all(['A', 'B', 'C', 'D', 'E'].map(id => dl.downloadTelegramFile(id)))
+    expect(again.every(g => g.status === 'ok')).toBe(true) // no slot leaked
+    expect(dl.inflightCount()).toBe(0)
+  }, 15_000)
 })
 
 describe('f2 — attempt 2 never reuses a pooled connection (Bun 1.4.0 `keepalive: false`)', () => {
@@ -245,13 +353,13 @@ describe('f2 — attempt 2 never reuses a pooled connection (Bun 1.4.0 `keepaliv
       })
       const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 })
       // Warm Bun's pool: two concurrent downloads leave two idle keep-alive sockets to this origin.
-      await Promise.all([dl.downloadTelegramFile('W1', { maxBytes: 1_000 }), dl.downloadTelegramFile('W2', { maxBytes: 1_000 })])
+      await Promise.all([dl.downloadTelegramFile('W1'), dl.downloadTelegramFile('W2')])
       await sleep(50)
       const warm = f.sockets.filter(s => !f.closed.has(s))
       expect(warm.length).toBeGreaterThanOrEqual(2) // the pool really holds idle reusable connections
       phase = 'race'
       const before = f.requests.length
-      const got = await dl.downloadTelegramFile('R', { maxBytes: 1_000 })
+      const got = await dl.downloadTelegramFile('R')
       expect(got.status).toBe('ok')
       expect(got.journal.dl_att).toBe(2)
       expect(got.journal.dl_win).toBe(winner)
@@ -286,7 +394,7 @@ describe('f6 — one attempt fails after the hedge, the sibling returns the byte
       try {
         const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100, capMs: 5_000 })
         const { value: got, unhandled } = await watchUnhandled(async () => {
-          const p = timers.during(() => dl.downloadTelegramFile('F', { maxBytes: 1_000 }))
+          const p = timers.during(() => dl.downloadTelegramFile('F'))
           return await p
         })
         expect(got.status).toBe('ok')
@@ -312,7 +420,7 @@ describe('f6 — one attempt fails after the hedge, the sibling returns the byte
       okFile(res)
     })
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 })
-    const { value: got, unhandled } = await watchUnhandled(() => dl.downloadTelegramFile('F', { maxBytes: 1_000 }))
+    const { value: got, unhandled } = await watchUnhandled(() => dl.downloadTelegramFile('F'))
     expect(got.status).toBe('ok')
     expect(got.journal.dl_win).toBe(1)
     expect(unhandled).toEqual([])
@@ -423,7 +531,7 @@ describe('f5 — the bot token never leaves, on every error path', () => {
           },
           () =>
             createTelegramDownloader({ token: TOKEN, probe, hedgeMs: 60_000 })
-              .downloadTelegramFile('F', { maxBytes: 1_000, onStart: j => (journal = j) })
+              .downloadTelegramFile('F', { onStart: j => (journal = j) })
               .catch(err => err),
         ),
       )
@@ -446,7 +554,7 @@ describe('f5 — the bot token never leaves, on every error path', () => {
           })
           return new Response(stream)
         },
-        () => createTelegramDownloader({ token: TOKEN, probe, hedgeMs: 60_000 }).downloadTelegramFile('F', { maxBytes: 1_000 }).catch(err => err),
+        () => createTelegramDownloader({ token: TOKEN, probe, hedgeMs: 60_000 }).downloadTelegramFile('F').catch(err => err),
       ),
     )
     expectClosed(e)
@@ -463,7 +571,7 @@ describe('f5 — the bot token never leaves, on every error path', () => {
       okFile(res)
     })
     const { value: e, out } = await captureOutput(() =>
-      createTelegramDownloader({ token: TOKEN, origin: f.origin, probe }).downloadTelegramFile('F', { maxBytes: 1_000 }).catch(err => err),
+      createTelegramDownloader({ token: TOKEN, origin: f.origin, probe }).downloadTelegramFile('F').catch(err => err),
     )
     expectClosed(e)
     expect(voiceErrorClass(e)).toBe('http_200')
@@ -477,7 +585,7 @@ describe('f5 — the bot token never leaves, on every error path', () => {
       okFile(res)
     })
     const { value, out } = await captureOutput(() =>
-      watchUnhandled(() => createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 }).downloadTelegramFile('F', { maxBytes: 1_000 })),
+      watchUnhandled(() => createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 }).downloadTelegramFile('F')),
     )
     expect(value.value.status).toBe('ok')
     expect(value.unhandled).toEqual([])

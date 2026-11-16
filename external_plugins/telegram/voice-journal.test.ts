@@ -251,7 +251,7 @@ describe('end-to-end: stalled attempt 1 → hedge → bridge, one voice.log line
       const env = await deliverVoiceTranscript(true, undefined, author, {
         journal,
         download: async () => {
-          const got = await downloadTelegramFile('FILE', { maxBytes: 1_000, onStart: n => (journal.net = n) })
+          const got = await downloadTelegramFile('FILE', { onStart: n => (journal.net = n) })
           return got.status === 'ok' ? join(dir, 'v.oga') : undefined
         },
         transcribe: async () => 'привет',

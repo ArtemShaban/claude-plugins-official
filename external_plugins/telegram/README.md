@@ -145,10 +145,12 @@ The core control-plane leg `tg-voice-delivery` reads this file.
 
 Every Telegram file download (the voice route, photos, `download_attachment`, the chat-store keeper) goes through
 one helper, `tg-download.ts` (`downloadTelegramFile`): if attempt 1 has no response headers after 8 s, a second
-attempt starts on a fresh connection and the first full answer wins (the other is aborted); a second request for
-the same `file_id` while it is in flight joins it instead of downloading again (each caller still gets its own
-`maxBytes` answer, judged on the bytes actually read; the body read stops at the largest caller limit, never past
-20 MiB); a hard cap of 180 s aborts everything. "Fresh connection" = Bun's `keepalive: false` (Bun docs: «Disable
+attempt starts on a fresh connection; the first attempt to get the file's response headers owns the body and the
+other is aborted at that moment (at most one body per file). One fixed ceiling for every download, 20 MiB (the Bot
+API limit), judged on the bytes actually read: over it → `too_big` and the body is cancelled. The body is assembled
+in one buffer grown in place (no second copy). A second request for the same `file_id` while it is in flight joins
+it and gets the same answer. At most 4 files download at once (more wait in order), so file bodies never hold more
+than 4 × 20 MiB. A hard cap of 180 s (counted from the request, waiting included) aborts everything. "Fresh connection" = Bun's `keepalive: false` (Bun docs: «Disable
 connection reuse for this request»). The voice waits for its file at most 90 s (`DOWNLOAD_TIMEOUT_MS`), then gets the whisper budget on top.
 It is the only place that builds the file URL (it carries the bot token); its errors carry only a closed class.
 

@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo, Socket } from 'node:net'
-import { createTelegramDownloader, DOWNLOAD_CAP_MS, HEDGE_MS, TelegramDownloadError } from './tg-download'
+import { createTelegramDownloader, DOWNLOAD_CAP_MS, HEDGE_MS, TelegramDownloadError, TRANSFER_CEILING_BYTES } from './tg-download'
 import { voiceErrorClass } from './voice-delivery'
 
 const TOKEN = '123456789:AAH-SECRET-fake-token-for-tests'
@@ -84,9 +84,9 @@ describe('criterion 1 — attempt 1 stalls, attempt 2 at 8 s on a second connect
       okFile(res)
     })
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe })
-    const t0 = Date.now()
-    const got = await dl.downloadTelegramFile('F', { maxBytes: 1_000 })
-    const took = Date.now() - t0
+    const t0 = performance.now()
+    const got = await dl.downloadTelegramFile('F')
+    const took = performance.now() - t0
     expect(got.status).toBe('ok')
     if (got.status === 'ok') expect([...got.bytes]).toEqual([...FILE])
     expect(took).toBeGreaterThanOrEqual(HEDGE_MS - 50)
@@ -106,9 +106,9 @@ describe('criterion 1 — attempt 1 stalls, attempt 2 at 8 s on a second connect
       okFile(res)
     })
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe })
-    const t0 = Date.now()
-    const got = await dl.downloadTelegramFile('F', { maxBytes: 1_000 })
-    const took = Date.now() - t0
+    const t0 = performance.now()
+    const got = await dl.downloadTelegramFile('F')
+    const took = performance.now() - t0
     expect(got.status).toBe('ok')
     expect(took).toBeGreaterThanOrEqual(HEDGE_MS - 50)
     expect(took).toBeLessThanOrEqual(10_000)
@@ -129,9 +129,9 @@ describe('criterion 2 — first complete answer wins (scaled: hedge 100 ms, atte
       okFile(res)
     })
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 })
-    const t0 = Date.now()
-    const got = await dl.downloadTelegramFile('F', { maxBytes: 1_000 })
-    const took = Date.now() - t0
+    const t0 = performance.now()
+    const got = await dl.downloadTelegramFile('F')
+    const took = performance.now() - t0
     expect(got.status).toBe('ok')
     expect(took).toBeGreaterThanOrEqual(950)
     expect(took).toBeLessThan(2_000)
@@ -149,7 +149,7 @@ describe('criterion 2 — first complete answer wins (scaled: hedge 100 ms, atte
       setTimeout(() => res.end(Buffer.from(FILE.slice(4))), 400)
     })
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 })
-    const got = await dl.downloadTelegramFile('F', { maxBytes: 1_000 })
+    const got = await dl.downloadTelegramFile('F')
     expect(got.status).toBe('ok')
     if (got.status === 'ok') expect([...got.bytes]).toEqual([...FILE])
     expect(f.requests.length).toBe(2)
@@ -161,7 +161,7 @@ describe('criterion 2 — first complete answer wins (scaled: hedge 100 ms, atte
     let probed = 0
     const f = await fakeApi((kind, _n, _req, res) => (kind === 'getfile' ? okGetFile(res) : okFile(res)))
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe: async () => (probed++, 1) })
-    const got = await dl.downloadTelegramFile('F', { maxBytes: 1_000 })
+    const got = await dl.downloadTelegramFile('F')
     expect(got).toMatchObject({ status: 'ok', ext: 'oga', uniqueId: 'AgAD-uniq' })
     expect(got.journal).toMatchObject({ dl_att: 1, dl_win: 1, dl_phase: 'done' })
     await sleep(50)
@@ -177,12 +177,12 @@ describe('criterion 3 — single-flight per file_id', () => {
       okFile(res)
     })
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 60_000 })
-    const first = dl.downloadTelegramFile('F', { maxBytes: 1_000 })
+    const first = dl.downloadTelegramFile('F')
     // The voice gives up waiting (its own bound); the shared download goes on.
     const voiceWait = await Promise.race([first.then(() => 'got'), sleep(150).then(() => 'gave-up')])
     expect(voiceWait).toBe('gave-up')
     let joinedJournal: unknown
-    const second = dl.downloadTelegramFile('F', { maxBytes: 1_000, onStart: j => (joinedJournal = j) })
+    const second = dl.downloadTelegramFile('F', { onStart: j => (joinedJournal = j) })
     expect(dl.inflightCount()).toBe(1)
     release()
     const [a, b] = await Promise.all([first, second])
@@ -204,11 +204,11 @@ describe('criterion 3 — single-flight per file_id', () => {
       okFile(res)
     })
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe })
-    const err = await dl.downloadTelegramFile('F', { maxBytes: 1_000 }).catch(e => e)
+    const err = await dl.downloadTelegramFile('F').catch(e => e)
     expect(err).toBeInstanceOf(TelegramDownloadError)
     expect(voiceErrorClass(err)).toBe('http_500')
     expect(dl.inflightCount()).toBe(0)
-    const again = await dl.downloadTelegramFile('F', { maxBytes: 1_000 })
+    const again = await dl.downloadTelegramFile('F')
     expect(again.status).toBe('ok')
     expect(f.requests.filter(r => r.kind === 'getfile').length).toBe(2)
   })
@@ -216,7 +216,7 @@ describe('criterion 3 — single-flight per file_id', () => {
   test('different file_ids do not join', async () => {
     const f = await fakeApi((kind, _n, _req, res) => (kind === 'getfile' ? okGetFile(res) : okFile(res)))
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe })
-    await Promise.all([dl.downloadTelegramFile('A', { maxBytes: 1_000 }), dl.downloadTelegramFile('B', { maxBytes: 1_000 })])
+    await Promise.all([dl.downloadTelegramFile('A'), dl.downloadTelegramFile('B')])
     expect(f.requests.filter(r => r.kind === 'getfile').length).toBe(2)
   })
 })
@@ -225,7 +225,7 @@ describe('bounds and results', () => {
   test('hard cap: both attempts stalled → timed out, all sockets closed, entry dropped', async () => {
     const f = await fakeApi(() => never())
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 50, capMs: 300 })
-    const err = await dl.downloadTelegramFile('F', { maxBytes: 1_000 }).catch(e => e)
+    const err = await dl.downloadTelegramFile('F').catch(e => e)
     expect(voiceErrorClass(err)).toBe('timeout')
     expect(dl.inflightCount()).toBe(0)
     expect(f.sockets.length).toBe(2)
@@ -239,18 +239,18 @@ describe('bounds and results', () => {
       res.end(JSON.stringify({ ok: false, error_code: 400, description: 'Bad Request: invalid file_id' }))
     })
     const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 200 })
-    const err = await dl.downloadTelegramFile('F', { maxBytes: 1_000 }).catch(e => e)
+    const err = await dl.downloadTelegramFile('F').catch(e => e)
     expect(voiceErrorClass(err)).toBe('http_400')
     await sleep(300)
     expect(f.requests.length).toBe(1)
   })
 
-  test('no file_path → no_file; over maxBytes → too_big (no file GET)', async () => {
+  test('no file_path → no_file; file_size over the 20 MiB ceiling → too_big (no file GET)', async () => {
     const f1 = await fakeApi((_k, _n, _req, res) => okGetFile(res, { file_path: undefined }))
-    const a = await createTelegramDownloader({ token: TOKEN, origin: f1.origin, probe }).downloadTelegramFile('F', { maxBytes: 1_000 })
+    const a = await createTelegramDownloader({ token: TOKEN, origin: f1.origin, probe }).downloadTelegramFile('F')
     expect(a.status).toBe('no_file')
-    const f2 = await fakeApi((_k, _n, _req, res) => okGetFile(res, { file_size: 5_000 }))
-    const b = await createTelegramDownloader({ token: TOKEN, origin: f2.origin, probe }).downloadTelegramFile('F', { maxBytes: 1_000 })
+    const f2 = await fakeApi((_k, _n, _req, res) => okGetFile(res, { file_size: TRANSFER_CEILING_BYTES + 1 }))
+    const b = await createTelegramDownloader({ token: TOKEN, origin: f2.origin, probe }).downloadTelegramFile('F')
     expect(b.status).toBe('too_big')
     expect(f2.requests.length).toBe(1)
   })
@@ -270,7 +270,7 @@ describe('the bot token never leaves in an error or the journal', () => {
     tmp.server.close()
     fakes.splice(fakes.indexOf(tmp), 1)
     const errs: unknown[] = []
-    errs.push(await createTelegramDownloader({ token: TOKEN, origin: deadOrigin, probe }).downloadTelegramFile('F', { maxBytes: 9 }).catch(e => e))
+    errs.push(await createTelegramDownloader({ token: TOKEN, origin: deadOrigin, probe }).downloadTelegramFile('F').catch(e => e))
     const f = await fakeApi((kind, _n, req, res) => {
       if (kind === 'getfile') {
         res.statusCode = 401
@@ -278,18 +278,18 @@ describe('the bot token never leaves in an error or the journal', () => {
         return res.end(JSON.stringify({ ok: false, error_code: 401, description: `Unauthorized ${req.url}` }))
       }
     })
-    errs.push(await createTelegramDownloader({ token: TOKEN, origin: f.origin, probe }).downloadTelegramFile('F', { maxBytes: 9 }).catch(e => e))
+    errs.push(await createTelegramDownloader({ token: TOKEN, origin: f.origin, probe }).downloadTelegramFile('F').catch(e => e))
     const g = await fakeApi((kind, _n, req, res) => {
       if (kind === 'getfile') return okGetFile(res)
       res.statusCode = 404
       res.end(`not found ${req.url}`)
     })
-    errs.push(await createTelegramDownloader({ token: TOKEN, origin: g.origin, probe }).downloadTelegramFile('F', { maxBytes: 9 }).catch(e => e))
+    errs.push(await createTelegramDownloader({ token: TOKEN, origin: g.origin, probe }).downloadTelegramFile('F').catch(e => e))
     const h = await fakeApi(() => never())
     let journal: unknown
     errs.push(
       await createTelegramDownloader({ token: TOKEN, origin: h.origin, probe, hedgeMs: 30, capMs: 120 })
-        .downloadTelegramFile('F', { maxBytes: 9, onStart: j => (journal = j) })
+        .downloadTelegramFile('F', { onStart: j => (journal = j) })
         .catch(e => e),
     )
     expect(errs.map(e => voiceErrorClass(e))).toEqual(['network', 'http_401', 'http_404', 'timeout'])
