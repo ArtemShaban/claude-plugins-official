@@ -18,12 +18,12 @@ import {
   deliverVoiceTranscript,
   isRetriableDownload,
   LATE_DEADLINE_MS,
-  LATE_EMIT_BUDGET_MS,
   LATE_TRY_AFTER_MS,
   LATE_VOICE_REFUSAL,
   lateFetchWanted,
   markPending,
   serialize,
+  TERMINAL_EMIT_MS,
   voiceAuthor,
   voiceErrorClass,
   voiceOutcomeOf,
@@ -791,7 +791,7 @@ describe('r1 f3 — the deadline bounds the whole re-fetch', () => {
         onLate: () => void final.push(`late ${n}`), onLost: () => void final.push(`lost ${n}`),
       })
     }
-    const stopAt = LATE_DEADLINE_MS - LATE_EMIT_BUDGET_MS // re-fetching stops here; the lost notice has the rest to be accepted
+    const stopAt = LATE_DEADLINE_MS // work stops at the declared +70 min end (rr2-2); the lost notice goes out then
     await clock.advanceTo(t0 + stopAt - 1)
     expect(runs).toEqual(['/a1.oga']) // voice 1 holds whisper; 2 and 3 wait in the queue
     expect(final).toEqual([]) // nothing final while work is pending
@@ -813,9 +813,10 @@ describe('r1 f3 — the deadline bounds the whole re-fetch', () => {
     expect(clock.pending()).toBe(0)
   })
 
-  test('LATE_DEADLINE_MS is 70 min and comes after the last try at +60', () => {
+  test('LATE_DEADLINE_MS is 70 min and comes after the last try at +60; the terminal window is 30 s', () => {
     expect(LATE_DEADLINE_MS).toBe(70 * MIN)
-    expect(LATE_DEADLINE_MS).toBeGreaterThan(LATE_TRY_AFTER_MS[LATE_TRY_AFTER_MS.length - 1] + LATE_EMIT_BUDGET_MS)
+    expect(LATE_DEADLINE_MS).toBeGreaterThan(LATE_TRY_AFTER_MS[LATE_TRY_AFTER_MS.length - 1])
+    expect(TERMINAL_EMIT_MS).toBe(30_000)
   })
 })
 
@@ -840,12 +841,15 @@ describe('rr1 f3 — a never-settling final notification closes once as late:und
 
   for (const kind of ['late', 'lost-after-tries', 'lost-at-deadline'] as const) {
     for (const later of ['resolves', 'rejects'] as const) {
-      test(`${kind}: transport never answers → one late:undelivered at the deadline, entry and timers gone; a later ${later} changes nothing`, async () => {
+      // late / lost-after-tries start before +70 → the voice's hard end +70; lost-at-deadline starts AT +70 → its own
+      // TERMINAL_EMIT_MS window → +70:30 (rr2-2)
+      const endAt = kind === 'lost-at-deadline' ? LATE_DEADLINE_MS + TERMINAL_EMIT_MS : LATE_DEADLINE_MS
+      test(`${kind}: transport never answers → one late:undelivered at +${endAt / MIN} min, entry and timers gone; a later ${later} changes nothing`, async () => {
         const w = hung(kind)
-        await w.h.clock.advanceTo(w.h.t0 + LATE_DEADLINE_MS - 1)
-        expect(w.h.lines).toEqual([]) // still inside the deadline: the notification is still being waited for
+        await w.h.clock.advanceTo(w.h.t0 + endAt - 1)
+        expect(w.h.lines).toEqual([]) // still inside the window: the notification is still being waited for
         expect(w.fetcher.has('FILE-1')).toBe(true) // download_attachment still refused meanwhile
-        await w.h.clock.advanceTo(w.h.t0 + LATE_DEADLINE_MS)
+        await w.h.clock.advanceTo(w.h.t0 + endAt)
         await drain()
         expect(w.h.lines.map(l => l.outcome)).toEqual(['late:undelivered'])
         expect(w.fetcher.size()).toBe(0)
@@ -864,6 +868,46 @@ describe('rr1 f3 — a never-settling final notification closes once as late:und
       })
     }
   }
+
+  // rr2-2 — the work/abort deadline is the declared +70 min end, not 30 s earlier
+  test('+60 try whose whisper finishes at +69:45, onLate accepted at once → one late:bridge, never onLost, no timers at +70', async () => {
+    // downloads 1..5 fail with 504 (tries at +2..+40); the +60 try gets the file and whisper returns at +69:45
+    const failing = [async () => { throw err504() }, async () => { throw err504() }, async () => { throw err504() },
+      async () => { throw err504() }, async () => { throw err504() }, async () => '/a.oga']
+    const h2 = harness({ downloads: failing })
+    h2.voice.transcribe = () => new Promise<string>(resolve => { h2.clock.setTimer(() => resolve('поздний текст'), 9 * MIN + 45_000) })
+    h2.fetcher.schedule(h2.voice)
+    await h2.clock.advanceTo(h2.t0 + 60 * MIN)
+    expect(h2.tryTimes.length).toBe(6)
+    expect(h2.lines).toEqual([])
+    await h2.clock.advanceTo(h2.t0 + 69 * MIN + 44_999)
+    expect(h2.late.length).toBe(0)
+    await h2.clock.advanceTo(h2.t0 + 69 * MIN + 45_000)
+    await h2.clock.advanceTo(h2.t0 + LATE_DEADLINE_MS + MIN)
+    expect(h2.late.length).toBe(1)
+    expect(h2.lost()).toBe(0)
+    expect(h2.lines.map(l => l.outcome)).toEqual(['late:bridge'])
+    await h2.clock.advanceTo(h2.t0 + 300 * MIN)
+    expect(h2.lines.length).toBe(1)
+    expect(h2.fetcher.size()).toBe(0)
+    expect(h2.clock.pending()).toBe(0)
+  })
+
+  test('whisper never returns, lost notice at +70:00 with an accepting transport → late:failed (not undelivered), no timers', async () => {
+    const h = harness({ downloads: [async () => '/a.oga'], transcribe: () => new Promise<string>(() => {}) })
+    h.fetcher.schedule(h.voice)
+    await h.clock.advanceTo(h.t0 + LATE_DEADLINE_MS - 1)
+    expect(h.lost()).toBe(0)
+    expect(h.lines).toEqual([])
+    await h.clock.advanceTo(h.t0 + LATE_DEADLINE_MS)
+    for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r))
+    expect(h.lost()).toBe(1)
+    expect(h.lines.map(l => l.outcome)).toEqual(['late:failed'])
+    await h.clock.advanceTo(h.t0 + 300 * MIN)
+    expect(h.lines.length).toBe(1)
+    expect(h.fetcher.size()).toBe(0)
+    expect(h.clock.pending()).toBe(0)
+  })
 
   test('a notification accepted before the deadline still closes as late:bridge, and its hard-end timer is cleared', async () => {
     const h = harness({ downloads: [async () => '/a.oga'] })

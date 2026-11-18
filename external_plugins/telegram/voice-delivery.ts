@@ -608,10 +608,12 @@ export const LATE_TRY_AFTER_MS: readonly number[] = [2, 5, 10, 20, 40, 60].map(m
  * agent's own +70 min record (core .claude/rules/telegram.md) is armed after that wake, so it never fires first. */
 export const LATE_DEADLINE_MS = 70 * 60_000
 
-/** The last slice of that deadline is the final notification's own budget (Codex rr1 f3): the voice stops being
- * re-fetched at LATE_DEADLINE_MS − this, sends its one lost notice, and whatever the transport has not accepted by
- * LATE_DEADLINE_MS closes as `late:undelivered`. */
-export const LATE_EMIT_BUDGET_MS = 30_000
+/** Work (tries, whisper) runs up to LATE_DEADLINE_MS; then the one lost notice goes out. The final notification
+ * (late text or lost notice) is bounded to the later of the voice's own LATE_DEADLINE_MS and this window counted from
+ * the moment the notification starts — so a notice that starts AT the deadline still gets a real window, and a
+ * transport that never answers closes the voice once as `late:undelivered` at most this long after the deadline
+ * (Codex rr1 f3, rr2-2). */
+export const TERMINAL_EMIT_MS = 30_000
 
 /** download_attachment's answer for a file under re-fetch (§2 C): at once, no network call. */
 export const LATE_VOICE_REFUSAL =
@@ -691,20 +693,20 @@ export function createLateVoiceFetcher(deps: {
   tryAfterMs?: readonly number[]
   downloadTimeoutMs?: number
   deadlineMs?: number
-  emitBudgetMs?: number
+  terminalEmitMs?: number
 }): LateVoiceFetcher {
   const now = deps.nowMs ?? Date.now
   const setTimer = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
   const clearTimer = deps.clearTimer ?? ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>))
   const offsets = deps.tryAfterMs ?? LATE_TRY_AFTER_MS
   const deadlineMs = deps.deadlineMs ?? LATE_DEADLINE_MS
-  const emitBudgetMs = deps.emitBudgetMs ?? LATE_EMIT_BUDGET_MS
+  const terminalEmitMs = deps.terminalEmitMs ?? TERMINAL_EMIT_MS
   type Entry = LateVoice & {
     key: string
     tries: number
     timer?: unknown
     deadline?: unknown
-    /** The final notification's own bound: the hard end of the voice (rr1 f3). */
+    /** The final notification's own bound: max(the voice's hard end, TERMINAL_EMIT_MS from its start) (rr1 f3, rr2-2). */
     emitTimer?: unknown
     /** No more tries: the final notification is going out (or the voice was abandoned). */
     done: boolean
@@ -747,9 +749,9 @@ export function createLateVoiceFetcher(deps: {
     line(e, outcome)
   }
   // The final notification: the entry stays (download_attachment still refused) until the transport answers; only an
-  // accepted one writes late:bridge / late:failed; a rejected one — or one still unanswered at the hard end of the voice
-  // (placeholder + deadlineMs) — writes late:undelivered (Codex r1 f2, rr1 f3). close() is once-only, so a transport
-  // answer that comes after the hard end changes nothing.
+  // accepted one writes late:bridge / late:failed; a rejected one — or one still unanswered at the hard end (the later of
+  // placeholder + deadlineMs and TERMINAL_EMIT_MS after it started) — writes late:undelivered (Codex r1 f2, rr1 f3,
+  // rr2-2). close() is once-only, so a transport answer that comes after the hard end changes nothing.
   async function finish(e: Entry, emit: () => void | Promise<void>, ok: VoiceOutcome, what: string): Promise<void> {
     stop(e)
     const sent = (async () => {
@@ -757,7 +759,7 @@ export function createLateVoiceFetcher(deps: {
       return 'sent' as const
     })()
     const hardEnd = new Promise<'late'>(resolve => {
-      e.emitTimer = setTimer(() => resolve('late'), Math.max(0, e.placeholderMs + deadlineMs - now()))
+      e.emitTimer = setTimer(() => resolve('late'), Math.max(terminalEmitMs, e.placeholderMs + deadlineMs - now()))
     })
     try {
       if ((await Promise.race([sent, hardEnd])) === 'late') {
@@ -824,12 +826,13 @@ export function createLateVoiceFetcher(deps: {
       const e: Entry = { ...v, key, tries: 0, done: false, closed: false, last: {}, abort: new AbortController() }
       entries.set(key, e)
       arm(e)
-      // Stop re-fetching emitBudgetMs before the end; the lost notice then has that long to be accepted (finish).
+      // The work/abort deadline is the declared end of the re-fetch (+70 min); a lost notice sent then gets its own
+      // TERMINAL_EMIT_MS window (finish).
       e.deadline = setTimer(() => {
         if (e.done) return
         deps.logNotice(`late re-fetch of msg ${e.msg} ran out of time after ${e.tries} tries`)
         void lost(e)
-      }, Math.max(0, e.placeholderMs + deadlineMs - emitBudgetMs - now()))
+      }, Math.max(0, e.placeholderMs + deadlineMs - now()))
       return true
     },
     has(fileId) {
