@@ -31,7 +31,7 @@ let calls: string[] = []
 let stderr = ''
 
 type From = { id: number; first_name: string; last_name?: string; username?: string; is_bot?: boolean }
-const owner: From = { id: OWNER, first_name: 'Артём', last_name: 'Ш', username: 'owner_u' }
+const owner: From = { id: OWNER, first_name: 'Владелец', last_name: 'Бота', username: 'owner_u' }
 const member: From = { id: MEMBER, first_name: 'Член', last_name: 'Команды', username: 'member_u' }
 const botUser = { id: BOT_ID, is_bot: true, first_name: 'bot', username: BOT }
 const at = (rest: string) => ({ text: `@${BOT}${rest}`, entities: [{ type: 'mention', offset: 0, length: BOT.length + 1 }] })
@@ -65,7 +65,7 @@ const UPDATES = [
   groupMsg(105, TEAM, member, voice('V105')), // member voice
   groupMsg(106, TEAM, owner, voice('V106')), // owner voice, no @
   groupMsg(107, TEAM, member, { text: 'пересланное', forward_origin: { type: 'user', date: NOW_S - 3600, sender_user: { id: 555, is_bot: false, first_name: 'Third', username: 'third' } } }),
-  groupMsg(108, TEAM, member, { text: 'ответ', reply_to_message: { message_id: 102, date: NOW_S, chat: { id: TEAM, type: 'supergroup' }, from: { id: OWNER, is_bot: false, first_name: 'Артём', username: 'owner_u' }, text: 'просто пишу' }, quote: { text: 'пишу', position: 7 } }),
+  groupMsg(108, TEAM, member, { text: 'ответ', reply_to_message: { message_id: 102, date: NOW_S, chat: { id: TEAM, type: 'supergroup' }, from: { id: OWNER, is_bot: false, first_name: 'Владелец', username: 'owner_u' }, text: 'просто пишу' }, quote: { text: 'пишу', position: 7 } }),
   groupMsg(109, TEAM, owner, { ...voice('V109'), caption: `@${BOT} глянь`, caption_entities: [{ type: 'mention', offset: 0, length: BOT.length + 1 }] }), // owner voice + @ → wake
   groupMsg(110, TEAM, member, { text: 'в General' }, null), // General: no thread
   groupMsg(111, TEAM, owner, { photo: [{ file_id: 'P111', file_unique_id: 'uP111', width: 9, height: 9, file_size: 5 }] }), // owner photo, no @
@@ -76,7 +76,7 @@ const UPDATES = [
     message_reaction: {
       chat: { id: TEAM, type: 'supergroup', title: 't', is_forum: true },
       message_id: 90,
-      user: { id: OWNER, is_bot: false, first_name: 'Артём' },
+      user: { id: OWNER, is_bot: false, first_name: 'Владелец' },
       date: NOW_S,
       old_reaction: [],
       new_reaction: [{ type: 'emoji', emoji: '👍' }],
