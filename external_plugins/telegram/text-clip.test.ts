@@ -44,19 +44,23 @@ describe('clipUtf16 — never cuts a character in half', () => {
 })
 
 // server.ts has top-level side effects (cannot be imported in a test), so its
-// wiring is checked on the source: both reply snippets go through clipUtf16,
-// and the inbound envelope spreads forwardDateMeta.
+// wiring is checked on the source: the envelope's reply / quote / forward block is
+// the shared messageContextMeta (tg-archive.ts, team spec §2.3), whose snippets go
+// through clipUtf16 and which spreads forwardDateMeta (behaviour: tg-archive.test.ts).
 describe('server.ts wiring', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const archiveSrc = readFileSync(join(import.meta.dir, 'tg-archive.ts'), 'utf8')
 
   test('no reply snippet is cut with a raw .slice(0, 300)', () => {
     expect(src).not.toMatch(/\?\.slice\(0, 300\)/)
-    expect(src).toContain('clipUtf16(safeName(repliedTo.text ?? repliedTo.caption), 300)')
-    expect(src).toContain('clipUtf16(safeName(ctx.message?.quote?.text), 300)')
+    expect(archiveSrc).not.toMatch(/\?\.slice\(0, 300\)/)
+    expect(archiveSrc).toContain('clipUtf16(safeName(repliedTo.text ?? repliedTo.caption), 300)')
+    expect(archiveSrc).toContain('clipUtf16(safeName(msg?.quote?.text), 300)')
   })
 
   test('the inbound envelope carries forwardDateMeta for every forward', () => {
-    expect(src).toContain('...forwardDateMeta(ctx.message?.forward_origin)')
-    expect(src).toMatch(/\.\.\.forwardMeta,/)
+    expect(archiveSrc).toContain('...forwardDateMeta(msg?.forward_origin)')
+    expect(src).toContain('const contextMeta = messageContextMeta(ctx.message, attachment?.kind)')
+    expect(src).toMatch(/\.\.\.contextMeta,/)
   })
 })

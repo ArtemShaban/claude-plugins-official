@@ -6,7 +6,7 @@
  * fake Bot API; no network, nothing under the real ~/Workspace or ~/.claude is touched.
  */
 import { describe, test, expect, beforeEach } from 'bun:test'
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'fs'
 import { execFileSync } from 'child_process'
 import { join } from 'path'
 import { tmpdir } from 'os'
@@ -243,6 +243,15 @@ describe('D-883 criterion 1 — every send we make lands once in the right .out.
   test('outLinesFor: a non-message result (true) → no line', () => {
     expect(outLinesFor('editMessageText', { inline_message_id: 'x' }, true, new Date())).toEqual([])
   })
+
+  test('outLinesFor: thread_id = the sent message\'s message_thread_id; absent otherwise (team spec AC-06)', () => {
+    const sent = { message_id: 9, date: 1_760_000_000, chat: { id: -100123, type: 'supergroup' }, text: 'ок', message_thread_id: 17, is_topic_message: true }
+    const [inTopic] = outLinesFor('sendMessage', { chat_id: '-100123', message_thread_id: 17 }, sent, new Date())
+    expect(inTopic!.line.thread_id).toBe(17)
+    const { message_thread_id: _drop, ...general } = sent
+    const [inGeneral] = outLinesFor('sendMessage', { chat_id: '-100123' }, general, new Date())
+    expect('thread_id' in inGeneral!.line).toBe(false)
+  })
 })
 
 // ── criterion 2 — keepFile ─────────────────────────────────────────────────
@@ -473,6 +482,64 @@ describe('archive-store-fixes AC-5 — files/<msg_id>.missing', () => {
     expect(readdirSync(filesDir()).sort()).toEqual(['46.oga'])
     expect(keptFilePath(archive, MAXIM, 46)).toBe(join(filesDir(), '46.oga'))
   })
+
+  test('r1 f4: his archive-only team voice whose live keep failed (`.missing`) is retried by catchUp; his delivered one stays skipped', async () => {
+    const gdir = () => join(archiveChatDir(archive, GROUP), 'files')
+    const row = (msg_id: number, file_id: string, archiveOnly = false) =>
+      appendArchive(archive, { ts: '2026-10-27T08:00:00.000Z', chat_id: GROUP, msg_id, sender_id: OWNER, senderName: 'owner', kind: 'voice', text: '(voice message)', file_id, thread_id: 7, ...(archiveOnly ? { archive_only: true as const } : {}) })
+    row(47, 'F47', true) // archive-only (no @): the live keeper ran and failed
+    row(48, 'F48') // delivered: the live keeper never ran (no receipt)
+    const live = createKeeper({ download: fakeDownload({ result: undefined }).download, log: l => logs.push(l) })
+    expect(await live.keep(archive, GROUP, 47, 'F47')).toBeUndefined()
+    expect(existsSync(join(gdir(), '47.missing'))).toBe(true)
+    const d = fakeDownload()
+    const NOW = new Date('2026-10-29T06:00:00Z')
+    const r = await catchUp({ archiveRoot: archive, ownerId: OWNER, drafts: () => ({}), log: (l: string) => logs.push(l), now: () => NOW,
+      keeper: createKeeper({ download: d.download, log: l => logs.push(l) }) })
+    expect(d.calls).toEqual(['F47'])
+    expect(r.kept).toBe(1)
+    expect(readdirSync(gdir()).sort()).toEqual(['47.oga'])
+  })
+
+  test('rr2-2: the process dies while his archive-only voice is downloading → a fresh catchUp retries it once; his delivered one stays skipped', async () => {
+    const gdir = () => join(archiveChatDir(archive, GROUP), 'files')
+    const row = (msg_id: number, file_id: string, archiveOnly = false) =>
+      appendArchive(archive, { ts: '2026-10-27T08:00:00.000Z', chat_id: GROUP, msg_id, sender_id: OWNER, senderName: 'owner', kind: 'voice', text: '(voice message)', file_id, thread_id: 7, ...(archiveOnly ? { archive_only: true as const } : {}) })
+    row(49, 'F49', true) // archive-only (no @): the live keeper started, then the process ended mid-download
+    row(50, 'F50') // delivered: the live keeper never ran
+    const hung: string[] = []
+    const live = createKeeper({ download: (id: string) => { hung.push(id); return new Promise(() => {}) }, log: l => logs.push(l) })
+    void live.keep(archive, GROUP, 49, 'F49') // never settles = termination before completion
+    expect(hung).toEqual(['F49'])
+    expect(keptFilePath(archive, GROUP, 49)).toBeUndefined() // no bytes exist
+    const d = fakeDownload()
+    const NOW = new Date('2026-10-29T06:00:00Z')
+    const r = await catchUp({ archiveRoot: archive, ownerId: OWNER, drafts: () => ({}), log: (l: string) => logs.push(l), now: () => NOW,
+      keeper: createKeeper({ download: d.download, log: l => logs.push(l) }) })
+    expect(d.calls).toEqual(['F49'])
+    expect(r.kept).toBe(1)
+    expect(readdirSync(gdir()).sort()).toEqual(['49.oga'])
+  })
+
+  test('rr3-1: the store is unwritable when his archive-only voice arrives (no receipt, no bytes) → after it recovers a fresh catchUp downloads it once; his delivered one stays skipped', async () => {
+    const gdir = () => join(archiveChatDir(archive, GROUP), 'files')
+    const row = (msg_id: number, file_id: string, archiveOnly = false) =>
+      appendArchive(archive, { ts: '2026-10-27T08:00:00.000Z', chat_id: GROUP, msg_id, sender_id: OWNER, senderName: 'owner', kind: 'voice', text: '(voice message)', file_id, thread_id: 7, ...(archiveOnly ? { archive_only: true as const } : {}) })
+    row(52, 'F52', true) // archive-only (no @): the row is the production disposition
+    row(53, 'F53') // delivered: no field, the live keeper never ran
+    writeFileSync(gdir(), 'not a dir') // `files` unusable: every receipt and byte write fails
+    const live = createKeeper({ download: fakeDownload().download, log: l => logs.push(l) })
+    expect(await live.keep(archive, GROUP, 52, 'F52')).toBeUndefined()
+    rmSync(gdir()) // storage recovered
+    expect(existsSync(gdir())).toBe(false) // no receipt and no bytes survived
+    const d = fakeDownload()
+    const NOW = new Date('2026-10-29T06:00:00Z')
+    const r = await catchUp({ archiveRoot: archive, ownerId: OWNER, drafts: () => ({}), log: (l: string) => logs.push(l), now: () => NOW,
+      keeper: createKeeper({ download: d.download, log: l => logs.push(l) }) })
+    expect(d.calls).toEqual(['F52'])
+    expect(r.kept).toBe(1)
+    expect(readdirSync(gdir()).sort()).toEqual(['52.oga'])
+  })
 })
 
 // ── archive-store-fixes r1 (verdict 2026-11-09-archive-store-fixes-codex-r1) ──────────────────────────
@@ -598,6 +665,35 @@ describe('archive-store-fixes r2 f14 — the store root itself is never followed
       expect([d, statSync(d).mode & 0o777]).toEqual([d, 0o700])
     }
   })
+})
+
+describe('rr4-1 — a successful download into an unsafe store: exactly one closed unsafe_path record', () => {
+  // Every caller converges on the one kind-agnostic keeper; the cases differ only in what reaches keep().
+  const callers: [string, () => string, string, number, string][] = [
+    ['owner archive-only voice', () => archive, GROUP, 120, 'oga'],
+    ['owner archive-only photo', () => archive, GROUP, 121, 'jpg'],
+    ['member media', () => archive, GROUP, 122, 'jpg'],
+    ['other attachment kind (document)', () => archive, GROUP, 123, 'pdf'],
+    ['other attachment kind (video)', () => archive, MAXIM, 124, 'mp4'],
+    ['out-store media (archive)', () => archive, MAXIM, 125, 'jpg'],
+    ['out-store media (business)', () => business, MAXIM, 126, 'pdf'],
+  ]
+
+  for (const [name, root, chat, msg, ext] of callers) {
+    test(`${name}: \`files\` is a regular file → one unsafe_path record, no bytes, no receipt`, async () => {
+      const chatDir = archiveChatDir(root(), chat)
+      mkdirSync(chatDir, { recursive: true, mode: 0o700 })
+      writeFileSync(join(chatDir, 'files'), 'not a dir')
+      const d = fakeDownload({ result: { bytes: new TextEncoder().encode(`bytes of F${msg}`), ext } })
+      const k = createKeeper({ download: d.download, log: l => logs.push(l) })
+      expect(await k.keep(root(), chat, msg, `F${msg}`)).toBeUndefined()
+      expect(d.calls).toEqual([`F${msg}`])
+      const records = logs.map(l => JSON.parse(l))
+      expect([name, records.length, records.map(e => e.error_class)]).toEqual([name, 1, ['unsafe_path']])
+      expect(readFileSync(join(chatDir, 'files'), 'utf8')).toBe('not a dir')
+      expect(readdirSync(chatDir).filter(n => n !== '.gitignore').sort()).toEqual(['files'])
+    })
+  }
 })
 
 describe('archive-store-fixes r2 n2 — only a regular file is kept bytes', () => {

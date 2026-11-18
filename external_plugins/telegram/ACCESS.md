@@ -112,6 +112,39 @@ group's existing `requireMention`/`allowFrom`/`postPolicy`:
 /telegram:access group context-buffer -1001654782309 off
 ```
 
+## Team group (`team: true`)
+
+For a forum group of the owner's team, where every member's message must be
+kept but only the install owner (or a client co-owner) may wake the assistant. Write the entry as exactly
+
+```jsonc
+"-1001654782309": { "team": true, "requireMention": true, "allowFrom": ["none"] }
+```
+
+(the owner install: `tools/tg-access-change.py add-group <id> --team`; a client
+install: the admin's `tg-access <id> add-group <chat> --name <n> --team`). The
+`requireMention` / `allowFrom: ["none"]` base keys are for an older plugin that
+does not know `team`: it then treats the group as nobody-may-wake, never as
+everyone-may-wake.
+
+- **Archive:** every member's message, in every topic, goes to the archive with
+  its author (id, username, display name), topic, reply target, quote and
+  forward origin — nothing else happens. Voices and photos are kept as files,
+  the owner's own non-waking ones too.
+- **Wake:** only the install owner (or a co-owner on a client install), not
+  forwarded and not sent via an inline bot (`via_bot`), with an explicit
+  `@botusername` (a `mention` or `text_mention` entity, in the text or a
+  caption). A reply to the bot without `@`, `mentionPatterns`, and any other
+  member's `@` do not wake. `asyncThreads` does not apply in a team group: his
+  `@` in such a topic still wakes. Dice, games, stories, paid media and the
+  like get one archive line each and never wake. The envelope
+  carries `group_mode="team"` and never a `<group-context-buffer>` block, even
+  with `contextBuffer` set.
+- **Reactions and buttons:** no reaction and no «Да / Нет» / «Готово» press
+  counts in a team group (for anyone); `reply` sends no such buttons there.
+- **Setup:** the bot must be a group admin (Step zero above), or its privacy
+  mode hides the members' messages.
+
 ## Mention detection
 
 In groups with `requireMention: true`, any of the following triggers the bot:
@@ -187,7 +220,10 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
       // false: this group never wakes the assistant — mentions and replies are
       // buffered like any other message (dropped without contextBuffer), member
       // reactions are ignored. Default (field omittable) = true.
-      "wakeOnMention": true
+      "wakeOnMention": true,
+      // true: team group — archive every member, wake only on the install
+      // owner's (or a client co-owner's) own explicit @mention; see Team group above. Default (field omittable) = off.
+      "team": false
     }
   },
 

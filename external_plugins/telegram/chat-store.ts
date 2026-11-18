@@ -40,6 +40,8 @@ export type OutLine = {
   /** Set on an edit: the message that was edited. */
   of_msg_id?: number
   backfilled?: true
+  /** Forum topic of the sent message (its message_thread_id), so a topic read includes our replies (team spec §2.6). */
+  thread_id?: number
 }
 
 /** `{ts, component, error_class, action_taken}` (dev-rules §5). Only a closed class — never the error text (it can hold the token's URL). */
@@ -65,7 +67,7 @@ export function isOutMethod(method: string): boolean {
   return (method.startsWith('send') && method !== 'sendChatAction') || method === 'editMessageText' || method === 'editMessageCaption'
 }
 
-type Msg = BusinessMessage & { edit_date?: number }
+type Msg = BusinessMessage & { edit_date?: number; message_thread_id?: number }
 
 function isMessage(r: unknown): r is Msg {
   const m = r as Msg | null
@@ -91,6 +93,7 @@ export function outLinesFor(method: string, payload: unknown, result: unknown, n
       text: redactInvites(label.text),
       ...(label.file_id ? { file_id: label.file_id } : {}),
       ...(edit ? { of_msg_id: m.message_id } : {}),
+      ...(Number.isInteger(m.message_thread_id) ? { thread_id: m.message_thread_id } : {}),
     }
     return { business, line }
   })
@@ -229,14 +232,16 @@ export function createKeeper(deps: { download: Download; log: (line: string) => 
     try { deps.log(storeErrorLine('tg-keep-file', err, action, now())) } catch {}
   }
   /** The durable reason (§2.C). Never throws: a failure here is one more stderr line. */
-  const markMissing = (root: string, chatId: string, msgId: number, errorClass: string) => {
+  const markMissing = (root: string, chatId: string, msgId: number, errorClass: string): boolean => {
     try {
       const dir = privateFilesDir(root, chatId)
       const tmp = join(dir, `.${msgId}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
       writeFileSync(tmp, JSON.stringify({ ts: now().toISOString(), error_class: errorClass }) + '\n', { mode: 0o600, flag: 'wx' })
       renameSync(tmp, join(dir, missingFileName(msgId)))
+      return true
     } catch (err) {
-      fail(err, `reason file of msg ${msgId} not written`)
+      fail(err, `file of msg ${msgId} not kept; reason file not written`)
+      return false
     }
   }
 
@@ -291,8 +296,8 @@ export function createKeeper(deps: { download: Download; log: (line: string) => 
       clearMissing(root, chatId, msgId) // a later success: bytes, no reason left
       return final
     } catch (err) {
-      fail(err, `file of msg ${msgId} not kept; delivery unaffected`)
-      markMissing(root, chatId, msgId, errorClassOf(err))
+      // rr4-1: one closed record per keep attempt — a failed receipt write has already logged its own.
+      if (markMissing(root, chatId, msgId, errorClassOf(err))) fail(err, `file of msg ${msgId} not kept; delivery unaffected`)
       return undefined
     }
   }
@@ -360,7 +365,10 @@ export async function catchUp(deps: CatchUpDeps): Promise<{ kept: number; backfi
         for (const name of readdirSync(dir).filter(n => MONTH_FILE.test(n) && n.slice(0, 7) >= firstMonth).sort()) {
           for (const l of readJsonLines<ArchiveLine>(join(dir, name))) {
             if (!l.file_id || l.msg_id == null || typeof l.ts !== 'string' || l.ts < cutoff) continue
-            if (isArchive && isOwnDeliveredMedia(l.kind, l.sender_id, deps.ownerId)) continue
+            // His own voice / photo: delivery keeps them, so skipped — unless the row itself says it is
+            // ARCHIVE-ONLY (`archive_only`, his no-@ voice in a team group; rr3-1): then retried like anyone's
+            // until it has bytes, whatever stopped the live keep (a failure, a crash mid-download, rr2-2).
+            if (isArchive && isOwnDeliveredMedia(l.kind, l.sender_id, deps.ownerId) && l.archive_only !== true) continue
             if (keptFilePath(root, l.chat_id, l.msg_id)) {
               // r1 f12: bytes next to a stale reason file → keep()'s fast path removes it (no download, not counted)
               if (existsSync(join(keptFilesDir(root, l.chat_id), missingFileName(l.msg_id)))) await deps.keeper.keep(root, l.chat_id, l.msg_id, l.file_id)

@@ -74,8 +74,9 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 
 | Tool | Purpose |
 | --- | --- |
-| `reply` | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading and `files` (absolute paths) for attachments. Images (`.jpg`/`.png`/`.gif`/`.webp`) send as photos with inline preview; other types send as documents. Max 50MB each. Auto-chunks text; files send as separate messages after the text. Returns the sent message ID(s). |
+| `reply` | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading, `message_thread_id` (forum topic id from the inbound meta; omit for General / DM) and `files` (absolute paths) for attachments. Images (`.jpg`/`.png`/`.gif`/`.webp`) send as photos with inline preview; other types send as documents. Max 50MB each. Auto-chunks text; files send as separate messages after the text. Returns the sent message ID(s). |
 | `react` | Add an emoji reaction to a message by ID. **Only Telegram's fixed whitelist** is accepted (👍 👎 ❤ 🔥 👀 etc). |
+| `download_attachment` | Download a file of an inbound message (`attachment_file_id` from the inbound meta) to the local inbox; returns the path to Read. Telegram caps bot downloads at 20 MB. |
 | `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
 | `secretary_watch` | This fork only: subscribe to / unsubscribe from a chat on the owner's secretary list (see «Secretary» below). |
 
@@ -93,7 +94,7 @@ off, or not resolvable → the text goes plain and the result says the buttons a
 A press counts only from the owner (`user.telegram_chat_id`; the lock's owner in locked
 mode) or a co-owner, in their own DM or a group of the access list that lets them in (the
 group's gate lets their reaction through: `allowFrom` empty or naming them, not
-`wakeOnMention:false`; D-1049). The send asks the same rule (`yes-no.ts` `pressCounts` /
+`wakeOnMention:false`, not `team:true`; D-1049). The send asks the same rule (`yes-no.ts` `pressCounts` /
 `buttonsCanCount`): into a chat where no such press could count the text goes plain and the
 result says a press would not count in this chat. Each press writes one line to
 `buttons.log` in the state dir (chat kind and id, topic, message id, data, who = owner /
@@ -159,15 +160,15 @@ judged on the bytes actually read: over it → `too_big` and the body is cancell
 connection reuse for this request»). The voice waits for its file at most 90 s (`DOWNLOAD_TIMEOUT_MS`), then gets the whisper budget on top.
 It is the only place that builds the file URL (it carries the bot token); its errors carry only a closed class.
 
-## No history or search
+## History: the archive, not the Bot API
 
-Telegram's Bot API exposes **neither** message history nor search. The bot
-only sees messages as they arrive — no `fetch_messages` tool exists. If the
-assistant needs earlier context, it will ask you to paste or summarize.
-
-This also means there's no `download_attachment` tool for historical messages
-— photos are downloaded eagerly on arrival since there's no way to fetch them
-later.
+Telegram's Bot API exposes **neither** message history nor search, and there is no
+`fetch_messages` tool. This fork keeps the history itself: every allowed chat goes to the
+inbound archive and our sends to the chat store (both below), and files are kept on arrival.
+The assistant reads earlier context there with the core chat reader
+(`python3 tools/chat_thread.py --group <chat_id> [--topic <id|general>] [--since <ISO>]`, skill
+`telegram-bot`) instead of asking you to paste it. `download_attachment` fetches the file of an
+inbound message by its `attachment_file_id`.
 
 ## Inbound archive (this fork, D-520)
 
@@ -175,7 +176,15 @@ Every message from an allowed DM person or an allowed group member — delivered
 buffered, or allowed but not woken (no mention, no `contextBuffer`) — is appended
 as one JSON line to `~/Workspace/ClaudeProjects/sam-data/state/tg-archive/<chat>/<YYYY-MM>.jsonl`
 (`tg-archive.ts`; fields `ts`, `chat_id`, `msg_id`, `sender_id`, `senderName`, `kind`,
-`text`, optional `thread_id`, `file_id` — text and labels only, no media bytes).
+`text`, optional `thread_id`, `file_id`, and — the same names and values as the envelope —
+`reply_to_message_id` / `reply_to_text` / `reply_to_user` / `reply_to_quote`,
+`forward_origin` / `forward_author` / `forward_author_id` / `forward_date` (every kind,
+voice too), plus `sender_display` (first + last name) and `via_bot` (an inline-bot result), and `archive_only: true` on his own
+voice / photo that did not wake the session — text and labels only, no media bytes). `thread_id` is the forum topic id: the reader's `--topic` filters by it.
+A team group (`team: true`, see ACCESS.md) archives every member and wakes only on an
+explicit, typed (not forwarded, not via an inline bot) `@<bot>` in the own message of the install
+owner or of an authorized client co-owner (`/etc/sam-telegram-access/co-owners`); any other content
+kind there (dice, game, story, paid media, …) gets one archive line and never wakes.
 Append-only, no cap; dir 0700, files 0600; the folder holds a `.gitignore` of `*`
 so it never enters git. Senders the gate does not allow leave nothing. No
 sam-data folder → archive off (one stderr line at start); a write error → one
@@ -193,18 +202,23 @@ stderr line, delivery unchanged.
   keeps — allowed DM people and configured groups, so a pairing reply to a stranger is not
   stored). Fields `ts`, `chat_id`, `msg_id`, `direction:"out"`, `via` (`secretary` | `bot`),
   `kind`, `text` (caption for media; `start=<INVITE>` redaction), optional `file_id`,
-  `of_msg_id` (edits), `backfilled`. A sibling file: readers of `YYYY-MM.jsonl` see no change.
+  `thread_id` (the forum topic of the sent message, its `message_thread_id`, so a topic read
+  includes our replies), `of_msg_id` (edits), `backfilled`. A sibling file: readers of `YYYY-MM.jsonl` see no change.
   A failed send writes nothing; a write error is one stderr JSON line
   `{ts, component, error_class, action_taken}` and the send's result is returned unchanged.
 - **Kept files.** Every incoming file of a stored line (tg-archive: delivered, buffered or
   allowed-but-not-woken; tg-business: listed chats) and every file we send is saved to
   `<root>/<chat>/files/<msg_id>.<ext>` (one `getFile` + download, ≤ 20 MB, 0600, idempotent,
-  never blocks delivery). His own voice and photo in a bot chat are not copied — delivery keeps
-  them (inbox + owner-log-media). Someone else's voice or photo is delivered from the kept path
+  never blocks delivery, and independent of the archive append). His own voice and photo are
+  not copied when they are DELIVERED (they woke the session) — delivery keeps them (inbox +
+  owner-log-media); his archive-only ones (no `@` in a team group, any group drop or buffer)
+  are kept here like anyone's. Someone else's voice or photo is delivered from the kept path
   (`attachment_path` / `image_path`); his own keep the inbox path. Retention (90 days for other
   people's files) is core's nightly job, not the plugin's.
 - **Start-up catch-up** (once per process, background): kept files for stored lines of the last
-  90 days that have none, and one `backfilled: true` out line per secretary draft with
+  90 days that have none (his own voice / photo only when its archive line carries
+  `archive_only: true` — set in the same append when it did not wake the session; a delivered
+  one has no such field and stays skipped), and one `backfilled: true` out line per secretary draft with
   `status: "sent"` not yet in its `.out.jsonl`.
 
 ## Secretary in the owner's Telegram (this fork, Telegram Business, D-637)
