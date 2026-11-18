@@ -139,7 +139,7 @@ no rotation) — the plugin's stderr is not kept anywhere durable. One line, key
 error class (`timeout`, `network`, `http_<code>`, `exit_<code>`, `sys_<CODE>`, `error`); `-` = the
 leg did not run. `outcome` = `bridge` (the session got the transcript) or
 `placeholder:<no_cmd|download|transcribe|empty|timeout>` (it got `(voice message)`, or the caption alone) or, for a
-voice re-fetched late (below), its one closing line `late:<bridge|failed|abandoned>`. Never the
+voice re-fetched late (below), its one closing line `late:<bridge|failed|abandoned|undelivered>`. Never the
 transcript, the caption, a path or an error text. Code: `voice-delivery.ts` (`formatVoiceLine`).
 
 Download keys (D-1066), appended to the same line:
@@ -153,13 +153,17 @@ network path. The core control-plane leg `tg-voice-delivery` reads this file.
 **Late re-fetch (D-1087).** A voice whose download ended without a file on a Telegram/network-side class (`timeout`,
 `network`, `error`, `sys_*`, `http_5xx`, `http_429`; never `none` or another 4xx), with a transcribe command set, is
 delivered in its place as the placeholder with `voice_pending="1"` and the author/trust keys (every voice placeholder
-carries `voice_author`, `voice_author_id` when known, `voice_author_origin`, `voice_trust`). The plugin then runs the
-same download + transcribe again at +2, +5, +10, +20, +40 and +60 min, in memory, outside the chat's queue (texts sent
-after the voice are never held). A transcript → one more notification with the same `message_id` and `ts`,
-`transcript_source="bridge"`, the author keys and `voice_late_s=<seconds since the voice>`. A file that came but whisper
-failed or gave nothing, or six failed tries → one notification with `voice_lost="1"`. Each such voice gets one closing
-line: `late:bridge` / `late:failed`, `late_tries` = the tries run, `total_ms` = ms since the voice arrived, the dl/tr
-keys of the last try. A plugin stop writes `late:abandoned` per voice still waiting (not persisted across restarts).
+carries `voice_author`, `voice_author_id` when known, `voice_author_origin`, `voice_trust`). The re-fetch is armed only
+after the session accepted that placeholder's wake. The plugin then runs the same download + transcribe again at +2,
++5, +10, +20, +40 and +60 min, in memory, outside the chat's queue (texts sent after the voice are never held); someone
+else's voice is fetched through the chat store with one Bot API request per try (no inbox fallback on a late try). The
+whole re-fetch ends 70 min after the placeholder: a whisper job still queued then never starts, a running one is
+killed. A transcript → one more notification with the same `message_id` and `ts`, `transcript_source="bridge"`, the
+author keys and `voice_late_s=<seconds since the voice>`. A file that came but whisper failed or gave nothing, six
+failed tries, or the 70-min end → one notification with `voice_lost="1"`. Each such voice gets one closing line, written
+once the session accepted that notification: `late:bridge` / `late:failed`; `late:undelivered` when the session did
+not accept it; `late_tries` = the tries run, `total_ms` = ms since the voice arrived, the dl/tr keys of the last try. A
+plugin stop writes `late:abandoned` per voice still waiting (not persisted across restarts).
 What the agent says to the person on these three attributes: core `.claude/rules/telegram.md`.
 
 ## File downloads

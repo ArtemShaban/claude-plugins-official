@@ -285,7 +285,9 @@ export type WakeDeliveryEffects = {
  * message) plus any buffered context, deliver it via fx.notify, and reset the
  * buffer iff delivery succeeded. Never throws — a notify failure is caught and
  * routed to fx.logError (mirrors every other .catch in server.ts; the channel
- * must never crash on a failed notification).
+ * must never crash on a failed notification). Resolves true when the
+ * notification was accepted, false when it failed (a voice's late re-fetch is
+ * armed only after an accepted wake — voice-delivery.ts wakeThenArm, D-1087).
  *
  * @param writeFile Persists a large formatted block to a file, returns its
  *        path. Only invoked for the 'file' delivery kind — never called for
@@ -296,7 +298,7 @@ export async function deliverWakeWithBuffer(
   baseText: string,
   writeFile: (formatted: string) => string,
   fx: WakeDeliveryEffects,
-): Promise<void> {
+): Promise<boolean> {
   let content = baseText
   const extraMeta: Record<string, string> = {}
 
@@ -311,10 +313,13 @@ export async function deliverWakeWithBuffer(
     }
   }
 
+  let accepted = false
   try {
     await fx.notify(content, extraMeta)
+    accepted = true
     if (entries.length > 0) fx.reset()
   } catch (err) {
     fx.logError(`failed to deliver inbound to Claude: ${err}`)
   }
+  return accepted
 }

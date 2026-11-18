@@ -428,6 +428,8 @@ export type VoiceOutcome =
   | 'late:bridge'
   | 'late:failed'
   | 'late:abandoned'
+  // The late text or the lost notice was not accepted by the session transport (Codex r1 f2).
+  | 'late:undelivered'
 
 /** The outcome of a finished delivery: what the session got, and for the placeholder the first leg that failed. */
 export function voiceOutcomeOf(o: {
@@ -458,7 +460,7 @@ export interface VoiceLineFields {
 }
 
 const VOICE_RESULT_RE = /^(ok|none|empty|timeout|network|error|http_[0-9]{3}|exit_[0-9]{1,3}|sys_[A-Z0-9_]{1,24})$/
-const OUTCOME_LINE_RE = /^(bridge|placeholder:(no_cmd|download|transcribe|empty|timeout)|late:(bridge|failed|abandoned))$/
+const OUTCOME_LINE_RE = /^(bridge|placeholder:(no_cmd|download|transcribe|empty|timeout)|late:(bridge|failed|abandoned|undelivered))$/
 
 /** One voice.log line, key=value; an absent field is `-`, so every line has the same keys. */
 export function formatVoiceLine(tsMs: number, pid: number, f: VoiceLineFields): string {
@@ -602,6 +604,10 @@ export async function deliverVoiceTranscript(
 /** Tries, counted from the placeholder (tg 49563: «через 2, 5, 10, 20, 40 и 60 мин»). */
 export const LATE_TRY_AFTER_MS: readonly number[] = [2, 5, 10, 20, 40, 60].map(m => m * 60_000)
 
+/** The whole re-fetch of one voice ends by this, counted from the placeholder's accepted wake (Codex r1 f3): the
+ * agent's own +70 min record (core .claude/rules/telegram.md) is armed after that wake, so it never fires first. */
+export const LATE_DEADLINE_MS = 70 * 60_000
+
 /** download_attachment's answer for a file under re-fetch (§2 C): at once, no network call. */
 export const LATE_VOICE_REFUSAL =
   'this voice file is being re-fetched by the plugin because Telegram has not handed it over yet — do not download it; ' +
@@ -644,12 +650,14 @@ export interface LateVoice {
   author: VoiceAuthorResult
   /** The first delivery's own download effect (store path for someone else's voice, inbox for the owner's). */
   download: (journal: VoiceJournal) => Promise<string | undefined>
-  /** The first delivery's own transcribe effect (whisper mutex + the original transcribeFlags). */
-  transcribe: (audioPath: string) => Promise<string>
-  /** The transcript came: the envelope as deliverVoiceTranscript built it, lateS = whole seconds since tsMs. */
-  onLate: (late: VoiceEnvelope, lateS: number) => void
-  /** Telegram never handed the file over (or whisper failed on it). */
-  onLost: () => void
+  /** The first delivery's own transcribe effect (whisper mutex + the original transcribeFlags); `signal` aborts at the
+   * deadline — a job still queued then never starts (voiceTranscribeEffect). */
+  transcribe: (audioPath: string, signal?: AbortSignal) => Promise<string>
+  /** The transcript came: the envelope as deliverVoiceTranscript built it, lateS = whole seconds since tsMs.
+   * Resolves when the session transport accepted it; a rejection closes the voice as `late:undelivered`. */
+  onLate: (late: VoiceEnvelope, lateS: number) => void | Promise<void>
+  /** Telegram never handed the file over (or whisper failed on it, or the deadline came). Same contract as onLate. */
+  onLost: () => void | Promise<void>
 }
 
 export interface LateVoiceFetcher {
@@ -657,7 +665,7 @@ export interface LateVoiceFetcher {
   schedule: (v: LateVoice) => boolean
   /** A file_id under re-fetch right now (download_attachment refuses it). */
   has: (fileId: string) => boolean
-  /** Plugin stop: one `late:abandoned` line per entry, synchronously; nothing runs after. Returns the count. */
+  /** Plugin stop: one `late:abandoned` line per open entry, synchronously; nothing runs after. Returns the count. */
   abandonAll: () => number
   size: () => number
 }
@@ -670,12 +678,25 @@ export function createLateVoiceFetcher(deps: {
   clearTimer?: (h: unknown) => void
   tryAfterMs?: readonly number[]
   downloadTimeoutMs?: number
+  deadlineMs?: number
 }): LateVoiceFetcher {
   const now = deps.nowMs ?? Date.now
   const setTimer = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
   const clearTimer = deps.clearTimer ?? ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>))
   const offsets = deps.tryAfterMs ?? LATE_TRY_AFTER_MS
-  type Entry = LateVoice & { key: string; tries: number; timer?: unknown; done: boolean; last: VoiceJournal }
+  const deadlineMs = deps.deadlineMs ?? LATE_DEADLINE_MS
+  type Entry = LateVoice & {
+    key: string
+    tries: number
+    timer?: unknown
+    deadline?: unknown
+    /** No more tries: the final notification is going out (or the voice was abandoned). */
+    done: boolean
+    /** The closing voice.log line is written and the entry is gone. */
+    closed: boolean
+    last: VoiceJournal
+    abort: AbortController
+  }
   const entries = new Map<string, Entry>()
 
   const line = (e: Entry, outcome: VoiceOutcome) => {
@@ -692,12 +713,32 @@ export function createLateVoiceFetcher(deps: {
       })
     } catch {}
   }
-  const end = (e: Entry, outcome: VoiceOutcome) => {
+  const stop = (e: Entry) => {
     e.done = true
     if (e.timer !== undefined) clearTimer(e.timer)
+    if (e.deadline !== undefined) clearTimer(e.deadline)
+    e.timer = e.deadline = undefined
+    e.abort.abort() // a whisper job still queued for this voice never starts; a running one is killed
+  }
+  const close = (e: Entry, outcome: VoiceOutcome) => {
+    if (e.closed) return
+    e.closed = true
     entries.delete(e.key)
     line(e, outcome)
   }
+  // The final notification: the entry stays (download_attachment still refused) until the transport answers; only an
+  // accepted one writes late:bridge / late:failed; a rejected one writes late:undelivered (Codex r1 f2).
+  async function finish(e: Entry, emit: () => void | Promise<void>, ok: VoiceOutcome, what: string): Promise<void> {
+    stop(e)
+    try {
+      await emit()
+      close(e, ok)
+    } catch (err) {
+      deps.logNotice(`${what} notification not accepted by the session: ${voiceErrorClass(err)}`)
+      close(e, 'late:undelivered')
+    }
+  }
+  const lost = (e: Entry) => finish(e, () => e.onLost(), 'late:failed', 'lost')
   // The next try is due at placeholder + offsets[tries]; one already overdue (the previous try ran long) starts now —
   // tries of one voice never overlap because the next is armed only after the previous settled.
   const arm = (e: Entry) => {
@@ -714,7 +755,7 @@ export function createLateVoiceFetcher(deps: {
       got = await deliverVoiceTranscript(true, e.caption, e.author, {
         journal,
         download: () => e.download(journal),
-        transcribe: e.transcribe,
+        transcribe: p => e.transcribe(p, e.abort.signal),
         logNotice: r => deps.logNotice(`late try ${e.tries}: ${r}`),
         nowMs: now,
         downloadTimeoutMs: deps.downloadTimeoutMs,
@@ -722,25 +763,12 @@ export function createLateVoiceFetcher(deps: {
     } catch (err) {
       deps.logNotice(`late try ${e.tries} crashed: ${voiceErrorClass(err)}`)
     }
-    if (e.done) return // abandoned while it ran
+    if (e.done) return // abandoned, or the deadline came while it ran
     if (got?.meta.transcript_source === 'bridge') {
-      end(e, 'late:bridge')
-      try {
-        e.onLate(got, Math.max(0, Math.round((now() - e.tsMs) / 1000)))
-      } catch (err) {
-        deps.logNotice(`late notification failed: ${voiceErrorClass(err)}`)
-      }
-      return
+      const late = got
+      return finish(e, () => e.onLate(late, Math.max(0, Math.round((now() - e.tsMs) / 1000))), 'late:bridge', 'late')
     }
-    if (journal.dl === 'ok' || e.tries >= offsets.length) {
-      end(e, 'late:failed')
-      try {
-        e.onLost()
-      } catch (err) {
-        deps.logNotice(`lost notification failed: ${voiceErrorClass(err)}`)
-      }
-      return
-    }
+    if (journal.dl === 'ok' || e.tries >= offsets.length) return lost(e)
     arm(e)
   }
 
@@ -748,9 +776,14 @@ export function createLateVoiceFetcher(deps: {
     schedule(v) {
       const key = `${v.chat}:${v.msg}`
       if (entries.has(key) || offsets.length === 0) return false
-      const e: Entry = { ...v, key, tries: 0, done: false, last: {} }
+      const e: Entry = { ...v, key, tries: 0, done: false, closed: false, last: {}, abort: new AbortController() }
       entries.set(key, e)
       arm(e)
+      e.deadline = setTimer(() => {
+        if (e.done) return
+        deps.logNotice(`late re-fetch of msg ${e.msg} ran out of time after ${e.tries} tries`)
+        void lost(e)
+      }, Math.max(0, e.placeholderMs + deadlineMs - now()))
       return true
     },
     has(fileId) {
@@ -759,9 +792,60 @@ export function createLateVoiceFetcher(deps: {
     },
     abandonAll() {
       const all = [...entries.values()]
-      for (const e of all) end(e, 'late:abandoned')
+      for (const e of all) {
+        stop(e)
+        close(e, 'late:abandoned')
+      }
       return all.length
     },
     size: () => entries.size,
   }
+}
+
+/** D-1087 / Codex r1 f1: the placeholder's wake first; the late fetcher takes the voice only once the session accepted
+ * that wake (`wake` resolves true). A rejected wake leaves nothing armed — no late or lost notice for a voice whose
+ * placeholder never arrived. The tries and the deadline count from the accepted wake. */
+export async function wakeThenArm(o: {
+  fetcher: LateVoiceFetcher
+  envelope: VoiceEnvelope
+  /** The voice to re-fetch, when lateFetchWanted said so; undefined for every other message. */
+  late?: Omit<LateVoice, 'placeholderMs'>
+  wake: (envelope: VoiceEnvelope) => Promise<boolean>
+  nowMs?: () => number
+}): Promise<boolean> {
+  const pending = o.late != null && !o.fetcher.has(o.late.fileId)
+  const accepted = await o.wake(markPending(o.envelope, pending))
+  if (accepted && pending) o.fetcher.schedule({ ...o.late!, placeholderMs: (o.nowMs ?? Date.now)() })
+  return accepted
+}
+
+/** A voice's download effects (D-883 store path; Codex r1 f4). `keep` is the chat-store keep of someone else's voice,
+ * undefined for the person's own voice (the inbox). The first delivery falls back to the inbox when the keep gives no
+ * file; a late try makes exactly ONE Bot API request — the keep alone, or the inbox alone — so no second getFile is
+ * left running after the try's own wait. */
+export function voiceDownloadEffects(o: {
+  keep: (() => Promise<string | undefined>) | undefined
+  inbox: (journal: VoiceJournal) => Promise<string | undefined>
+}): { first: (journal: VoiceJournal) => Promise<string | undefined>; late: (journal: VoiceJournal) => Promise<string | undefined> } {
+  const keep = o.keep
+  if (!keep) return { first: o.inbox, late: o.inbox }
+  return { first: async j => (await keep()) ?? o.inbox(j), late: () => keep() }
+}
+
+/** A voice's transcribe effect: the shared whisper queue + the original transcribeFlags (owner-log extract for the
+ * person's own voice, --no-save for anyone else's). An aborted signal (the late deadline) refuses a job that is still
+ * queued and is passed on so a running one is killed (Codex r1 f3, f6). */
+export function voiceTranscribeEffect(o: {
+  ownerSent: boolean
+  msgId: number | undefined
+  chatId: string
+  queue: <T>(job: () => Promise<T>) => Promise<T>
+  run: (audioPath: string, extraArgs: string[], signal?: AbortSignal) => Promise<string>
+}): (audioPath: string, signal?: AbortSignal) => Promise<string> {
+  const flags = transcribeFlags(o.ownerSent, o.msgId, o.chatId)
+  return (audioPath, signal) =>
+    o.queue(async () => {
+      if (signal?.aborted) throw new Error('late voice ran out of time before whisper started')
+      return o.run(audioPath, [...flags], signal)
+    })
 }

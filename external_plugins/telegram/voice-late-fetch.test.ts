@@ -5,16 +5,19 @@
 // no live state, no import of server.ts (static reads only).
 import { afterAll, describe, expect, test } from 'bun:test'
 import { createServer } from 'node:http'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { MessageOrigin } from 'grammy/types'
 import { createTelegramDownloader } from './tg-download'
+import { createKeeper, keptFilesDir } from './chat-store'
+import { deliverWakeWithBuffer } from './group-buffer'
 import {
   createLateVoiceFetcher,
   createVoiceLog,
   deliverVoiceTranscript,
   isRetriableDownload,
+  LATE_DEADLINE_MS,
   LATE_TRY_AFTER_MS,
   LATE_VOICE_REFUSAL,
   lateFetchWanted,
@@ -23,8 +26,11 @@ import {
   voiceAuthor,
   voiceErrorClass,
   voiceOutcomeOf,
+  voiceDownloadEffects,
   voicePlaceholder,
+  voiceTranscribeEffect,
   VOICE_LOG,
+  wakeThenArm,
   withTimeout,
   type LateVoice,
   type VoiceAuthorResult,
@@ -423,7 +429,8 @@ describe('criterion 7 — order: texts after a stalled voice are never held by a
     const s = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
     const emit = s.slice(s.indexOf('const emitDirect = '), s.indexOf('const emitDirect = ') + 400)
     expect(emit).toContain("mcp.notification({ method: 'notifications/claude/channel', params: { content, meta } })")
-    const sched = s.slice(s.indexOf('scheduled = lateVoice.schedule({'), s.indexOf('const delivered = markPending(envelope, scheduled)'))
+    expect(emit.includes('void mcp.notification')).toBe(false) // the fetcher awaits it (r1 f2)
+    const sched = s.slice(s.indexOf('lateCandidate = {'), s.indexOf('bodyText = envelope.text'))
     expect(sched).toContain('onLate: (late, lateS) =>')
     expect(sched).toContain("emitDirect(late.text, { ...baseMeta, ...late.meta, voice_late_s: String(lateS) })")
     expect(sched).toContain("voice_lost: '1'")
@@ -432,7 +439,10 @@ describe('criterion 7 — order: texts after a stalled voice are never held by a
     expect(sched.includes('serialize(')).toBe(false)
     // ONE meta builder shared by the wake and the late notification
     expect(s.match(/user_id: String\(from\.id\),\n\s+ts: new Date\(\(ctx\.message\?\.date \?\? 0\) \* 1000\)\.toISOString\(\)/g)?.length).toBe(1)
-    expect(s).toContain('...baseMeta,\n                ...(imagePath ? { image_path: imagePath } : {}),')
+    expect(s).toContain('...baseMeta,\n                    ...(imagePath ? { image_path: imagePath } : {}),')
+    // the placeholder's wake goes through wakeThenArm (r1 f1): armed only after it was accepted
+    expect(s).toContain('await wakeThenArm({\n      fetcher: lateVoice,\n      envelope: { text: bodyText, meta: voiceMeta },\n      late: lateCandidate,')
+    expect(s.includes('lateVoice.schedule(')).toBe(false)
   })
 })
 
@@ -481,16 +491,17 @@ describe('criterion 9 — same download effect, same transcribe effect (original
 
   test('server.ts passes the first delivery’s voiceDownload / voiceTranscribe (static)', () => {
     const s = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-    const tr = s.slice(s.indexOf('const voiceTranscribe = (audioPath: string) =>'), s.indexOf('const envelope = await withTimeout('))
-    expect(tr).toContain("serialize('whisper', () =>")
-    expect(tr).toContain('extraArgs: transcribeFlags(ownerSent, msgId, chat_id)')
-    const dl = s.slice(s.indexOf('const voiceDownload = async (j: VoiceJournal) =>'), s.indexOf('const voiceTranscribe'))
-    expect(dl).toContain('(await keepOthersMedia(ctx, fileId, sizeHint)) ??')
-    expect(dl).toContain("downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga', net => (j.net = net))")
-    const sched = s.slice(s.indexOf('scheduled = lateVoice.schedule({'), s.indexOf('const delivered = markPending(envelope, scheduled)'))
-    expect(sched).toContain('download: voiceDownload,')
+    const tr = s.slice(s.indexOf('const voiceTranscribe = voiceTranscribeEffect({'), s.indexOf('const envelope = await withTimeout('))
+    expect(tr).toContain("queue: job => serialize('whisper', job),")
+    expect(tr).toContain('ownerSent,\n        msgId,\n        chatId: chat_id,')
+    expect(tr).toContain('{ timeoutMs, extraArgs, signal }')
+    const dl = s.slice(s.indexOf('const voiceDownload = voiceDownloadEffects({'), s.indexOf('const voiceTranscribe'))
+    expect(dl).toContain('keep: othersKeep(ctx, fileId, sizeHint),')
+    expect(dl).toContain("inbox: j => downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga', net => (j.net = net)),")
+    const sched = s.slice(s.indexOf('lateCandidate = {'), s.indexOf('bodyText = envelope.text'))
+    expect(sched).toContain('download: voiceDownload.late,')
     expect(sched).toContain('transcribe: voiceTranscribe,')
-    expect(s).toContain('download: () => voiceDownload(journal),')
+    expect(s).toContain('download: () => voiceDownload.first(journal),')
     expect(s).toContain('transcribe: voiceTranscribe,\n          logNotice: voiceLogNotice,')
   })
 })
@@ -556,13 +567,296 @@ describe('the same voice is taken once', () => {
     expect(h.fetcher.schedule(h.voice)).toBe(false)
     expect(h.fetcher.size()).toBe(1)
   })
-  test('a throwing onLate is contained: the line is written, the entry is gone', async () => {
+  test('a throwing onLate is contained: late:undelivered is written, the entry is gone (r1 f2)', async () => {
     const h = harness({ downloads: [async () => '/a.oga'] })
     h.voice.onLate = () => { throw new Error('mcp closed') }
     h.fetcher.schedule(h.voice)
     await h.clock.advanceTo(h.t0 + 3 * MIN)
-    expect(h.lines[0].outcome).toBe('late:bridge')
+    expect(h.lines.map(l => l.outcome)).toEqual(['late:undelivered'])
     expect(h.fetcher.size()).toBe(0)
     expect(voiceErrorClass(new Error('mcp closed'))).toBe('error')
+  })
+})
+
+// ═════ Codex r1 (sam-data …/codex-agent-runs/20261118T1205Z-driver-tg-voice-late-fetch-r1/out.json) ═════
+
+// ── f1 — the retry is armed only after the placeholder's wake was accepted (real deliverWakeWithBuffer) ──────────
+describe('r1 f1 — wakeThenArm: transactional with the first delivery', () => {
+  function wiring(notify: (content: string, meta: Record<string, string>) => Promise<void>) {
+    const clock = fakeClock()
+    const lines: VoiceLineFields[] = []
+    const fired: string[] = []
+    const fetcher = createLateVoiceFetcher({ writeLine: f => lines.push(f), logNotice: () => {}, nowMs: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer })
+    const late: Omit<LateVoice, 'placeholderMs'> = {
+      chat: '22276', msg: 49610, fileId: 'FILE-W', tsMs: clock.now() - 125_000, arrivedMs: clock.now() - 121_000, author: owner,
+      download: async () => '/a.oga', transcribe: async () => 'текст',
+      onLate: () => void fired.push('late'), onLost: () => void fired.push('lost'),
+    }
+    const run = () =>
+      wakeThenArm({
+        fetcher,
+        envelope: voicePlaceholder(undefined, owner),
+        late,
+        nowMs: clock.now,
+        wake: env => deliverWakeWithBuffer([], env.text, () => '/unused', {
+          notify: (content, extra) => notify(content, { chat_id: '22276', message_id: '49610', user_id: '111', ...env.meta, ...extra }),
+          reset: () => {},
+          logError: () => {},
+        }),
+      })
+    return { clock, lines, fired, fetcher, run }
+  }
+
+  test('the initial notification rejects → nothing armed: registry 0, timers 0, no late / lost ever', async () => {
+    const w = wiring(async () => { throw new Error('transport closed') })
+    expect(await w.run()).toBe(false)
+    expect(w.fetcher.size()).toBe(0)
+    expect(w.clock.pending()).toBe(0)
+    await w.clock.advanceTo(w.clock.now() + 180 * MIN)
+    expect(w.fired).toEqual([])
+    expect(w.lines).toEqual([])
+  })
+
+  test('the initial notification is accepted → it carried voice_pending="1" and exactly one entry is armed', async () => {
+    const sent: Record<string, string>[] = []
+    const w = wiring(async (_c, meta) => void sent.push(meta))
+    expect(await w.run()).toBe(true)
+    expect(sent.length).toBe(1)
+    expect(sent[0]).toMatchObject({ voice_pending: '1', ...ownerKeys, message_id: '49610', user_id: '111' })
+    expect(w.fetcher.size()).toBe(1)
+    expect(w.fetcher.has('FILE-W')).toBe(true)
+    await w.clock.advanceTo(w.clock.now() + 3 * MIN)
+    expect(w.fired).toEqual(['late'])
+  })
+
+  test('a message with no late candidate (any non-voice, a bridged voice) → no voice_pending, nothing armed', async () => {
+    const sent: Record<string, string>[] = []
+    const clock = fakeClock()
+    const fetcher = createLateVoiceFetcher({ writeLine: () => {}, logNotice: () => {}, nowMs: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer })
+    const ok = await wakeThenArm({ fetcher, envelope: { text: 'hi', meta: {} }, wake: async env => (sent.push(env.meta), true) })
+    expect(ok).toBe(true)
+    expect(sent).toEqual([{}])
+    expect(fetcher.size()).toBe(0)
+  })
+})
+
+// ── f2 — a late / lost emission closes the voice only once the transport accepted it ─────────────────────────────
+describe('r1 f2 — awaitable late / lost emission', () => {
+  test('onLate rejects → no late:bridge, one late:undelivered line, a loud notice; never a second emission', async () => {
+    const notices: string[] = []
+    const h = harness({ downloads: [async () => '/a.oga'] })
+    const fetcher = createLateVoiceFetcher({ writeLine: f => h.lines.push(f), logNotice: r => notices.push(r), nowMs: h.clock.now, setTimer: h.clock.setTimer, clearTimer: h.clock.clearTimer })
+    let calls = 0
+    h.voice.onLate = async () => { calls++; throw new Error('Not connected') }
+    fetcher.schedule(h.voice)
+    await h.clock.advanceTo(h.t0 + 120 * MIN)
+    expect(calls).toBe(1)
+    expect(h.lines.map(l => l.outcome)).toEqual(['late:undelivered'])
+    expect(h.lines.some(l => l.outcome === 'late:bridge')).toBe(false)
+    expect(notices.some(n => n.startsWith('late notification not accepted by the session'))).toBe(true)
+    expect(fetcher.size()).toBe(0)
+    expect(h.clock.pending()).toBe(0)
+  })
+
+  test('onLost rejects → late:undelivered, not late:failed', async () => {
+    const h = harness({ downloads: [async () => { throw err504() }] })
+    const fetcher = createLateVoiceFetcher({ writeLine: f => h.lines.push(f), logNotice: () => {}, nowMs: h.clock.now, setTimer: h.clock.setTimer, clearTimer: h.clock.clearTimer })
+    h.voice.onLost = async () => { throw new Error('Not connected') }
+    fetcher.schedule(h.voice)
+    await h.clock.advanceTo(h.t0 + 120 * MIN)
+    expect(h.lines.map(l => l.outcome)).toEqual(['late:undelivered'])
+    expect(h.lines[0].lateTries).toBe(6)
+  })
+
+  test('a succeeding emission: the entry stays (download_attachment refused) until accepted, then closes exactly once', async () => {
+    let accept: () => void = () => {}
+    const h = harness({ downloads: [async () => '/a.oga'] })
+    h.voice.onLate = () => new Promise<void>(r => (accept = r))
+    h.fetcher.schedule(h.voice)
+    await h.clock.advanceTo(h.t0 + 3 * MIN)
+    expect(h.lines).toEqual([])
+    expect(h.fetcher.has('FILE-1')).toBe(true)
+    accept()
+    for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r))
+    await h.clock.advanceTo(h.t0 + 120 * MIN)
+    expect(h.lines.map(l => [l.outcome, l.lateTries])).toEqual([['late:bridge', 1]])
+    expect(h.fetcher.size()).toBe(0)
+  })
+
+  test('the voice.log line format accepts late:undelivered', () => {
+    const dir = tempDir('voice-undelivered-')
+    createVoiceLog({ stateDir: dir, pid: 4 })({ chat: '22276', msg: 9, journal: { dl: 'ok' }, outcome: 'late:undelivered', totalMs: 5, lateTries: 2 })
+    expect(readFileSync(join(dir, VOICE_LOG), 'utf8')).toContain(' outcome=late:undelivered ')
+  })
+})
+
+// ── f3 — +70 min is a real upper bound, whisper-queue wait included ─────────────────────────────────────────────
+describe('r1 f3 — the deadline bounds the whole re-fetch', () => {
+  test('three late voices blocked on the shared whisper queue: each gets exactly one final outcome by +70, no expired job runs', async () => {
+    const clock = fakeClock()
+    const lines: VoiceLineFields[] = []
+    const fetcher = createLateVoiceFetcher({ writeLine: f => lines.push(f), logNotice: () => {}, nowMs: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer })
+    const runs: string[] = []
+    const signals: AbortSignal[] = []
+    let releaseFirst: () => void = () => {}
+    const queueKey = `whisper-r1f3-${Math.random()}`
+    // Voice 1's whisper run holds the one whisper slot until +75 min (a kill that did not take — the worst case);
+    // voices 2 and 3 wait behind it in the queue.
+    const transcribe = voiceTranscribeEffect({
+      ownerSent: true, msgId: 1, chatId: '22276',
+      queue: job => serialize(queueKey, job),
+      run: (audioPath, _args, signal) => {
+        runs.push(audioPath)
+        if (signal) signals.push(signal)
+        return new Promise<string>(resolve => (releaseFirst = () => resolve('поздно')))
+      },
+    })
+    const final: string[] = []
+    const t0 = clock.now()
+    for (const n of [1, 2, 3]) {
+      fetcher.schedule({
+        chat: '22276', msg: 49620 + n, fileId: `F${n}`, tsMs: t0 - 1_000, arrivedMs: t0, placeholderMs: t0, author: owner,
+        download: async () => `/a${n}.oga`, transcribe,
+        onLate: () => void final.push(`late ${n}`), onLost: () => void final.push(`lost ${n}`),
+      })
+    }
+    await clock.advanceTo(t0 + LATE_DEADLINE_MS - 1)
+    expect(runs).toEqual(['/a1.oga']) // voice 1 holds whisper; 2 and 3 wait in the queue
+    expect(final).toEqual([]) // nothing final while work is pending
+    expect(lines).toEqual([])
+    await clock.advanceTo(t0 + LATE_DEADLINE_MS)
+    for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r))
+    expect(final.sort()).toEqual(['lost 1', 'lost 2', 'lost 3'])
+    expect(lines.map(l => l.outcome)).toEqual(['late:failed', 'late:failed', 'late:failed'])
+    expect(signals.length).toBe(1)
+    expect(signals[0].aborted).toBe(true) // the running job is told to die (server.ts kills the child on abort)
+    await clock.advanceTo(t0 + 75 * MIN)
+    releaseFirst() // voice 1's whisper finally returns: its text is dropped, the queue moves on
+    for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r))
+    await clock.advanceTo(t0 + 300 * MIN)
+    expect(runs).toEqual(['/a1.oga']) // the queued, expired jobs of voices 2 and 3 never started
+    expect(final.length).toBe(3)
+    expect(lines.length).toBe(3)
+    expect(fetcher.size()).toBe(0)
+    expect(clock.pending()).toBe(0)
+  })
+
+  test('LATE_DEADLINE_MS is 70 min and comes after the last try at +60', () => {
+    expect(LATE_DEADLINE_MS).toBe(70 * MIN)
+    expect(LATE_DEADLINE_MS).toBeGreaterThan(LATE_TRY_AFTER_MS[LATE_TRY_AFTER_MS.length - 1])
+  })
+})
+
+// ── f4 — another author's voice: one Bot API request per late try, store path kept ──────────────────────────────
+describe('r1 f4 — the store path makes one getFile per late try', () => {
+  test('fake Bot API: two stalled tries then the file; exactly one getFile per try, none after the wait; kept in the store', async () => {
+    const getFileAt: number[] = []
+    let clockNow = () => 0
+    const server = createServer((req, res) => {
+      if ((req.url ?? '').includes('/getFile')) {
+        getFileAt.push(clockNow())
+        res.setHeader('content-type', 'application/json')
+        if (getFileAt.length <= 2) return // Telegram holds the file (the downloader's cap aborts it)
+        return res.end(JSON.stringify({ ok: true, result: { file_unique_id: 'AgADo', file_size: 4, file_path: 'voice/file_9.oga' } }))
+      }
+      res.end(Buffer.from([1, 2, 3, 4]))
+    })
+    await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()))
+    const port = (server.address() as { port: number }).port
+    const root = tempDir('voice-late-store-')
+    const inbox = tempDir('voice-late-inbox-')
+    try {
+      // the 120 s wait scaled to 150 ms; the downloader's own cap to 400 ms (the stalled request is aborted there)
+      const { downloadTelegramFile } = createTelegramDownloader({ token: '123456789:AAH-SECRET-store', origin: `http://127.0.0.1:${port}`, probeAfterMs: 60_000, capMs: 400, probe: async () => 30 })
+      const keeper = createKeeper({
+        download: async fileId => {
+          const got = await downloadTelegramFile(fileId)
+          if (got.status === 'no_file') return undefined
+          if (got.status === 'too_big') return 'too_big'
+          return { bytes: got.bytes, ext: got.ext || 'bin' }
+        },
+        log: () => {},
+      })
+      const effects = voiceDownloadEffects({
+        keep: () => keeper.keep(root, '-1001', 49630, 'FILE-O', 4),
+        inbox: async j => {
+          const got = await downloadTelegramFile('FILE-O', { onStart: n => (j.net = n) })
+          if (got.status !== 'ok') return undefined
+          const p = join(inbox, 'o.oga')
+          writeFileSync(p, got.bytes)
+          return p
+        },
+      })
+      const clock = fakeClock()
+      clockNow = () => clock.now()
+      const alice: VoiceAuthorResult = { voice_author: 'alice_h', voice_author_id: '555', voice_author_origin: 'sender', voice_trust: 'data' }
+      const late: VoiceEnvelope[] = []
+      const fetcher = createLateVoiceFetcher({ writeLine: () => {}, logNotice: () => {}, nowMs: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, downloadTimeoutMs: 150 })
+      const t0 = clock.now()
+      fetcher.schedule({
+        chat: '-1001', msg: 49630, fileId: 'FILE-O', tsMs: t0 - 1_000, arrivedMs: t0, placeholderMs: t0, author: alice,
+        download: effects.late, transcribe: async () => 'чужой текст', onLate: env => void late.push(env), onLost: () => {},
+      })
+      // the try's wait (150 ms) ends long before the downloader's cap (400 ms); then wait well past the cap
+      const pastTheCap = async () => {
+        for (let i = 0; i < 25; i++) await new Promise(r => setTimeout(r, 40))
+      }
+      for (const [k, offset] of [[1, 2], [2, 5], [3, 10]] as const) {
+        await clock.advanceTo(t0 + offset * MIN, pastTheCap)
+        expect(getFileAt.length).toBe(k)
+        expect(getFileAt[k - 1]).toBe(t0 + offset * MIN)
+      }
+      expect(late.length).toBe(1)
+      expect(late[0].meta).toMatchObject({ transcript_source: 'bridge', voice_trust: 'data', voice_author: 'alice_h' })
+      expect(late[0].meta.attachment_path.startsWith(keptFilesDir(root, '-1001'))).toBe(true)
+      expect(existsSync(late[0].meta.attachment_path)).toBe(true)
+      expect(existsSync(join(inbox, 'o.oga'))).toBe(false) // never the inbox fallback on a late try
+      await clock.advanceTo(t0 + 120 * MIN, pastTheCap)
+      expect(getFileAt.length).toBe(3)
+    } finally {
+      server.closeAllConnections()
+      server.close()
+    }
+  }, 30_000)
+
+  test('the first delivery keeps its inbox fallback; the person\'s own voice uses the inbox on both', async () => {
+    const calls: string[] = []
+    const others = voiceDownloadEffects({ keep: async () => (calls.push('keep'), undefined), inbox: async () => (calls.push('inbox'), '/inbox/x.oga') })
+    expect(await others.first({})).toBe('/inbox/x.oga')
+    expect(calls).toEqual(['keep', 'inbox'])
+    calls.length = 0
+    expect(await others.late({})).toBeUndefined()
+    expect(calls).toEqual(['keep'])
+    const own = voiceDownloadEffects({ keep: undefined, inbox: async () => (calls.push('own'), '/inbox/own.oga') })
+    expect(await own.late({})).toBe('/inbox/own.oga')
+  })
+})
+
+// ── f6 — a late try runs whisper with the exact original arguments (owner: owner-log extract; other: --no-save) ─────
+describe('r1 f6 — the late transcribe arguments, executed', () => {
+  async function lateArgs(ownerSent: boolean, author: VoiceAuthorResult) {
+    const seen: { audioPath: string; args: string[] }[] = []
+    const transcribe = voiceTranscribeEffect({
+      ownerSent, msgId: 49640, chatId: '22276',
+      queue: job => serialize(`whisper-r1f6-${Math.random()}`, job),
+      run: async (audioPath, args) => (seen.push({ audioPath, args }), 'слова'),
+    })
+    const h = harness({ downloads: [async () => { throw err504() }, async () => '/late/49640.oga'], author })
+    h.voice.transcribe = transcribe
+    h.fetcher.schedule(h.voice)
+    await h.clock.advanceTo(h.t0 + 10 * MIN)
+    expect(h.late.length).toBe(1)
+    return seen
+  }
+
+  test('the person\'s own voice: --msg-id/--chat-id/--source telegram of the ORIGINAL message, on the late file', async () => {
+    expect(await lateArgs(true, owner)).toEqual([
+      { audioPath: '/late/49640.oga', args: ['--msg-id', '49640', '--chat-id', '22276', '--source', 'telegram', '--no-recall'] },
+    ])
+  })
+
+  test('another author\'s voice: --no-save, no --msg-id (no owner extract, no owner save)', async () => {
+    const alice: VoiceAuthorResult = { voice_author: 'alice_h', voice_author_id: '555', voice_author_origin: 'sender', voice_trust: 'data' }
+    expect(await lateArgs(false, alice)).toEqual([{ audioPath: '/late/49640.oga', args: ['--no-save', '--no-recall'] }])
   })
 })

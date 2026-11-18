@@ -81,11 +81,12 @@ import {
   deliverVoiceTranscript,
   LATE_VOICE_REFUSAL,
   lateFetchWanted,
-  markPending,
   PHOTO_DOWNLOAD_TIMEOUT_MS,
   voiceEnvelopeMs,
   serialize,
-  transcribeFlags,
+  voiceDownloadEffects,
+  voiceTranscribeEffect,
+  wakeThenArm,
   ttsLang,
   userVoiceConfig,
   voiceAuthor,
@@ -94,6 +95,7 @@ import {
   whisperTimeoutMs,
   voiceOutcomeOf,
   withTimeout,
+  type LateVoice,
   type VoiceJournal,
 } from './voice-delivery'
 import { createTelegramDownloader, type DownloadJournal } from './tg-download'
@@ -428,11 +430,17 @@ bot.api.config.use(
 )
 /** Someone else's voice / photo in a bot chat → kept in the store (delivered from there); his own → undefined (inbox path). */
 function keepOthersMedia(ctx: Context, fileId: string, size: number | undefined): Promise<string | undefined> {
+  return othersKeep(ctx, fileId, size)?.() ?? Promise.resolve(undefined)
+}
+/** The store keep of someone else's media as a thunk; undefined when the media takes the inbox path (his own, no store). */
+function othersKeep(ctx: Context, fileId: string, size: number | undefined): (() => Promise<string | undefined>) | undefined {
   const msgId = ctx.message?.message_id
-  if (!ARCHIVE_ROOT || msgId == null || ctx.chat == null) return Promise.resolve(undefined)
+  if (!ARCHIVE_ROOT || msgId == null || ctx.chat == null) return undefined
   const owner = voiceOwnerId()
-  if (owner != null && String(ctx.from?.id) === owner) return Promise.resolve(undefined)
-  return keeper.keep(ARCHIVE_ROOT, String(ctx.chat.id), msgId, fileId, size)
+  if (owner != null && String(ctx.from?.id) === owner) return undefined
+  const root = ARCHIVE_ROOT
+  const chatId = String(ctx.chat.id)
+  return () => keeper.keep(root, chatId, msgId, fileId, size)
 }
 let storeCatchUpDone = false
 let botUsername = ''
@@ -2049,12 +2057,13 @@ function runTranscribeCmd(
   cmd: string,
   audioPath: string,
   lang: string,
-  opts?: { timeoutMs?: number; extraArgs?: readonly string[] },
+  opts?: { timeoutMs?: number; extraArgs?: readonly string[]; signal?: AbortSignal },
 ): Promise<string> {
   const extraArgs = opts?.extraArgs ?? []
   const child = spawn('sh', ['-c', `${cmd} "$@"`, 'sh', audioPath, lang, ...extraArgs], {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
+  opts?.signal?.addEventListener('abort', () => child.kill('SIGKILL'), { once: true })
   const raw = new Promise<string>((resolve, reject) => {
     let out = ''
     let err = ''
@@ -2430,11 +2439,11 @@ async function handleInbound(
       } : {}),
     }
     // A late / lost voice notification: emitted directly (like reactions), never through deliverWakeWithBuffer and
-    // never under this chat's serialize key — the group buffer was already used by the placeholder's wake.
+    // never under this chat's serialize key — the group buffer was already used by the placeholder's wake. Returns the
+    // transport's promise: the late fetcher closes the voice only when it resolves (a rejection → late:undelivered).
     const emitDirect = (content: string, meta: Record<string, string>) =>
-      void mcp.notification({ method: 'notifications/claude/channel', params: { content, meta } }).catch(err =>
-        safeStderr(`telegram channel: late voice notification failed (chat=${chat_id} msg=${msgId ?? '?'}): ${err}\n`),
-      )
+      mcp.notification({ method: 'notifications/claude/channel', params: { content, meta } })
+    let lateCandidate: Omit<LateVoice, 'placeholderMs'> | undefined
 
     // F4 fix (analysis/2026-09-17-voice-bridge-u3-verdict.md): every leg that
     // can hang (the voice envelope's own download, which has NO bound of its
@@ -2467,27 +2476,28 @@ async function handleInbound(
       let envelopeTimedOut = false
       // D-883: someone else's voice is delivered from the chat store (its transcript lands
       // next to it — core transcribe.sh); his own, or a store failure, keeps the inbox path.
-      // The same effect is reused by a late re-fetch (D-1087), with that try's own journal.
-      const voiceDownload = async (j: VoiceJournal) =>
-        (await keepOthersMedia(ctx, fileId, sizeHint)) ??
-        downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga', net => (j.net = net))
+      // A late re-fetch (D-1087) takes the same path with ONE Bot API request per try (voiceDownloadEffects).
+      const voiceDownload = voiceDownloadEffects({
+        keep: othersKeep(ctx, fileId, sizeHint),
+        inbox: j => downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga', net => (j.net = net)),
+      })
       // Whisper mutex (§6.3, EXTRAS(2)): the SAME serialize() keyed on a
       // fixed 'whisper' key bounds concurrent whisper runs to 1 across ALL
       // chats (whisper is ~1.5GB RSS on a 16GB miniK) — a slow voice in
       // chat B still waits behind chat A's transcription here, even though
       // the two chats' TEXT delivery never waits on each other above.
       // Reused by a late re-fetch with the original transcribeFlags (owner-log extract for the original msg_id).
-      const voiceTranscribe = (audioPath: string) =>
-        serialize('whisper', () =>
-          runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, lang, {
-            timeoutMs,
-            extraArgs: transcribeFlags(ownerSent, msgId, chat_id),
-          }),
-        )
+      const voiceTranscribe = voiceTranscribeEffect({
+        ownerSent,
+        msgId,
+        chatId: chat_id,
+        queue: job => serialize('whisper', job),
+        run: (audioPath, extraArgs, signal) => runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, lang, { timeoutMs, extraArgs, signal }),
+      })
       const envelope = await withTimeout(
         deliverVoiceTranscript(TRANSCRIBE_CMD != null, ctx.message?.caption, author, {
           journal,
-          download: () => voiceDownload(journal),
+          download: () => voiceDownload.first(journal),
           transcribe: voiceTranscribe,
           logNotice: voiceLogNotice,
         }),
@@ -2523,15 +2533,14 @@ async function handleInbound(
           totalMs: Date.now() - voiceStart,
         })
       } catch {}
-      // D-1087 §2 C: a Telegram/network-side download failure → the late fetcher takes the voice, and only then
-      // the placeholder says voice_pending="1".
-      let scheduled = false
+      // D-1087 §2 C: a Telegram/network-side download failure → the late fetcher takes the voice, but only after the
+      // placeholder's wake was accepted (wakeThenArm below, Codex r1 f1); only then the placeholder says voice_pending.
       if (
         msgId != null &&
         lateFetchWanted({ cmdConfigured: TRANSCRIBE_CMD != null, deliveredBridge, timedOut: envelopeTimedOut, journal })
       ) {
         const caption = ctx.message?.caption
-        scheduled = lateVoice.schedule({
+        lateCandidate = {
           chat: chat_id,
           msg: msgId,
           fileId,
@@ -2539,20 +2548,18 @@ async function handleInbound(
           durS: attachment.duration,
           tsMs: (ctx.message?.date ?? 0) * 1000,
           arrivedMs: voiceStart,
-          placeholderMs: Date.now(),
           caption,
           author,
-          download: voiceDownload,
+          download: voiceDownload.late,
           transcribe: voiceTranscribe,
           onLate: (late, lateS) =>
             emitDirect(late.text, { ...baseMeta, ...late.meta, voice_late_s: String(lateS) }),
           onLost: () =>
             emitDirect(caption ?? '(voice message)', { ...baseMeta, ...voiceAuthorMeta(author), voice_lost: '1' }),
-        })
+        }
       }
-      const delivered = markPending(envelope, scheduled)
-      bodyText = delivered.text
-      voiceMeta = delivered.meta
+      bodyText = envelope.text
+      voiceMeta = envelope.meta
     } else if (downloadImage) {
       imagePath = await withTimeout(
         downloadImage(),
@@ -2582,28 +2589,34 @@ async function handleInbound(
     // messages depends on THIS call actually completing before the next
     // queued block in the chain starts (§6.2 point 3) — a fire-and-forget
     // here would only guarantee ordering to a microtask, not in practice.
-    await deliverWakeWithBuffer(
-      bufferedEntries,
-      bodyText,
-      formatted => writeContextBufferFile(GROUP_BUFFER_DIR, chat_id, formatted),
-      {
-        notify: (content, extraMeta) =>
-          mcp.notification({
-            method: 'notifications/claude/channel',
-            params: {
-              content,
-              meta: {
-                ...baseMeta,
-                ...(imagePath ? { image_path: imagePath } : {}),
-                ...voiceMeta,
-                ...extraMeta,
-              },
-            },
-          }),
-        reset: () => resetGroupBuffer(GROUP_BUFFER_DIR, chat_id),
-        logError: reason => process.stderr.write(`telegram channel: ${reason}\n`),
-      },
-    )
+    await wakeThenArm({
+      fetcher: lateVoice,
+      envelope: { text: bodyText, meta: voiceMeta },
+      late: lateCandidate,
+      wake: wakeEnvelope =>
+        deliverWakeWithBuffer(
+          bufferedEntries,
+          wakeEnvelope.text,
+          formatted => writeContextBufferFile(GROUP_BUFFER_DIR, chat_id, formatted),
+          {
+            notify: (content, extraMeta) =>
+              mcp.notification({
+                method: 'notifications/claude/channel',
+                params: {
+                  content,
+                  meta: {
+                    ...baseMeta,
+                    ...(imagePath ? { image_path: imagePath } : {}),
+                    ...wakeEnvelope.meta,
+                    ...extraMeta,
+                  },
+                },
+              }),
+            reset: () => resetGroupBuffer(GROUP_BUFFER_DIR, chat_id),
+            logError: reason => process.stderr.write(`telegram channel: ${reason}\n`),
+          },
+        ),
+    })
   }).catch(err => safeStderr(`telegram channel: serialized delivery crashed (chat=${chat_id}): ${err}\n`))
 
   // Route A — additive signed approval-channel emit (step-2 / reply parity).
