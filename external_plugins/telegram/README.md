@@ -179,8 +179,8 @@ as one JSON line to `~/Workspace/ClaudeProjects/sam-data/state/tg-archive/<chat>
 `text`, optional `thread_id`, `file_id`, and — the same names and values as the envelope —
 `reply_to_message_id` / `reply_to_text` / `reply_to_user` / `reply_to_quote`,
 `forward_origin` / `forward_author` / `forward_author_id` / `forward_date` (every kind,
-voice too), plus `sender_display` (first + last name) and `via_bot` (an inline-bot result) — text
-and labels only, no media bytes). `thread_id` is the forum topic id: the reader's `--topic` filters by it.
+voice too), plus `sender_display` (first + last name) and `via_bot` (an inline-bot result), and `archive_only: true` on his own
+voice / photo that did not wake the session — text and labels only, no media bytes). `thread_id` is the forum topic id: the reader's `--topic` filters by it.
 A team group (`team: true`, see ACCESS.md) archives every member and wakes only on an
 explicit, typed (not forwarded, not via an inline bot) `@<bot>` in the own message of the install
 owner or of an authorized client co-owner (`/etc/sam-telegram-access/co-owners`); any other content
@@ -216,9 +216,9 @@ stderr line, delivery unchanged.
   (`attachment_path` / `image_path`); his own keep the inbox path. Retention (90 days for other
   people's files) is core's nightly job, not the plugin's.
 - **Start-up catch-up** (once per process, background): kept files for stored lines of the last
-  90 days that have none (his own voice / photo only when a `.missing` receipt shows its
-  archive-only keep failed or was cut off — the keeper writes a `pending` receipt before every
-  download and removes it on success; a delivered one never gets a receipt), and one `backfilled: true` out line per secretary draft with
+  90 days that have none (his own voice / photo only when its archive line carries
+  `archive_only: true` — set in the same append when it did not wake the session; a delivered
+  one has no such field and stays skipped), and one `backfilled: true` out line per secretary draft with
   `status: "sent"` not yet in its `.out.jsonl`.
 
 ## Secretary in the owner's Telegram (this fork, Telegram Business, D-637)

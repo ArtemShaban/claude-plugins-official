@@ -174,8 +174,7 @@ export function keptFilePath(root: string, chatId: string, msgId: number): strin
 /**
  * archive-store-fixes §2.C (owner tg 39044): a file that was not kept leaves a durable named reason,
  * `files/<msg_id>.missing` = one JSON line `{ts, error_class}` — `too_big`, `no_file_path`, or the
- * closed class of storeErrorLine, or `pending` (written before every download, rr2-2: a crash mid-download
- * still leaves a retry signal). stderr alone was persisted nowhere (video 41167). keptFilePath never
+ * closed class of storeErrorLine. stderr alone was persisted nowhere (video 41167). keptFilePath never
  * returns it, so catch-up still retries the row; a later success removes it.
  */
 export function missingFileName(msgId: number): string {
@@ -268,10 +267,6 @@ export function createKeeper(deps: { download: Download; log: (line: string) => 
         markMissing(root, chatId, msgId, 'too_big')
         return undefined
       }
-      // rr2-2: the receipt goes down BEFORE the download, so a process that dies mid-download still leaves
-      // the retry signal catchUp reads (his archive-only voice / photo has no other); success removes it below.
-      // Not writable = the store dir is unusable for the bytes too: stop here, its one error already logged.
-      if (!markMissing(root, chatId, msgId, 'pending')) return undefined
       const got = await deps.download(fileId)
       if (got === undefined) {
         markMissing(root, chatId, msgId, 'no_file_path')
@@ -370,15 +365,10 @@ export async function catchUp(deps: CatchUpDeps): Promise<{ kept: number; backfi
         for (const name of readdirSync(dir).filter(n => MONTH_FILE.test(n) && n.slice(0, 7) >= firstMonth).sort()) {
           for (const l of readJsonLines<ArchiveLine>(join(dir, name))) {
             if (!l.file_id || l.msg_id == null || typeof l.ts !== 'string' || l.ts < cutoff) continue
-            // His own voice / photo: delivery keeps them, so skipped — unless a `.missing` receipt says the
-            // live keep of an ARCHIVE-ONLY one (his no-@ voice in a team group) failed or was cut off mid-download
-            // (`pending`, rr2-2): retried (r1 f4).
-            // A delivered one never gets a receipt (the live keeper skips it), so it stays skipped.
-            if (
-              isArchive &&
-              isOwnDeliveredMedia(l.kind, l.sender_id, deps.ownerId) &&
-              !existsSync(join(keptFilesDir(root, l.chat_id), missingFileName(l.msg_id)))
-            ) continue
+            // His own voice / photo: delivery keeps them, so skipped — unless the row itself says it is
+            // ARCHIVE-ONLY (`archive_only`, his no-@ voice in a team group; rr3-1): then retried like anyone's
+            // until it has bytes, whatever stopped the live keep (a failure, a crash mid-download, rr2-2).
+            if (isArchive && isOwnDeliveredMedia(l.kind, l.sender_id, deps.ownerId) && l.archive_only !== true) continue
             if (keptFilePath(root, l.chat_id, l.msg_id)) {
               // r1 f12: bytes next to a stale reason file → keep()'s fast path removes it (no download, not counted)
               if (existsSync(join(keptFilesDir(root, l.chat_id), missingFileName(l.msg_id)))) await deps.keeper.keep(root, l.chat_id, l.msg_id, l.file_id)

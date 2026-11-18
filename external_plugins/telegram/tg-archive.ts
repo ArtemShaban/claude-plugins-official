@@ -50,6 +50,12 @@ export type ArchiveLine = {
   sender_display?: string
   /** r1 f1: an inline-bot result — «@<bot username>», else the bot's id; that bot wrote the text. */
   via_bot?: string
+  /**
+   * rr3-1 (AC-05): his own voice / photo that did NOT wake the session (no `@` in a team group, any group
+   * drop / buffer). Delivery does not keep it, so the store must — written in the same append as the row,
+   * so catch-up can always tell it from a delivered one. Absent on every other line.
+   */
+  archive_only?: true
 }
 
 /** The slice of a Telegram message messageContextMeta reads (grammY Message is assignable). */

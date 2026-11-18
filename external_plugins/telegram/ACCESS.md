@@ -115,7 +115,7 @@ group's existing `requireMention`/`allowFrom`/`postPolicy`:
 ## Team group (`team: true`)
 
 For a forum group of the owner's team, where every member's message must be
-kept but only the owner may wake the assistant. Write the entry as exactly
+kept but only the install owner (or a client co-owner) may wake the assistant. Write the entry as exactly
 
 ```jsonc
 "-1001654782309": { "team": true, "requireMention": true, "allowFrom": ["none"] }

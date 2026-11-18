@@ -411,6 +411,13 @@ describe('team group — kept files (AC-05, OB-02)', () => {
     expect(kept(TEAM).filter(n => n.startsWith('109.'))).toEqual([])
   })
 
+  test('rr3-1: his archive-only voice and photo rows carry archive_only:true (the catch-up retry signal); delivered and member rows do not', () => {
+    expect(line(TEAM, 106)?.archive_only).toBe(true)
+    expect(line(TEAM, 111)?.archive_only).toBe(true)
+    expect('archive_only' in (line(TEAM, 109) ?? {})).toBe(false)
+    expect('archive_only' in (line(TEAM, 105) ?? {})).toBe(false)
+  })
+
   test('r1 f4: the archive append threw, the keeper still kept his no-@ voice', () => {
     expect(stderr).toContain('tg-archive append failed')
     expect(kept(TEAM2)).toContain('124.oga')
