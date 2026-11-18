@@ -174,7 +174,8 @@ export function keptFilePath(root: string, chatId: string, msgId: number): strin
 /**
  * archive-store-fixes §2.C (owner tg 39044): a file that was not kept leaves a durable named reason,
  * `files/<msg_id>.missing` = one JSON line `{ts, error_class}` — `too_big`, `no_file_path`, or the
- * closed class of storeErrorLine. stderr alone was persisted nowhere (video 41167). keptFilePath never
+ * closed class of storeErrorLine, or `pending` (written before every download, rr2-2: a crash mid-download
+ * still leaves a retry signal). stderr alone was persisted nowhere (video 41167). keptFilePath never
  * returns it, so catch-up still retries the row; a later success removes it.
  */
 export function missingFileName(msgId: number): string {
@@ -232,14 +233,16 @@ export function createKeeper(deps: { download: Download; log: (line: string) => 
     try { deps.log(storeErrorLine('tg-keep-file', err, action, now())) } catch {}
   }
   /** The durable reason (§2.C). Never throws: a failure here is one more stderr line. */
-  const markMissing = (root: string, chatId: string, msgId: number, errorClass: string) => {
+  const markMissing = (root: string, chatId: string, msgId: number, errorClass: string): boolean => {
     try {
       const dir = privateFilesDir(root, chatId)
       const tmp = join(dir, `.${msgId}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
       writeFileSync(tmp, JSON.stringify({ ts: now().toISOString(), error_class: errorClass }) + '\n', { mode: 0o600, flag: 'wx' })
       renameSync(tmp, join(dir, missingFileName(msgId)))
+      return true
     } catch (err) {
       fail(err, `reason file of msg ${msgId} not written`)
+      return false
     }
   }
 
@@ -265,6 +268,10 @@ export function createKeeper(deps: { download: Download; log: (line: string) => 
         markMissing(root, chatId, msgId, 'too_big')
         return undefined
       }
+      // rr2-2: the receipt goes down BEFORE the download, so a process that dies mid-download still leaves
+      // the retry signal catchUp reads (his archive-only voice / photo has no other); success removes it below.
+      // Not writable = the store dir is unusable for the bytes too: stop here, its one error already logged.
+      if (!markMissing(root, chatId, msgId, 'pending')) return undefined
       const got = await deps.download(fileId)
       if (got === undefined) {
         markMissing(root, chatId, msgId, 'no_file_path')
@@ -364,7 +371,8 @@ export async function catchUp(deps: CatchUpDeps): Promise<{ kept: number; backfi
           for (const l of readJsonLines<ArchiveLine>(join(dir, name))) {
             if (!l.file_id || l.msg_id == null || typeof l.ts !== 'string' || l.ts < cutoff) continue
             // His own voice / photo: delivery keeps them, so skipped — unless a `.missing` receipt says the
-            // live keep of an ARCHIVE-ONLY one (his no-@ voice in a team group) failed: retried (r1 f4).
+            // live keep of an ARCHIVE-ONLY one (his no-@ voice in a team group) failed or was cut off mid-download
+            // (`pending`, rr2-2): retried (r1 f4).
             // A delivered one never gets a receipt (the live keeper skips it), so it stays skipped.
             if (
               isArchive &&

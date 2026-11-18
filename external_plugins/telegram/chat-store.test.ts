@@ -500,6 +500,26 @@ describe('archive-store-fixes AC-5 — files/<msg_id>.missing', () => {
     expect(r.kept).toBe(1)
     expect(readdirSync(gdir()).sort()).toEqual(['47.oga'])
   })
+
+  test('rr2-2: the process dies while his archive-only voice is downloading → a fresh catchUp retries it once; his delivered one stays skipped', async () => {
+    const gdir = () => join(archiveChatDir(archive, GROUP), 'files')
+    const row = (msg_id: number, file_id: string) =>
+      appendArchive(archive, { ts: '2026-10-27T08:00:00.000Z', chat_id: GROUP, msg_id, sender_id: OWNER, senderName: 'owner', kind: 'voice', text: '(voice message)', file_id, thread_id: 7 })
+    row(49, 'F49') // archive-only (no @): the live keeper started, then the process ended mid-download
+    row(50, 'F50') // delivered: the live keeper never ran
+    const hung: string[] = []
+    const live = createKeeper({ download: (id: string) => { hung.push(id); return new Promise(() => {}) }, log: l => logs.push(l) })
+    void live.keep(archive, GROUP, 49, 'F49') // never settles = termination before completion
+    expect(hung).toEqual(['F49'])
+    expect(keptFilePath(archive, GROUP, 49)).toBeUndefined() // no bytes exist
+    const d = fakeDownload()
+    const NOW = new Date('2026-10-29T06:00:00Z')
+    const r = await catchUp({ archiveRoot: archive, ownerId: OWNER, drafts: () => ({}), log: (l: string) => logs.push(l), now: () => NOW,
+      keeper: createKeeper({ download: d.download, log: l => logs.push(l) }) })
+    expect(d.calls).toEqual(['F49'])
+    expect(r.kept).toBe(1)
+    expect(readdirSync(gdir()).sort()).toEqual(['49.oga'])
+  })
 })
 
 // ── archive-store-fixes r1 (verdict 2026-11-09-archive-store-fixes-codex-r1) ──────────────────────────
