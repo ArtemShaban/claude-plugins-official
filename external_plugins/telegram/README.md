@@ -201,7 +201,8 @@ stderr line, delivery unchanged.
   keeps — allowed DM people and configured groups, so a pairing reply to a stranger is not
   stored). Fields `ts`, `chat_id`, `msg_id`, `direction:"out"`, `via` (`secretary` | `bot`),
   `kind`, `text` (caption for media; `start=<INVITE>` redaction), optional `file_id`,
-  `of_msg_id` (edits), `backfilled`. A sibling file: readers of `YYYY-MM.jsonl` see no change.
+  `thread_id` (the forum topic of the sent message, its `message_thread_id`, so a topic read
+  includes our replies), `of_msg_id` (edits), `backfilled`. A sibling file: readers of `YYYY-MM.jsonl` see no change.
   A failed send writes nothing; a write error is one stderr JSON line
   `{ts, component, error_class, action_taken}` and the send's result is returned unchanged.
 - **Kept files.** Every incoming file of a stored line (tg-archive: delivered, buffered or

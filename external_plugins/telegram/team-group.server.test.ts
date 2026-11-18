@@ -54,6 +54,12 @@ function groupMsg(id: number, chat: number, from: From, extra: Record<string, un
 }
 const voice = (id: string) => ({ voice: { file_id: id, file_unique_id: 'u' + id, duration: 2, file_size: 5 } })
 
+// r2 f3: one fixture per fallback content kind (server.ts OTHER_CONTENT_KINDS) — kind → its update id. The coverage
+// test below reads OTHER_CONTENT_KINDS from server.ts itself, so a kind added there without a fixture here fails.
+const FALLBACK_KINDS: Record<string, number> = {
+  dice: 115, game: 116, story: 117, paid_media: 118, animation: 125, giveaway: 126, giveaway_winners: 127, checklist: 128,
+}
+
 const UPDATES = [
   // 101 owner @ in a topic, a reply with a quote → the one wake
   groupMsg(101, TEAM, owner, {
@@ -80,6 +86,11 @@ const UPDATES = [
   groupMsg(117, TEAM, member, { story: { chat: { id: 5, type: 'private' }, id: 1 } }),
   groupMsg(118, TEAM, member, { paid_media: { star_count: 1, paid_media: [] } }),
   groupMsg(119, TEAM, member, { animation: { file_id: 'A119', file_unique_id: 'uA', width: 1, height: 1, duration: 1 }, document: { file_id: 'A119', file_unique_id: 'uA' } }),
+  // r2 f3: a bare animation (no document), a giveaway, its winners, a checklist → the fallback, one line each
+  groupMsg(125, TEAM, member, { animation: { file_id: 'A125', file_unique_id: 'uA125', width: 1, height: 1, duration: 1 } }),
+  groupMsg(126, TEAM, member, { giveaway: { chats: [{ id: -1007, type: 'channel', title: 'c' }], winners_selection_date: NOW_S + 60, winner_count: 1 } }),
+  groupMsg(127, TEAM, member, { giveaway_winners: { chat: { id: -1007, type: 'channel', title: 'c' }, giveaway_message_id: 3, winners_selection_date: NOW_S, winner_count: 1, winners: [{ id: 9, is_bot: false, first_name: 'w' }] } }),
+  groupMsg(128, TEAM, owner, { checklist: { title: 'список', tasks: [{ id: 1, text: 'пункт' }] } }),
   groupMsg(121, TEAM, member, { location: { latitude: 1, longitude: 2 }, venue: { location: { latitude: 1, longitude: 2 }, title: 'V', address: 'A' } }),
   groupMsg(122, TEAM, member, { new_chat_members: [{ id: 9, is_bot: false, first_name: 'n' }] }), // service: not archived
   groupMsg(123, OLD, member, { dice: { emoji: '🎲', value: 1 } }, null), // another group: unchanged (dropped)
@@ -237,7 +248,7 @@ describe('team group — wake (AC-01 wiring, OB-03)', () => {
   test('exactly the owner\'s own @ messages wake (text 101, voice+caption 109); every other team message does not', () => {
     const team = notifications.filter(n => n.meta.chat_id === String(TEAM))
     expect(team.map(n => n.meta.message_id).sort(), stderr).toEqual(['101', '109'])
-    for (const id of [102, 103, 104, 105, 106, 107, 108, 110, 111, 112, 114, 115, 116, 117, 118, 119, 121, 122, 123, 124]) {
+    for (const id of [102, 103, 104, 105, 106, 107, 108, 110, 111, 112, 114, 115, 116, 117, 118, 119, 121, 122, 123, 124, 125, 126, 127, 128]) {
       expect(notifIds()).not.toContain(String(id))
     }
   })
@@ -302,7 +313,7 @@ describe('team group — envelope (AC-04, OB-04)', () => {
 describe('team group — archive (AC-03, OB-01)', () => {
   test('every team message has exactly one line, the wakes included', () => {
     const ids = linesOf(TEAM).map(l => l.msg_id).sort()
-    expect(ids).toEqual([101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 114, 115, 116, 117, 118, 119, 121])
+    expect(ids).toEqual([101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 114, 115, 116, 117, 118, 119, 121, 125, 126, 127, 128])
   })
 
   test('r1 f1: the inline-bot result is archived with via_bot', () => {
@@ -363,6 +374,27 @@ describe('team group — archive (AC-03, OB-01)', () => {
     // the existing group is not woken by a plain member message
     expect(notifIds()).not.toContain('120')
   })
+})
+
+describe('team group — r2 f3 fallback content kinds, exhaustive', () => {
+  test('the tested kinds are exactly server.ts OTHER_CONTENT_KINDS', () => {
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const m = src.match(/const OTHER_CONTENT_KINDS = \[([^\]]*)\]/)
+    expect(m).not.toBeNull()
+    const kinds = [...m![1].matchAll(/'([a-z_]+)'/g)].map(x => x[1]).sort()
+    expect(kinds.length).toBeGreaterThan(0)
+    expect(Object.keys(FALLBACK_KINDS).sort()).toEqual(kinds)
+  })
+
+  for (const [kind, id] of Object.entries(FALLBACK_KINDS)) {
+    test(`${kind} (${id}): exactly one archive line with its kind, no notification, no reaction`, () => {
+      const rows = linesOf(TEAM).filter(l => l.msg_id === id)
+      expect(rows.length).toBe(1)
+      expect(rows[0]).toMatchObject({ kind, text: `(${kind})` })
+      expect(notifIds()).not.toContain(String(id))
+      expect(calls.filter(c => c.startsWith('setMessageReaction')).map(c => c.split(' ')[1])).not.toContain(String(id))
+    })
+  }
 })
 
 describe('team group — kept files (AC-05, OB-02)', () => {
