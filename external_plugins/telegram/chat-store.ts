@@ -240,7 +240,7 @@ export function createKeeper(deps: { download: Download; log: (line: string) => 
       renameSync(tmp, join(dir, missingFileName(msgId)))
       return true
     } catch (err) {
-      fail(err, `reason file of msg ${msgId} not written`)
+      fail(err, `file of msg ${msgId} not kept; reason file not written`)
       return false
     }
   }
@@ -296,8 +296,8 @@ export function createKeeper(deps: { download: Download; log: (line: string) => 
       clearMissing(root, chatId, msgId) // a later success: bytes, no reason left
       return final
     } catch (err) {
-      fail(err, `file of msg ${msgId} not kept; delivery unaffected`)
-      markMissing(root, chatId, msgId, errorClassOf(err))
+      // rr4-1: one closed record per keep attempt — a failed receipt write has already logged its own.
+      if (markMissing(root, chatId, msgId, errorClassOf(err))) fail(err, `file of msg ${msgId} not kept; delivery unaffected`)
       return undefined
     }
   }

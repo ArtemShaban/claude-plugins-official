@@ -221,8 +221,8 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
       // buffered like any other message (dropped without contextBuffer), member
       // reactions are ignored. Default (field omittable) = true.
       "wakeOnMention": true,
-      // true: team group — archive every member, wake only on the owner's own
-      // explicit @mention; see Team group above. Default (field omittable) = off.
+      // true: team group — archive every member, wake only on the install
+      // owner's (or a client co-owner's) own explicit @mention; see Team group above. Default (field omittable) = off.
       "team": false
     }
   },

@@ -667,6 +667,35 @@ describe('archive-store-fixes r2 f14 — the store root itself is never followed
   })
 })
 
+describe('rr4-1 — a successful download into an unsafe store: exactly one closed unsafe_path record', () => {
+  // Every caller converges on the one kind-agnostic keeper; the cases differ only in what reaches keep().
+  const callers: [string, () => string, string, number, string][] = [
+    ['owner archive-only voice', () => archive, GROUP, 120, 'oga'],
+    ['owner archive-only photo', () => archive, GROUP, 121, 'jpg'],
+    ['member media', () => archive, GROUP, 122, 'jpg'],
+    ['other attachment kind (document)', () => archive, GROUP, 123, 'pdf'],
+    ['other attachment kind (video)', () => archive, MAXIM, 124, 'mp4'],
+    ['out-store media (archive)', () => archive, MAXIM, 125, 'jpg'],
+    ['out-store media (business)', () => business, MAXIM, 126, 'pdf'],
+  ]
+
+  for (const [name, root, chat, msg, ext] of callers) {
+    test(`${name}: \`files\` is a regular file → one unsafe_path record, no bytes, no receipt`, async () => {
+      const chatDir = archiveChatDir(root(), chat)
+      mkdirSync(chatDir, { recursive: true, mode: 0o700 })
+      writeFileSync(join(chatDir, 'files'), 'not a dir')
+      const d = fakeDownload({ result: { bytes: new TextEncoder().encode(`bytes of F${msg}`), ext } })
+      const k = createKeeper({ download: d.download, log: l => logs.push(l) })
+      expect(await k.keep(root(), chat, msg, `F${msg}`)).toBeUndefined()
+      expect(d.calls).toEqual([`F${msg}`])
+      const records = logs.map(l => JSON.parse(l))
+      expect([name, records.length, records.map(e => e.error_class)]).toEqual([name, 1, ['unsafe_path']])
+      expect(readFileSync(join(chatDir, 'files'), 'utf8')).toBe('not a dir')
+      expect(readdirSync(chatDir).filter(n => n !== '.gitignore').sort()).toEqual(['files'])
+    })
+  }
+})
+
 describe('archive-store-fixes r2 n2 — only a regular file is kept bytes', () => {
   const filesDir = () => join(archiveChatDir(archive, MAXIM), 'files')
   const RECEIPT = '{"ts":"2026-10-27T08:00:00.000Z","error_class":"too_big"}\n'
