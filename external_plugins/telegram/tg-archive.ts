@@ -48,6 +48,8 @@ export type ArchiveLine = {
   forward_date?: string
   /** first + last name of the sender, sanitized (← «кто писал»). */
   sender_display?: string
+  /** r1 f1: an inline-bot result — «@<bot username>», else the bot's id; that bot wrote the text. */
+  via_bot?: string
 }
 
 /** The slice of a Telegram message messageContextMeta reads (grammY Message is assignable). */
@@ -94,6 +96,14 @@ export function senderDisplayMeta(from: { first_name?: string; last_name?: strin
   const name = [from?.first_name, from?.last_name].filter(s => typeof s === 'string' && s.trim()).join(' ')
   const v = clipUtf16(safeName(name), 128)
   return v && v.trim() ? { sender_display: v } : {}
+}
+
+/** r1 f1: the archive's `via_bot` («@username», else the id) of an inline-bot result; nothing otherwise. */
+export function viaBotMeta(viaBot: { id?: number; username?: string } | undefined): { via_bot?: string } {
+  if (viaBot == null) return {}
+  const u = safeName(viaBot.username)
+  const v = u ? `@${clipUtf16(u, 64)}` : viaBot.id != null ? String(viaBot.id) : 'unknown'
+  return { via_bot: v }
 }
 
 /** <sam-data>/state/tg-archive, or undefined when the install has no sam-data folder. */

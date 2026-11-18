@@ -187,6 +187,8 @@ export type MentionMessage = {
   entities?: MentionEntity[]
   caption_entities?: MentionEntity[]
   forward_origin?: unknown
+  /** Set on an inline-bot result: the text is that bot's, not the sender's own words (r1 f1). */
+  via_bot?: unknown
 }
 
 /**
@@ -218,14 +220,15 @@ export type TeamCommanders = {
 
 /**
  * A message in a team group: 'deliver' (wake) ⇔ the sender is the owner or a co-owner AND the message
- * is not forwarded AND it carries an explicit @<bot>. Everything else → 'archive' (archive-only).
+ * is not forwarded AND not sent via an inline bot (r1 f1: `via_bot` = that bot wrote the text, even under his
+ * `from`) AND it carries an explicit @<bot>. Everything else → 'archive' (archive-only).
  */
 export function teamMessageDecision(
   msg: MentionMessage,
   senderId: string,
   who: TeamCommanders,
 ): 'deliver' | 'archive' {
-  if (senderId === '' || msg.forward_origin != null) return 'archive'
+  if (senderId === '' || msg.forward_origin != null || msg.via_bot != null) return 'archive'
   if (!explicitBotMention(msg, who.botUsername)) return 'archive'
   if (who.ownerId != null && who.ownerId !== '' && senderId === who.ownerId) return 'deliver'
   return who.coOwners().has(senderId) ? 'deliver' : 'archive'

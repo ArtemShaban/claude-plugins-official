@@ -482,6 +482,24 @@ describe('archive-store-fixes AC-5 — files/<msg_id>.missing', () => {
     expect(readdirSync(filesDir()).sort()).toEqual(['46.oga'])
     expect(keptFilePath(archive, MAXIM, 46)).toBe(join(filesDir(), '46.oga'))
   })
+
+  test('r1 f4: his archive-only team voice whose live keep failed (`.missing`) is retried by catchUp; his delivered one stays skipped', async () => {
+    const gdir = () => join(archiveChatDir(archive, GROUP), 'files')
+    const row = (msg_id: number, file_id: string) =>
+      appendArchive(archive, { ts: '2026-10-27T08:00:00.000Z', chat_id: GROUP, msg_id, sender_id: OWNER, senderName: 'owner', kind: 'voice', text: '(voice message)', file_id, thread_id: 7 })
+    row(47, 'F47') // archive-only (no @): the live keeper ran and failed
+    row(48, 'F48') // delivered: the live keeper never ran (no receipt)
+    const live = createKeeper({ download: fakeDownload({ result: undefined }).download, log: l => logs.push(l) })
+    expect(await live.keep(archive, GROUP, 47, 'F47')).toBeUndefined()
+    expect(existsSync(join(gdir(), '47.missing'))).toBe(true)
+    const d = fakeDownload()
+    const NOW = new Date('2026-10-29T06:00:00Z')
+    const r = await catchUp({ archiveRoot: archive, ownerId: OWNER, drafts: () => ({}), log: (l: string) => logs.push(l), now: () => NOW,
+      keeper: createKeeper({ download: d.download, log: l => logs.push(l) }) })
+    expect(d.calls).toEqual(['F47'])
+    expect(r.kept).toBe(1)
+    expect(readdirSync(gdir()).sort()).toEqual(['47.oga'])
+  })
 })
 
 // ── archive-store-fixes r1 (verdict 2026-11-09-archive-store-fixes-codex-r1) ──────────────────────────

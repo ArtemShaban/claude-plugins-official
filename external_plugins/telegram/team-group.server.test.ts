@@ -3,12 +3,14 @@
  * (preload; no network, no real token). Spec: sam-data dev/analysis/2026-11-18-tg-bot-team-group-spec.md
  * AC-01 (gate wiring), AC-02 (reaction), AC-03 (archive line), AC-04 (envelope, no buffer), AC-05 (keeper).
  *
- * STATE ISOLATION (dev-rules §1.2): HOME and TELEGRAM_STATE_DIR are a fresh mkdtemp dir; nothing under
- * the real ~/.claude or ~/Workspace is read or written (last test: the live archive dir's mtime).
+ * STATE ISOLATION (dev-rules §1.2): HOME, TELEGRAM_STATE_DIR and IDEA_INBOX_DIR are under a fresh mkdtemp dir,
+ * and the preload points access-lock.ts's LOCK_DIR (and so the co-owners file) at a path inside it that does not
+ * exist (r1 f14, the access-lock.server.test.ts seam; production code has no seam): the real home, the live
+ * archive and /etc/sam-telegram-access are never read or written.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
-import { homedir, tmpdir } from 'os'
+import { tmpdir } from 'os'
 import { join } from 'path'
 
 const OWNER = 111111111
@@ -16,16 +18,16 @@ const MEMBER = 444444444
 const BOT_ID = 1
 const BOT = 'test_bot'
 const TEAM = -1001112223334
+const TEAM2 = -1001112229999 // a team group whose archive month file cannot be written (r1 f4)
 const OLD = -1005556667778 // an existing group: requireMention, everyone allowed, no buffer
 const BUF = -1009990001112 // positive control: an existing group with contextBuffer + a stale buffer
 const TOPIC = 7
 const NOW_S = Math.floor(Date.now() / 1000)
-const LIVE_ARCHIVE = join(homedir(), 'Workspace', 'ClaudeProjects', 'sam-data', 'state', 'tg-archive')
-const liveStamp = () => (existsSync(LIVE_ARCHIVE) ? statSync(LIVE_ARCHIVE).mtimeMs : null)
-const LIVE_BEFORE = liveStamp()
+const MONTH = new Date(NOW_S * 1000).toISOString().slice(0, 7)
 
 let dir: string
 let archive: string
+let ideaDir: string
 let notifications: { content: string; meta: Record<string, string> }[] = []
 let calls: string[] = []
 let stderr = ''
@@ -70,6 +72,19 @@ const UPDATES = [
   groupMsg(110, TEAM, member, { text: 'в General' }, null), // General: no thread
   groupMsg(111, TEAM, owner, { photo: [{ file_id: 'P111', file_unique_id: 'uP111', width: 9, height: 9, file_size: 5 }] }), // owner photo, no @
   groupMsg(112, TEAM, owner, { ...at(' переслал'), forward_origin: { type: 'hidden_user', date: NOW_S - 60, sender_user_name: 'Скрыт' } }), // owner forward with @
+  // r1 f1: his from.id, but an inline-bot result (via_bot) carrying a valid @<bot> → archive only
+  groupMsg(114, TEAM, owner, { ...at(' от инлайн-бота'), via_bot: { id: 77, is_bot: true, first_name: 'gif', username: 'gif' } }),
+  // r1 f3: content kinds with no handler of their own → one archive line each, no wake
+  groupMsg(115, TEAM, owner, { dice: { emoji: '🎲', value: 3 } }),
+  groupMsg(116, TEAM, member, { game: { title: 'g', description: 'd', photo: [] } }),
+  groupMsg(117, TEAM, member, { story: { chat: { id: 5, type: 'private' }, id: 1 } }),
+  groupMsg(118, TEAM, member, { paid_media: { star_count: 1, paid_media: [] } }),
+  groupMsg(119, TEAM, member, { animation: { file_id: 'A119', file_unique_id: 'uA', width: 1, height: 1, duration: 1 }, document: { file_id: 'A119', file_unique_id: 'uA' } }),
+  groupMsg(121, TEAM, member, { location: { latitude: 1, longitude: 2 }, venue: { location: { latitude: 1, longitude: 2 }, title: 'V', address: 'A' } }),
+  groupMsg(122, TEAM, member, { new_chat_members: [{ id: 9, is_bot: false, first_name: 'n' }] }), // service: not archived
+  groupMsg(123, OLD, member, { dice: { emoji: '🎲', value: 1 } }, null), // another group: unchanged (dropped)
+  // r1 f4: archive append throws (the month file is a directory) → his no-@ voice is still kept
+  groupMsg(124, TEAM2, owner, voice('V124'), null),
   // reaction: his 👍 on a bot message in the team group → nothing
   {
     update_id: 113,
@@ -101,7 +116,9 @@ beforeAll(async () => {
     // mentionPatterns would match «просто пишу» if consulted
     mentionPatterns: ['просто'],
     groups: {
-      [String(TEAM)]: { team: true, requireMention: true, allowFrom: ['none'], contextBuffer: true },
+      // r1 f2: asyncThreads on his wake topic must not turn his @ into an idea capture
+      [String(TEAM)]: { team: true, requireMention: true, allowFrom: ['none'], contextBuffer: true, asyncThreads: [String(TOPIC)] },
+      [String(TEAM2)]: { team: true, requireMention: true, allowFrom: ['none'] },
       [String(OLD)]: { requireMention: true, allowFrom: [] },
       [String(BUF)]: { requireMention: true, allowFrom: [], contextBuffer: true },
     },
@@ -117,12 +134,28 @@ beforeAll(async () => {
   mkdirSync(data, { recursive: true })
   writeFileSync(join(data, 'config.json'), JSON.stringify({ user: { telegram_chat_id: String(OWNER) } }))
   archive = join(data, 'state', 'tg-archive')
+  mkdirSync(join(archive, String(TEAM2), `${MONTH}.jsonl`), { recursive: true }) // r1 f4: appendArchive throws there
+  ideaDir = join(dir, 'ideas')
+  mkdirSync(ideaDir, { recursive: true })
 
   const callsLog = join(dir, 'calls.log')
   writeFileSync(callsLog, '')
   const preload = join(dir, 'fake-bot-api.ts')
   writeFileSync(preload, /* ts */ `
 import { appendFileSync } from 'fs'
+import { plugin } from 'bun'
+// r1 f14: LOCK_DIR (and the co-owners file under it) → a path inside the test dir that does not exist.
+plugin({
+  name: 'test-lock-dir',
+  setup(build) {
+    build.onLoad({ filter: /access-lock\\.ts$/ }, async args => {
+      const src = await Bun.file(args.path).text()
+      const out = src.replace("'/etc/sam-telegram-access'", ${JSON.stringify(JSON.stringify(join(dir, 'no-lock')))})
+      if (out === src) throw new Error('test preload: LOCK_DIR constant not found')
+      return { contents: out, loader: 'ts' }
+    })
+  },
+})
 const CALLS_LOG = ${JSON.stringify(callsLog)}
 const UPDATES = ${JSON.stringify(UPDATES)}
 let served = false
@@ -157,6 +190,7 @@ require('node-fetch').default = fake
       TELEGRAM_STATE_DIR: stateDir,
       TELEGRAM_BOT_TOKEN: '1:test',
       SAM_TRANSCRIBE_CMD: 'echo transcribed',
+      IDEA_INBOX_DIR: ideaDir,
     },
     stdin: 'pipe',
     stdout: 'pipe',
@@ -203,14 +237,22 @@ describe('team group — wake (AC-01 wiring, OB-03)', () => {
   test('exactly the owner\'s own @ messages wake (text 101, voice+caption 109); every other team message does not', () => {
     const team = notifications.filter(n => n.meta.chat_id === String(TEAM))
     expect(team.map(n => n.meta.message_id).sort(), stderr).toEqual(['101', '109'])
-    for (const id of [102, 103, 104, 105, 106, 107, 108, 110, 111, 112]) expect(notifIds()).not.toContain(String(id))
+    for (const id of [102, 103, 104, 105, 106, 107, 108, 110, 111, 112, 114, 115, 116, 117, 118, 119, 121, 122, 123, 124]) {
+      expect(notifIds()).not.toContain(String(id))
+    }
+  })
+
+  test('r1 f2: his @ in an asyncThreads topic of the team group still wakes; nothing became an idea', () => {
+    expect(notifIds()).toContain('101')
+    const ideas = existsSync(ideaDir) ? readdirSync(ideaDir, { recursive: true }).map(String) : []
+    expect(ideas.filter(n => n.endsWith('.json') || n.endsWith('.md'))).toEqual([])
   })
 
   test('👀 only on the wake messages: no ack on his no-@ / reply-to-bot / forward, no ack on a member\'s @', () => {
     const acks = calls.filter(c => c.startsWith('setMessageReaction')).map(c => c.split(' ')[1])
     expect(acks).toContain('101')
     expect(acks).toContain('109')
-    for (const id of ['102', '103', '104', '112']) expect(acks).not.toContain(id)
+    for (const id of ['102', '103', '104', '112', '114', '115']) expect(acks).not.toContain(id)
   })
 
   test('no bot reply to anyone in the team group', () => {
@@ -260,7 +302,21 @@ describe('team group — envelope (AC-04, OB-04)', () => {
 describe('team group — archive (AC-03, OB-01)', () => {
   test('every team message has exactly one line, the wakes included', () => {
     const ids = linesOf(TEAM).map(l => l.msg_id).sort()
-    expect(ids).toEqual([101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112])
+    expect(ids).toEqual([101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 114, 115, 116, 117, 118, 119, 121])
+  })
+
+  test('r1 f1: the inline-bot result is archived with via_bot', () => {
+    expect(line(TEAM, 114)).toMatchObject({ sender_id: String(OWNER), via_bot: '@gif' })
+    expect('via_bot' in line(TEAM, 101)!).toBe(false)
+  })
+
+  test('r1 f3: dice / game / story / paid media / animation / venue — one line each, with their kind; service and other-group not archived', () => {
+    expect([115, 116, 117, 118].map(id => line(TEAM, id)!.kind)).toEqual(['dice', 'game', 'story', 'paid_media'])
+    expect(line(TEAM, 115)!.text).toBe('(dice)')
+    expect(line(TEAM, 119)!.kind).toBe('document') // an animation carries document too: that handler archives it
+    expect(line(TEAM, 121)!.kind).toBe('location')
+    expect(line(TEAM, 122)).toBeUndefined()
+    expect(line(OLD, 123)).toBeUndefined()
   })
 
   test('author fields: sender_id, senderName, sender_display', () => {
@@ -322,8 +378,9 @@ describe('team group — kept files (AC-05, OB-02)', () => {
   test('his delivered voice → not kept in the store (delivery keeps it, as today)', () => {
     expect(kept(TEAM).filter(n => n.startsWith('109.'))).toEqual([])
   })
-})
 
-test('live archive dir untouched by this file (mtime)', () => {
-  expect(liveStamp()).toBe(LIVE_BEFORE)
+  test('r1 f4: the archive append threw, the keeper still kept his no-@ voice', () => {
+    expect(stderr).toContain('tg-archive append failed')
+    expect(kept(TEAM2)).toContain('124.oga')
+  })
 })

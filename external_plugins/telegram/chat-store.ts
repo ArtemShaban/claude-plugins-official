@@ -363,7 +363,14 @@ export async function catchUp(deps: CatchUpDeps): Promise<{ kept: number; backfi
         for (const name of readdirSync(dir).filter(n => MONTH_FILE.test(n) && n.slice(0, 7) >= firstMonth).sort()) {
           for (const l of readJsonLines<ArchiveLine>(join(dir, name))) {
             if (!l.file_id || l.msg_id == null || typeof l.ts !== 'string' || l.ts < cutoff) continue
-            if (isArchive && isOwnDeliveredMedia(l.kind, l.sender_id, deps.ownerId)) continue
+            // His own voice / photo: delivery keeps them, so skipped — unless a `.missing` receipt says the
+            // live keep of an ARCHIVE-ONLY one (his no-@ voice in a team group) failed: retried (r1 f4).
+            // A delivered one never gets a receipt (the live keeper skips it), so it stays skipped.
+            if (
+              isArchive &&
+              isOwnDeliveredMedia(l.kind, l.sender_id, deps.ownerId) &&
+              !existsSync(join(keptFilesDir(root, l.chat_id), missingFileName(l.msg_id)))
+            ) continue
             if (keptFilePath(root, l.chat_id, l.msg_id)) {
               // r1 f12: bytes next to a stale reason file → keep()'s fast path removes it (no download, not counted)
               if (existsSync(join(keptFilesDir(root, l.chat_id), missingFileName(l.msg_id)))) await deps.keeper.keep(root, l.chat_id, l.msg_id, l.file_id)

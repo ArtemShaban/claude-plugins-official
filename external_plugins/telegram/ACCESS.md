@@ -132,9 +132,12 @@ everyone-may-wake.
   forward origin — nothing else happens. Voices and photos are kept as files,
   the owner's own non-waking ones too.
 - **Wake:** only the install owner (or a co-owner on a client install), not
-  forwarded, with an explicit `@botusername` (a `mention` or `text_mention`
-  entity, in the text or a caption). A reply to the bot without `@`,
-  `mentionPatterns`, and any other member's `@` do not wake. The envelope
+  forwarded and not sent via an inline bot (`via_bot`), with an explicit
+  `@botusername` (a `mention` or `text_mention` entity, in the text or a
+  caption). A reply to the bot without `@`, `mentionPatterns`, and any other
+  member's `@` do not wake. `asyncThreads` does not apply in a team group: his
+  `@` in such a topic still wakes. Dice, games, stories, paid media and the
+  like get one archive line each and never wake. The envelope
   carries `group_mode="team"` and never a `<group-context-buffer>` block, even
   with `contextBuffer` set.
 - **Reactions and buttons:** no reaction and no «Да / Нет» / «Готово» press

@@ -61,7 +61,7 @@ import {
   type BufferEntry,
 } from './group-buffer'
 import { sendWithAutoFormat, buildVoiceCaption } from './telegram-format'
-import { appendArchive, archiveRoot, messageContextMeta, senderDisplayMeta } from './tg-archive'
+import { appendArchive, archiveRoot, messageContextMeta, senderDisplayMeta, viaBotMeta } from './tg-archive'
 import { createSecretary, directResultText, loadSecretaryState, previewResultText, secretaryRoot, type SecretaryApi } from './secretary'
 import { catchUp, createKeeper, createOutStore, isOwnDeliveredMedia, type Download } from './chat-store'
 import { clipUtf16, safeName } from './text-clip'
@@ -1826,6 +1826,23 @@ bot.on('message:poll', async ctx => {
   await handleInbound(ctx, `(poll: ${p.question} — ${options})`, undefined, undefined, 'poll')
 })
 
+// r1 f3 (owner tg 49424: every team message stored): a content kind with no handler above — dice, game,
+// story, paid media, giveaway, checklist, a bare animation — in a TEAM group → one archive line, never a
+// wake. Registered after every message:* handler (grammY runs the first matching one only, so nothing is
+// archived twice; an animation also carries `document` and is archived by that handler). Payment and
+// service messages (joins, pins, topic events) are not member content and stay unarchived. Other chats:
+// unchanged (no handler for these kinds before; dropped).
+const OTHER_CONTENT_KINDS = ['animation', 'dice', 'game', 'story', 'paid_media', 'giveaway', 'giveaway_winners', 'checklist'] as const
+bot.on('message', async ctx => {
+  const chat = ctx.chat
+  if (chat.type !== 'group' && chat.type !== 'supergroup') return
+  if (!isTeamGroup(loadAccess().groups[String(chat.id)])) return
+  const m = ctx.message as unknown as Record<string, unknown>
+  const kind = OTHER_CONTENT_KINDS.find(k => m[k] != null)
+  if (!kind) return
+  await handleInbound(ctx, `(${kind})`, undefined, undefined, kind, true)
+})
+
 // Emoji reactions arrive as message_reaction updates (enabled via
 // allowed_updates in bot.start). Surface them to Claude as a structured
 // channel event so a reaction can drive, e.g., a binary approve/reject —
@@ -2077,6 +2094,8 @@ async function handleInbound(
   // Archive-line kind for a file-less non-text message (location/contact/poll).
   // Used ONLY for the archive line below; envelope meta stays as for a text.
   archiveKind?: string,
+  // r1 f3: archive the line (when gate() allows it) and stop — the fallback for other message kinds.
+  archiveOnly = false,
 ): Promise<void> {
   const result = gate(ctx)
 
@@ -2101,22 +2120,27 @@ async function handleInbound(
         // Team spec §2.3: reply / quote / forward (every kind, voice too) + «кто писал»; additive.
         ...messageContextMeta(msg),
         ...senderDisplayMeta(ctx.from),
+        ...viaBotMeta(msg?.via_bot),
       })
-      // D-883: the file goes into the chat store on arrival (never blocks delivery). His own
-      // voice / photo are skipped only when DELIVERED — delivery keeps them (inbox + owner-log-media,
-      // D-197). Archive-only (his non-@ voice in a team group, any group drop / buffer) → kept here
-      // (team spec §2.4, class fix: otherwise it got neither bytes nor text).
-      if (
-        attachment?.file_id &&
-        msg?.message_id != null &&
-        !(result.action === 'deliver' && isOwnDeliveredMedia(attachment.kind, String(ctx.from!.id), voiceOwnerId()))
-      ) {
-        void keeper.keep(ARCHIVE_ROOT, String(ctx.chat!.id), msg.message_id, attachment.file_id, attachment.size)
-      }
     } catch (err) {
       safeStderr(`telegram channel: tg-archive append failed (${ARCHIVE_ROOT}): ${err}\n`)
     }
+    // D-883: the file goes into the chat store on arrival (never blocks delivery), independent of the
+    // append above (r1 f4: an append failure must not drop the bytes too). His own voice / photo are skipped
+    // only when DELIVERED — delivery keeps them (inbox + owner-log-media, D-197). Archive-only (his non-@
+    // voice in a team group, any group drop / buffer) → kept here (team spec §2.4). keep() never throws.
+    const keepMsgId = ctx.message?.message_id
+    if (
+      attachment?.file_id &&
+      keepMsgId != null &&
+      !(result.action === 'deliver' && isOwnDeliveredMedia(attachment.kind, String(ctx.from!.id), voiceOwnerId()))
+    ) {
+      void keeper.keep(ARCHIVE_ROOT, String(ctx.chat!.id), keepMsgId, attachment.file_id, attachment.size)
+    }
   }
+
+  // r1 f3: a message kind with no handler of its own reaches here archive-only, never a wake.
+  if (archiveOnly) return
 
   if (result.action === 'drop') return
 
@@ -2192,7 +2216,11 @@ async function handleInbound(
   // session. Default ('work', incl. General / DM / any non-async topic) falls
   // through to the existing behaviour below. classifyRoute is unit-tested.
   const threadId = ctx.message?.message_thread_id
-  const route = classifyRoute(access, chat_id, threadId, IDEA_INBOX_DIR != null)
+  // r1 f2: in a team group the wake is decided by teamMessageDecision() alone (gate() above) — an
+  // asyncThreads topic there never turns his @ into an idea capture.
+  const route = isTeamGroup(access.groups[chat_id])
+    ? 'work'
+    : classifyRoute(access, chat_id, threadId, IDEA_INBOX_DIR != null)
   // IDEA_INBOX_DIR is guaranteed non-null when route !== 'work' (classifyRoute
   // returns 'work' when async is disabled), but assert for the type-checker.
   const dir = IDEA_INBOX_DIR

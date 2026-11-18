@@ -254,6 +254,12 @@ describe('team group — wake decision (AC-01)', () => {
     expect(teamMessageDecision(m, OWNER_A, installA())).toBe('archive')
   })
 
+  test('r1 f1 archive-only: owner from.id + a foreign via_bot (inline result) carrying a valid @<bot>', () => {
+    const m: MentionMessage = { ...at(BOT_A), via_bot: { id: 77, is_bot: true, first_name: 'gif', username: 'gif' } }
+    expect(teamMessageDecision(m, OWNER_A, installA())).toBe('archive')
+    expect(teamMessageDecision(at(BOT_A), OWNER_A, installA())).toBe('deliver') // his own typed @ still wakes
+  })
+
   test('archive-only: owner @ of a different bot', () => {
     expect(teamMessageDecision(at('other_bot'), OWNER_A, installA())).toBe('archive')
   })
