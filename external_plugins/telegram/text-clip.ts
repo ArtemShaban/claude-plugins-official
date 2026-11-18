@@ -3,6 +3,13 @@
 // leave a lone surrogate — invalid UTF-16 that broke the owner-log night sweep
 // on 08.10 (BACKLOG «БЛОК · ДОРАБОТКИ ПЛАГИНА TELEGRAM» п.2). If the cut would
 // split a surrogate pair, the whole pair is dropped instead.
+// Filenames, titles and quoted snippets are uploader-controlled. They land inside the <channel>
+// notification — delimiter chars would let the uploader break out of the tag or forge a second
+// meta entry. (Moved here from server.ts so the archive line shares it — server.ts is not importable.)
+export function safeName(s: string | undefined): string | undefined {
+  return s?.replace(/[<>\[\]\r\n;]/g, '_')
+}
+
 export function clipUtf16(s: string | undefined, max: number): string | undefined {
   if (s == null || s.length <= max) return s
   let end = max

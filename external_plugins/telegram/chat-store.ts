@@ -40,6 +40,8 @@ export type OutLine = {
   /** Set on an edit: the message that was edited. */
   of_msg_id?: number
   backfilled?: true
+  /** Forum topic of the sent message (its message_thread_id), so a topic read includes our replies (team spec §2.6). */
+  thread_id?: number
 }
 
 /** `{ts, component, error_class, action_taken}` (dev-rules §5). Only a closed class — never the error text (it can hold the token's URL). */
@@ -65,7 +67,7 @@ export function isOutMethod(method: string): boolean {
   return (method.startsWith('send') && method !== 'sendChatAction') || method === 'editMessageText' || method === 'editMessageCaption'
 }
 
-type Msg = BusinessMessage & { edit_date?: number }
+type Msg = BusinessMessage & { edit_date?: number; message_thread_id?: number }
 
 function isMessage(r: unknown): r is Msg {
   const m = r as Msg | null
@@ -91,6 +93,7 @@ export function outLinesFor(method: string, payload: unknown, result: unknown, n
       text: redactInvites(label.text),
       ...(label.file_id ? { file_id: label.file_id } : {}),
       ...(edit ? { of_msg_id: m.message_id } : {}),
+      ...(Number.isInteger(m.message_thread_id) ? { thread_id: m.message_thread_id } : {}),
     }
     return { business, line }
   })

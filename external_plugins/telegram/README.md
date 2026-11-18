@@ -93,7 +93,7 @@ off, or not resolvable → the text goes plain and the result says the buttons a
 A press counts only from the owner (`user.telegram_chat_id`; the lock's owner in locked
 mode) or a co-owner, in their own DM or a group of the access list that lets them in (the
 group's gate lets their reaction through: `allowFrom` empty or naming them, not
-`wakeOnMention:false`; D-1049). The send asks the same rule (`yes-no.ts` `pressCounts` /
+`wakeOnMention:false`, not `team:true`; D-1049). The send asks the same rule (`yes-no.ts` `pressCounts` /
 `buttonsCanCount`): into a chat where no such press could count the text goes plain and the
 result says a press would not count in this chat. Each press writes one line to
 `buttons.log` in the state dir (chat kind and id, topic, message id, data, who = owner /
@@ -175,7 +175,12 @@ Every message from an allowed DM person or an allowed group member — delivered
 buffered, or allowed but not woken (no mention, no `contextBuffer`) — is appended
 as one JSON line to `~/Workspace/ClaudeProjects/sam-data/state/tg-archive/<chat>/<YYYY-MM>.jsonl`
 (`tg-archive.ts`; fields `ts`, `chat_id`, `msg_id`, `sender_id`, `senderName`, `kind`,
-`text`, optional `thread_id`, `file_id` — text and labels only, no media bytes).
+`text`, optional `thread_id`, `file_id`, and — the same names and values as the envelope —
+`reply_to_message_id` / `reply_to_text` / `reply_to_user` / `reply_to_quote`,
+`forward_origin` / `forward_author` / `forward_author_id` / `forward_date` (every kind,
+voice too), plus `sender_display` (first + last name) — text and labels only, no media bytes).
+A team group (`team: true`, see ACCESS.md) archives every member and wakes only on the
+owner's own explicit `@<bot>`.
 Append-only, no cap; dir 0700, files 0600; the folder holds a `.gitignore` of `*`
 so it never enters git. Senders the gate does not allow leave nothing. No
 sam-data folder → archive off (one stderr line at start); a write error → one

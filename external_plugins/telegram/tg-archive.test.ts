@@ -24,7 +24,7 @@ import {
 } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
-import { appendArchive, archiveFilePath, archiveRoot, type ArchiveLine } from './tg-archive'
+import { appendArchive, archiveFilePath, archiveRoot, messageContextMeta, senderDisplayMeta, type ArchiveLine } from './tg-archive'
 
 const LIVE_ARCHIVE = join(homedir(), 'Workspace', 'ClaudeProjects', 'sam-data', 'state', 'tg-archive')
 const liveStamp = () => (existsSync(LIVE_ARCHIVE) ? statSync(LIVE_ARCHIVE).mtimeMs : null)
@@ -577,6 +577,68 @@ describe('D-520 Q1 A3: pairing and disabled policies archive none of the three k
     expect(r.notifications).toEqual([])
     expect(r.archiveRootExists).toBe(false)
   }, 20000)
+})
+
+// ── Team spec §2.3 / AC-03: the shared reply / quote / forward helper + «кто писал» ──
+describe('messageContextMeta + senderDisplayMeta (team spec AC-03, unit)', () => {
+  const D = 1_760_000_000
+  const iso = new Date(D * 1000).toISOString()
+
+  test('forward from a user: origin, author (username), id, original date', () => {
+    const m = { forward_origin: { type: 'user' as const, date: D, sender_user: { id: 77, is_bot: false, first_name: 'Ann', username: 'ann' } } }
+    expect(messageContextMeta(m)).toEqual({ forward_origin: 'forward_user', forward_author: 'ann', forward_author_id: '77', forward_date: iso })
+  })
+
+  test('forward from a hidden user: no id, never guessed', () => {
+    const m = { forward_origin: { type: 'hidden_user' as const, date: D, sender_user_name: 'Секрет' } }
+    expect(messageContextMeta(m)).toEqual({ forward_origin: 'forward_hidden_user', forward_author: 'Секрет', forward_date: iso })
+  })
+
+  test('forward from a chat and from a channel', () => {
+    const chat = { forward_origin: { type: 'chat' as const, date: D, sender_chat: { id: -100555, type: 'supergroup' as const, title: 'Чат' } } }
+    expect(messageContextMeta(chat)).toEqual({ forward_origin: 'forward_chat', forward_author: 'Чат', forward_author_id: '-100555', forward_date: iso })
+    const channel = { forward_origin: { type: 'channel' as const, date: D, message_id: 3, chat: { id: -100666, type: 'channel' as const, title: 'Канал', username: 'kanal' } } }
+    expect(messageContextMeta(channel)).toEqual({ forward_origin: 'forward_channel', forward_author: 'kanal', forward_author_id: '-100666', forward_date: iso })
+  })
+
+  test('a forwarded VOICE: the archive (no kind) gets forward_*; the voice envelope keeps only forward_date', () => {
+    const m = { forward_origin: { type: 'user' as const, date: D, sender_user: { id: 77, is_bot: false, first_name: 'Ann' } } }
+    expect(messageContextMeta(m)).toEqual({ forward_origin: 'forward_user', forward_author: 'Ann', forward_author_id: '77', forward_date: iso })
+    expect(messageContextMeta(m, 'voice')).toEqual({ forward_date: iso })
+  })
+
+  test('a reply: id, sanitized snippet, the replied-to user', () => {
+    const m = { reply_to_message: { message_id: 42, text: 'был <тег>; текст', from: { id: 5, username: 'bob' } } }
+    expect(messageContextMeta(m)).toEqual({ reply_to_message_id: '42', reply_to_text: 'был _тег__ текст', reply_to_user: 'bob' })
+  })
+
+  test('a reply with a quote: the quote too', () => {
+    const m = { reply_to_message: { message_id: 42, caption: 'фото', from: { id: 5 } }, quote: { text: 'кусок' } }
+    expect(messageContextMeta(m)).toEqual({ reply_to_message_id: '42', reply_to_text: 'фото', reply_to_user: '5', reply_to_quote: 'кусок' })
+  })
+
+  test('a topic message whose reply target is the topic root (forum_topic_created) → no reply_to_*', () => {
+    const m = { reply_to_message: { message_id: 3, from: { id: 5 }, forum_topic_created: { name: 'Тема', icon_color: 1 } } }
+    expect(messageContextMeta(m)).toEqual({})
+  })
+
+  test('not a reply, not forwarded (General, a DM) → {}', () => {
+    expect(messageContextMeta({})).toEqual({})
+    expect(messageContextMeta(undefined)).toEqual({})
+  })
+
+  test('a long snippet is clipped to 300 without a lone surrogate', () => {
+    const long = 'a'.repeat(299) + '😀' + 'b'.repeat(10)
+    const out = messageContextMeta({ reply_to_message: { message_id: 1, text: long } }).reply_to_text!
+    expect(out.length).toBe(299)
+  })
+
+  test('sender_display: first + last, sanitized; none → {}', () => {
+    expect(senderDisplayMeta({ first_name: 'Иван', last_name: 'Петров' })).toEqual({ sender_display: 'Иван Петров' })
+    expect(senderDisplayMeta({ first_name: 'A<b>' })).toEqual({ sender_display: 'A_b_' })
+    expect(senderDisplayMeta({ first_name: ' ' })).toEqual({})
+    expect(senderDisplayMeta(undefined)).toEqual({})
+  })
 })
 
 test('live archive dir untouched by this file (mtime)', () => {

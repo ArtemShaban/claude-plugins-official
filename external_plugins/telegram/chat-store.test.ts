@@ -243,6 +243,15 @@ describe('D-883 criterion 1 — every send we make lands once in the right .out.
   test('outLinesFor: a non-message result (true) → no line', () => {
     expect(outLinesFor('editMessageText', { inline_message_id: 'x' }, true, new Date())).toEqual([])
   })
+
+  test('outLinesFor: thread_id = the sent message\'s message_thread_id; absent otherwise (team spec AC-06)', () => {
+    const sent = { message_id: 9, date: 1_760_000_000, chat: { id: -100123, type: 'supergroup' }, text: 'ок', message_thread_id: 17, is_topic_message: true }
+    const [inTopic] = outLinesFor('sendMessage', { chat_id: '-100123', message_thread_id: 17 }, sent, new Date())
+    expect(inTopic!.line.thread_id).toBe(17)
+    const { message_thread_id: _drop, ...general } = sent
+    const [inGeneral] = outLinesFor('sendMessage', { chat_id: '-100123' }, general, new Date())
+    expect('thread_id' in inGeneral!.line).toBe(false)
+  })
 })
 
 // ── criterion 2 — keepFile ─────────────────────────────────────────────────

@@ -122,6 +122,13 @@ export type GroupGatePolicy = {
   allowFrom?: string[]
   contextBuffer?: boolean
   wakeOnMention?: boolean
+  /** Team group (spec 2026-11-18-tg-bot-team-group): see teamMessageDecision. Only the literal true counts. */
+  team?: boolean
+}
+
+/** A team-mode entry (`team: true`, the literal boolean — anything else is the old behaviour). */
+export function isTeamGroup(policy: GroupGatePolicy | null | undefined): boolean {
+  return policy != null && policy.team === true
 }
 
 // Exported for gate()'s archive signal (D-520): a configured group's message from
@@ -152,6 +159,74 @@ export function groupMessageDecision(
 
 /** Whether a member's reaction in a CONFIGURED group may reach the session. */
 export function groupReactionAllowed(policy: GroupGatePolicy, senderId: string): boolean {
+  // Team group: no reaction and no «Да / Нет» / «Готово» press counts there, for anyone (spec §2.2).
+  if (isTeamGroup(policy)) return false
   if (policy.wakeOnMention === false) return false
   return groupSenderAllowed(policy, senderId)
+}
+
+// ── Team group (team:true) — spec sam-data dev/analysis/2026-11-18-tg-bot-team-group-spec.md ──
+// Owner (tg 49424): «чтобы агента будило только через собака … только если я пишу … Я владелец бота»;
+// «На «Собака Сэм» от других участников группы … тебя не нужно будить». Every member's message is
+// archived (gate() returns the archive-only drop); only the install owner's or a co-owner's own,
+// not-forwarded message with an explicit @<bot> wakes. Reply-to-bot, mentionPatterns, requireMention
+// and allowFrom are never consulted here (in a bot-created topic every message replies to the bot).
+
+/** The entity shape a text and a caption carry (grammY MessageEntity is assignable). */
+export type MentionEntity = {
+  type: string
+  offset: number
+  length: number
+  user?: { is_bot?: boolean; username?: string }
+}
+
+/** The slice of a Telegram message the mention and team decisions read. */
+export type MentionMessage = {
+  text?: string
+  caption?: string
+  entities?: MentionEntity[]
+  caption_entities?: MentionEntity[]
+  forward_origin?: unknown
+}
+
+/**
+ * An explicit mention of THIS bot: a `mention` entity equal to @<botUsername> (case-insensitive) or a
+ * `text_mention` of the bot, in the text or the caption entities. No reply-to-bot, no patterns.
+ * server.ts isMentioned() uses it as its first leg (one mention rule). Unknown username → false.
+ */
+export function explicitBotMention(msg: MentionMessage, botUsername: string): boolean {
+  if (!botUsername) return false
+  const entities = msg.entities ?? msg.caption_entities ?? []
+  const text = msg.text ?? msg.caption ?? ''
+  for (const e of entities) {
+    if (e.type === 'mention') {
+      const mentioned = text.slice(e.offset, e.offset + e.length)
+      if (mentioned.toLowerCase() === `@${botUsername}`.toLowerCase()) return true
+    }
+    if (e.type === 'text_mention' && e.user?.is_bot && e.user.username === botUsername) return true
+  }
+  return false
+}
+
+export type TeamCommanders = {
+  /** The install owner's id (the lock's ownerChatId in locked mode, else config.json); undefined → nobody. */
+  ownerId: string | undefined
+  /** The admin's co-owner list — called only when a non-owner's message would otherwise wake. */
+  coOwners: () => ReadonlySet<string>
+  botUsername: string
+}
+
+/**
+ * A message in a team group: 'deliver' (wake) ⇔ the sender is the owner or a co-owner AND the message
+ * is not forwarded AND it carries an explicit @<bot>. Everything else → 'archive' (archive-only).
+ */
+export function teamMessageDecision(
+  msg: MentionMessage,
+  senderId: string,
+  who: TeamCommanders,
+): 'deliver' | 'archive' {
+  if (senderId === '' || msg.forward_origin != null) return 'archive'
+  if (!explicitBotMention(msg, who.botUsername)) return 'archive'
+  if (who.ownerId != null && who.ownerId !== '' && senderId === who.ownerId) return 'deliver'
+  return who.coOwners().has(senderId) ? 'deliver' : 'archive'
 }

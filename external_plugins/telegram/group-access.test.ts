@@ -4,13 +4,19 @@
 import { describe, expect, test } from 'bun:test'
 import {
   checkOutboundAllowed,
+  explicitBotMention,
   groupMessageDecision,
   groupReactionAllowed,
+  isTeamGroup,
   recordSeenGroup,
+  teamMessageDecision,
   type GroupGatePolicy,
+  type MentionMessage,
   type PostGateAccess,
   type SeenGroup,
+  type TeamCommanders,
 } from './group-access'
+import { buttonsCanCount, pressCounts } from './yes-no'
 
 describe('recordSeenGroup (discovery breadcrumb)', () => {
   test('first sighting of an unconfigured group creates one entry', () => {
@@ -184,5 +190,163 @@ describe('groupMessageDecision / groupReactionAllowed (wakeOnMention:false — n
     let called = false
     groupMessageDecision({ requireMention: true, allowFrom: ['111'] }, '555', () => { called = true; return true })
     expect(called).toBe(false)
+  })
+})
+
+// ── Team group (spec sam-data dev/analysis/2026-11-18-tg-bot-team-group-spec.md AC-01 / AC-02) ──
+describe('team group — wake decision (AC-01)', () => {
+  // The literal both access tools write (core tg-access-change.py TEAM_SHAPE, kit --team).
+  const TEAM_SHAPE: GroupGatePolicy = { team: true, requireMention: true, allowFrom: ['none'] }
+  const OWNER_A = '111111111'
+  const OWNER_B = '222222222'
+  const CO = '333333333'
+  const MEMBER = '444444444'
+  const BOT_A = 'samA_bot'
+  const BOT_B = 'samB_bot'
+
+  const at = (bot: string, rest = ' сделай X'): MentionMessage => ({
+    text: `@${bot}${rest}`,
+    entities: [{ type: 'mention', offset: 0, length: bot.length + 1 }],
+  })
+  const plain: MentionMessage = { text: 'просто сообщение' }
+  // Install A (owner install: no co-owner file) and a locked client fixture with a co-owner.
+  const installA = (coOwners: string[] = []): TeamCommanders => ({ ownerId: OWNER_A, coOwners: () => new Set(coOwners), botUsername: BOT_A })
+  const installB: TeamCommanders = { ownerId: OWNER_B, coOwners: () => new Set(), botUsername: BOT_B }
+
+  test('wake: owner + explicit @<bot>', () => {
+    expect(teamMessageDecision(at(BOT_A), OWNER_A, installA())).toBe('deliver')
+  })
+
+  test('wake: owner @ in another case still matches (@SamA_Bot)', () => {
+    const m: MentionMessage = { text: '@SamA_Bot да', entities: [{ type: 'mention', offset: 0, length: 9 }] }
+    expect(teamMessageDecision(m, OWNER_A, installA())).toBe('deliver')
+  })
+
+  test('wake: co-owner + @ (locked client fixture, co-owner list from the admin file)', () => {
+    expect(teamMessageDecision(at(BOT_A), CO, installA([CO]))).toBe('deliver')
+  })
+
+  test('wake: owner voice whose caption carries @<bot>', () => {
+    const voice: MentionMessage = { caption: `@${BOT_A} глянь`, caption_entities: [{ type: 'mention', offset: 0, length: BOT_A.length + 1 }] }
+    expect(teamMessageDecision(voice, OWNER_A, installA())).toBe('deliver')
+  })
+
+  test('wake: owner text_mention of the bot', () => {
+    const m: MentionMessage = { text: 'Сэм сделай', entities: [{ type: 'text_mention', offset: 0, length: 3, user: { is_bot: true, username: BOT_A } }] }
+    expect(teamMessageDecision(m, OWNER_A, installA())).toBe('deliver')
+  })
+
+  test('archive-only: owner with no @', () => {
+    expect(teamMessageDecision(plain, OWNER_A, installA())).toBe('archive')
+  })
+
+  test('archive-only: owner reply to the bot with no @ (reply-to-bot is never consulted)', () => {
+    const m = { text: 'да', reply_to_message: { message_id: 5, from: { id: 1, is_bot: true, username: BOT_A } } }
+    expect(teamMessageDecision(m, OWNER_A, installA())).toBe('archive')
+  })
+
+  test('archive-only: owner text a mentionPatterns regex would match (patterns are never consulted)', () => {
+    expect(teamMessageDecision({ text: 'hey claude сделай' }, OWNER_A, installA())).toBe('archive')
+  })
+
+  test('archive-only: owner FORWARD that contains @<bot> («я автор»)', () => {
+    const m: MentionMessage = { ...at(BOT_A), forward_origin: { type: 'user', date: 1, sender_user: { id: 9, is_bot: false, first_name: 'x' } } }
+    expect(teamMessageDecision(m, OWNER_A, installA())).toBe('archive')
+  })
+
+  test('archive-only: owner @ of a different bot', () => {
+    expect(teamMessageDecision(at('other_bot'), OWNER_A, installA())).toBe('archive')
+  })
+
+  test('archive-only: member + @', () => {
+    expect(teamMessageDecision(at(BOT_A), MEMBER, installA())).toBe('archive')
+  })
+
+  test('archive-only: member reply to the bot', () => {
+    const m = { text: 'ок', reply_to_message: { message_id: 5, from: { id: 1, is_bot: true, username: BOT_A } } }
+    expect(teamMessageDecision(m, MEMBER, installA())).toBe('archive')
+  })
+
+  test('archive-only: member plain', () => {
+    expect(teamMessageDecision(plain, MEMBER, installA())).toBe('archive')
+  })
+
+  test('archive-only: co-owner id on an install whose co-owner list is empty (owner install)', () => {
+    expect(teamMessageDecision(at(BOT_A), CO, installA([]))).toBe('archive')
+  })
+
+  test('OB-07 two installs in one group: bot B never wakes on owner A, bot A never on owner B', () => {
+    expect(teamMessageDecision(at(BOT_B), OWNER_A, installB)).toBe('archive')
+    expect(teamMessageDecision(at(BOT_A), OWNER_A, installB)).toBe('archive')
+    expect(teamMessageDecision(at(BOT_A), OWNER_B, installA())).toBe('archive')
+    // each owner wakes only his own bot
+    expect(teamMessageDecision(at(BOT_B), OWNER_B, installB)).toBe('deliver')
+    expect(teamMessageDecision(at(BOT_A), OWNER_A, installA())).toBe('deliver')
+  })
+
+  test('no owner id known (config missing, invalid lock) → nobody wakes', () => {
+    expect(teamMessageDecision(at(BOT_A), OWNER_A, { ownerId: undefined, coOwners: () => new Set(), botUsername: BOT_A })).toBe('archive')
+    expect(teamMessageDecision(at(BOT_A), '', { ownerId: '', coOwners: () => new Set(['']), botUsername: BOT_A })).toBe('archive')
+  })
+
+  test('bot username not known yet → nobody wakes', () => {
+    expect(teamMessageDecision({ text: '@ x', entities: [{ type: 'mention', offset: 0, length: 1 }] }, OWNER_A, { ...installA(), botUsername: '' })).toBe('archive')
+  })
+
+  test('the co-owner file is read only for a non-owner, non-forwarded @ message', () => {
+    let reads = 0
+    const who: TeamCommanders = { ownerId: OWNER_A, coOwners: () => { reads++; return new Set() }, botUsername: BOT_A }
+    teamMessageDecision(at(BOT_A), OWNER_A, who)
+    teamMessageDecision(plain, MEMBER, who)
+    teamMessageDecision({ ...at(BOT_A), forward_origin: { type: 'hidden_user', date: 1, sender_user_name: 'h' } }, MEMBER, who)
+    expect(reads).toBe(0)
+    teamMessageDecision(at(BOT_A), MEMBER, who)
+    expect(reads).toBe(1)
+  })
+
+  test('the OLD groupMessageDecision on TEAM_SHAPE drops everyone (an older plugin stays deaf there)', () => {
+    for (const id of [OWNER_A, CO, MEMBER]) {
+      expect(groupMessageDecision({ requireMention: true, allowFrom: ['none'] }, id, () => true)).toBe('drop')
+      expect(groupMessageDecision({ ...TEAM_SHAPE, contextBuffer: true } as GroupGatePolicy, id, () => true)).toBe('drop')
+    }
+  })
+
+  test('isTeamGroup: only the literal boolean true', () => {
+    expect(isTeamGroup(TEAM_SHAPE)).toBe(true)
+    expect(isTeamGroup({ team: 'true' } as unknown as GroupGatePolicy)).toBe(false)
+    expect(isTeamGroup({ team: 1 } as unknown as GroupGatePolicy)).toBe(false)
+    expect(isTeamGroup({ requireMention: true })).toBe(false)
+    expect(isTeamGroup(undefined)).toBe(false)
+  })
+
+  test('explicitBotMention: entity in text or caption; reply-to-bot alone is not a mention', () => {
+    expect(explicitBotMention(at(BOT_A), BOT_A)).toBe(true)
+    expect(explicitBotMention({ text: `x @${BOT_A}`, entities: [] }, BOT_A)).toBe(false) // no entity → no mention
+    expect(explicitBotMention({ text: 'да' }, BOT_A)).toBe(false)
+  })
+})
+
+describe('team group — reactions and buttons (AC-02)', () => {
+  const TEAM = '-1001234567890'
+  const OPEN = '-1009876543210'
+  const access = {
+    groups: {
+      [TEAM]: { team: true, requireMention: true, allowFrom: ['none'] } as GroupGatePolicy,
+      [OPEN]: { requireMention: true, allowFrom: [] } as GroupGatePolicy,
+    },
+  }
+
+  test('groupReactionAllowed is false on team for the owner, a co-owner and a member', () => {
+    for (const id of ['111111111', '333333333', '444444444']) {
+      expect(groupReactionAllowed(access.groups[TEAM]!, id)).toBe(false)
+    }
+    // team with an open allowFrom too
+    expect(groupReactionAllowed({ team: true, allowFrom: [] }, '111111111')).toBe(false)
+  })
+
+  test('no press counts and no buttons are sent in a team chat; a plain open group is unchanged', () => {
+    expect(pressCounts(TEAM, '111111111', access)).toBe(false)
+    expect(buttonsCanCount(TEAM, access, '111111111', new Set(['333333333']))).toBe(false)
+    expect(buttonsCanCount(OPEN, access, '111111111', new Set())).toBe(true)
   })
 })
