@@ -608,6 +608,11 @@ export const LATE_TRY_AFTER_MS: readonly number[] = [2, 5, 10, 20, 40, 60].map(m
  * agent's own +70 min record (core .claude/rules/telegram.md) is armed after that wake, so it never fires first. */
 export const LATE_DEADLINE_MS = 70 * 60_000
 
+/** The last slice of that deadline is the final notification's own budget (Codex rr1 f3): the voice stops being
+ * re-fetched at LATE_DEADLINE_MS − this, sends its one lost notice, and whatever the transport has not accepted by
+ * LATE_DEADLINE_MS closes as `late:undelivered`. */
+export const LATE_EMIT_BUDGET_MS = 30_000
+
 /** download_attachment's answer for a file under re-fetch (§2 C): at once, no network call. */
 export const LATE_VOICE_REFUSAL =
   'this voice file is being re-fetched by the plugin because Telegram has not handed it over yet — do not download it; ' +
@@ -661,9 +666,16 @@ export interface LateVoice {
 }
 
 export interface LateVoiceFetcher {
-  /** Take a voice; false when that chat+msg is already taken. */
+  /** Reserve chat+msg for a re-fetch whose placeholder is about to be woken (Codex rr1-1: eligibility is per message,
+   * never per file_id — two messages may share one Telegram file_id). false when that chat+msg is already reserved or
+   * taken. The reservation ends in exactly one of schedule() (accepted wake) or release() (wake not accepted). */
+  reserve: (chat: string, msg: number) => boolean
+  /** The placeholder's wake was not accepted: drop the reservation and write the one closing `late:undelivered` line,
+   * so a leg does not wait the whole deadline for a voice that will never be re-fetched (security re-review N9). */
+  release: (v: Omit<LateVoice, 'placeholderMs'>) => void
+  /** Take a voice (consumes its reservation); false when that chat+msg is already taken. */
   schedule: (v: LateVoice) => boolean
-  /** A file_id under re-fetch right now (download_attachment refuses it). */
+  /** A file_id under re-fetch right now — download_attachment's refusal only, never retry eligibility. */
   has: (fileId: string) => boolean
   /** Plugin stop: one `late:abandoned` line per open entry, synchronously; nothing runs after. Returns the count. */
   abandonAll: () => number
@@ -679,17 +691,21 @@ export function createLateVoiceFetcher(deps: {
   tryAfterMs?: readonly number[]
   downloadTimeoutMs?: number
   deadlineMs?: number
+  emitBudgetMs?: number
 }): LateVoiceFetcher {
   const now = deps.nowMs ?? Date.now
   const setTimer = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
   const clearTimer = deps.clearTimer ?? ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>))
   const offsets = deps.tryAfterMs ?? LATE_TRY_AFTER_MS
   const deadlineMs = deps.deadlineMs ?? LATE_DEADLINE_MS
+  const emitBudgetMs = deps.emitBudgetMs ?? LATE_EMIT_BUDGET_MS
   type Entry = LateVoice & {
     key: string
     tries: number
     timer?: unknown
     deadline?: unknown
+    /** The final notification's own bound: the hard end of the voice (rr1 f3). */
+    emitTimer?: unknown
     /** No more tries: the final notification is going out (or the voice was abandoned). */
     done: boolean
     /** The closing voice.log line is written and the entry is gone. */
@@ -698,8 +714,10 @@ export function createLateVoiceFetcher(deps: {
     abort: AbortController
   }
   const entries = new Map<string, Entry>()
+  /** chat+msg whose placeholder wake is in flight (reserve → schedule | release). */
+  const reserved = new Set<string>()
 
-  const line = (e: Entry, outcome: VoiceOutcome) => {
+  const line =(e: Entry, outcome: VoiceOutcome) => {
     try {
       deps.writeLine({
         chat: e.chat,
@@ -723,16 +741,29 @@ export function createLateVoiceFetcher(deps: {
   const close = (e: Entry, outcome: VoiceOutcome) => {
     if (e.closed) return
     e.closed = true
+    if (e.emitTimer !== undefined) clearTimer(e.emitTimer)
+    e.emitTimer = undefined
     entries.delete(e.key)
     line(e, outcome)
   }
   // The final notification: the entry stays (download_attachment still refused) until the transport answers; only an
-  // accepted one writes late:bridge / late:failed; a rejected one writes late:undelivered (Codex r1 f2).
+  // accepted one writes late:bridge / late:failed; a rejected one — or one still unanswered at the hard end of the voice
+  // (placeholder + deadlineMs) — writes late:undelivered (Codex r1 f2, rr1 f3). close() is once-only, so a transport
+  // answer that comes after the hard end changes nothing.
   async function finish(e: Entry, emit: () => void | Promise<void>, ok: VoiceOutcome, what: string): Promise<void> {
     stop(e)
-    try {
+    const sent = (async () => {
       await emit()
-      close(e, ok)
+      return 'sent' as const
+    })()
+    const hardEnd = new Promise<'late'>(resolve => {
+      e.emitTimer = setTimer(() => resolve('late'), Math.max(0, e.placeholderMs + deadlineMs - now()))
+    })
+    try {
+      if ((await Promise.race([sent, hardEnd])) === 'late') {
+        deps.logNotice(`${what} notification still not accepted by the session at the deadline`)
+        close(e, 'late:undelivered')
+      } else close(e, ok)
     } catch (err) {
       deps.logNotice(`${what} notification not accepted by the session: ${voiceErrorClass(err)}`)
       close(e, 'late:undelivered')
@@ -773,17 +804,32 @@ export function createLateVoiceFetcher(deps: {
   }
 
   return {
+    reserve(chat, msg) {
+      const key = `${chat}:${msg}`
+      if (entries.has(key) || reserved.has(key) || offsets.length === 0) return false
+      reserved.add(key)
+      return true
+    },
+    release(v) {
+      reserved.delete(`${v.chat}:${v.msg}`)
+      line(
+        { ...v, key: `${v.chat}:${v.msg}`, placeholderMs: now(), tries: 0, done: true, closed: true, last: {}, abort: new AbortController() },
+        'late:undelivered',
+      )
+    },
     schedule(v) {
       const key = `${v.chat}:${v.msg}`
+      reserved.delete(key)
       if (entries.has(key) || offsets.length === 0) return false
       const e: Entry = { ...v, key, tries: 0, done: false, closed: false, last: {}, abort: new AbortController() }
       entries.set(key, e)
       arm(e)
+      // Stop re-fetching emitBudgetMs before the end; the lost notice then has that long to be accepted (finish).
       e.deadline = setTimer(() => {
         if (e.done) return
         deps.logNotice(`late re-fetch of msg ${e.msg} ran out of time after ${e.tries} tries`)
         void lost(e)
-      }, Math.max(0, e.placeholderMs + deadlineMs - now()))
+      }, Math.max(0, e.placeholderMs + deadlineMs - emitBudgetMs - now()))
       return true
     },
     has(fileId) {
@@ -792,6 +838,7 @@ export function createLateVoiceFetcher(deps: {
     },
     abandonAll() {
       const all = [...entries.values()]
+      reserved.clear()
       for (const e of all) {
         stop(e)
         close(e, 'late:abandoned')
@@ -813,9 +860,19 @@ export async function wakeThenArm(o: {
   wake: (envelope: VoiceEnvelope) => Promise<boolean>
   nowMs?: () => number
 }): Promise<boolean> {
-  const pending = o.late != null && !o.fetcher.has(o.late.fileId)
-  const accepted = await o.wake(markPending(o.envelope, pending))
-  if (accepted && pending) o.fetcher.schedule({ ...o.late!, placeholderMs: (o.nowMs ?? Date.now)() })
+  // Eligibility is per chat+msg (Codex rr1-1): the pending marker and the reservation are one decision, and a shared
+  // Telegram file_id never blocks a second message. The reservation ends in schedule (accepted) or release (not).
+  const late = o.late
+  const reserved = late != null && o.fetcher.reserve(late.chat, late.msg)
+  let accepted = false
+  try {
+    accepted = await o.wake(markPending(o.envelope, reserved))
+  } finally {
+    if (reserved) {
+      if (accepted) o.fetcher.schedule({ ...late!, placeholderMs: (o.nowMs ?? Date.now)() })
+      else o.fetcher.release(late!)
+    }
+  }
   return accepted
 }
 

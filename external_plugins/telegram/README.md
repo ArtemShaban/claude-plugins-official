@@ -157,8 +157,11 @@ carries `voice_author`, `voice_author_id` when known, `voice_author_origin`, `vo
 after the session accepted that placeholder's wake. The plugin then runs the same download + transcribe again at +2,
 +5, +10, +20, +40 and +60 min, in memory, outside the chat's queue (texts sent after the voice are never held); someone
 else's voice is fetched through the chat store with one Bot API request per try (no inbox fallback on a late try). The
-whole re-fetch ends 70 min after the placeholder: a whisper job still queued then never starts, a running one is
-killed. A transcript → one more notification with the same `message_id` and `ts`, `transcript_source="bridge"`, the
+whole re-fetch ends 70 min after the placeholder: 30 s before that a whisper job still queued never starts and a running
+one is killed, and the lost notice goes out; a notification the session has still not answered at +70 min closes the
+voice as `late:undelivered` (a later answer changes nothing). A message's retry is reserved per chat+message, so two
+messages sharing one Telegram file_id are both re-fetched; a placeholder wake the session did not accept writes
+`late:undelivered` at once and arms nothing. A transcript → one more notification with the same `message_id` and `ts`, `transcript_source="bridge"`, the
 author keys and `voice_late_s=<seconds since the voice>`. A file that came but whisper failed or gave nothing, six
 failed tries, or the 70-min end → one notification with `voice_lost="1"`. Each such voice gets one closing line, written
 once the session accepted that notification: `late:bridge` / `late:failed`; `late:undelivered` when the session did

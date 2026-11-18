@@ -18,6 +18,7 @@ import {
   deliverVoiceTranscript,
   isRetriableDownload,
   LATE_DEADLINE_MS,
+  LATE_EMIT_BUDGET_MS,
   LATE_TRY_AFTER_MS,
   LATE_VOICE_REFUSAL,
   lateFetchWanted,
@@ -607,14 +608,17 @@ describe('r1 f1 — wakeThenArm: transactional with the first delivery', () => {
     return { clock, lines, fired, fetcher, run }
   }
 
-  test('the initial notification rejects → nothing armed: registry 0, timers 0, no late / lost ever', async () => {
+  test('the initial notification rejects → nothing armed: registry 0, timers 0, no late / lost ever; one late:undelivered line (N9)', async () => {
     const w = wiring(async () => { throw new Error('transport closed') })
     expect(await w.run()).toBe(false)
     expect(w.fetcher.size()).toBe(0)
     expect(w.clock.pending()).toBe(0)
     await w.clock.advanceTo(w.clock.now() + 180 * MIN)
     expect(w.fired).toEqual([])
-    expect(w.lines).toEqual([])
+    // the voice will never be re-fetched: one closing line now, so a leg does not wait 70 min for it (re-review N9)
+    expect(w.lines.map(l => [l.outcome, l.lateTries, l.msg])).toEqual([['late:undelivered', 0, 49610]])
+    // the reservation is gone: the same message can be taken again
+    expect(w.fetcher.reserve('22276', 49610)).toBe(true)
   })
 
   test('the initial notification is accepted → it carried voice_pending="1" and exactly one entry is armed', async () => {
@@ -637,6 +641,73 @@ describe('r1 f1 — wakeThenArm: transactional with the first delivery', () => {
     expect(ok).toBe(true)
     expect(sent).toEqual([{}])
     expect(fetcher.size()).toBe(0)
+  })
+})
+
+// ── rr1-1 — retry eligibility is per chat+msg; a shared Telegram file_id blocks nothing ──────────────────────────
+describe('rr1-1 — two messages sharing one file_id (real deliverWakeWithBuffer + real fetcher + fake clock)', () => {
+  function two() {
+    const clock = fakeClock()
+    const lines: VoiceLineFields[] = []
+    const fetcher = createLateVoiceFetcher({ writeLine: f => lines.push(f), logNotice: () => {}, nowMs: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer })
+    const sent: Record<string, string>[] = []
+    const fired: string[] = []
+    const mk = (msg: number, download: () => Promise<string | undefined>): Omit<LateVoice, 'placeholderMs'> => ({
+      chat: '22276', msg, fileId: 'SAME-FILE-ID', tsMs: clock.now() - 125_000, arrivedMs: clock.now() - 121_000, author: owner,
+      download, transcribe: async () => `текст ${msg}`,
+      onLate: () => void fired.push(`late ${msg}`), onLost: () => void fired.push(`lost ${msg}`),
+    })
+    const wake = (msg: number, late: Omit<LateVoice, 'placeholderMs'>) =>
+      wakeThenArm({
+        fetcher, envelope: voicePlaceholder(undefined, owner), late, nowMs: clock.now,
+        wake: wakeEnv => deliverWakeWithBuffer([], wakeEnv.text, () => '/unused', {
+          notify: async (_c, extra) => void sent.push({ message_id: String(msg), ...wakeEnv.meta, ...extra }),
+          reset: () => {}, logError: () => {},
+        }),
+      })
+    return { clock, lines, fetcher, sent, fired, mk, wake }
+  }
+
+  test('both wakes carry voice_pending, registry 2, one late/lost each, has(fileId) true until both entries close', async () => {
+    const w = two()
+    let bTries = 0
+    const a = w.mk(49701, async () => '/a.oga') // A gets its file at +2
+    const b = w.mk(49702, async () => (++bTries < 2 ? undefined : '/b.oga')) // B: first try gives no file → +5 gets it
+    expect(await w.wake(49701, a)).toBe(true)
+    expect(await w.wake(49702, b)).toBe(true) // same file_id, accepted while A is pending
+    expect(w.sent.map(m => [m.message_id, m.voice_pending])).toEqual([['49701', '1'], ['49702', '1']])
+    expect(w.fetcher.size()).toBe(2)
+    expect(w.fetcher.has('SAME-FILE-ID')).toBe(true)
+    await w.clock.advanceTo(w.clock.now() + 2 * MIN) // A's late text → A closed, B still open
+    expect(w.fired).toContain('late 49701')
+    expect(w.fetcher.size()).toBe(1)
+    expect(w.fetcher.has('SAME-FILE-ID')).toBe(true) // B still under re-fetch: download_attachment stays refused
+    await w.clock.advanceTo(w.clock.now() + 3 * MIN) // B's try at +5
+    expect([...w.fired].sort()).toEqual(['late 49701', 'late 49702'])
+    expect(w.fetcher.size()).toBe(0)
+    expect(w.fetcher.has('SAME-FILE-ID')).toBe(false)
+    await w.clock.advanceTo(w.clock.now() + 200 * MIN)
+    expect(w.fired.length).toBe(2) // each message got exactly one notification
+    expect(w.lines.map(l => [l.msg, l.outcome]).sort()).toEqual([[49701, 'late:bridge'], [49702, 'late:bridge']])
+    expect(w.clock.pending()).toBe(0)
+  })
+
+  test('the same message woken twice at once: only one reservation — one marker, one entry', async () => {
+    const w = two()
+    const a = w.mk(49703, async () => '/a.oga')
+    const [r1, r2] = await Promise.all([w.wake(49703, a), w.wake(49703, a)])
+    expect([r1, r2]).toEqual([true, true])
+    expect(w.sent.map(m => m.voice_pending)).toEqual(['1', undefined])
+    expect(w.fetcher.size()).toBe(1)
+  })
+
+  test('reserve / schedule: a different message is independent; a taken message cannot be reserved', () => {
+    const w = two()
+    expect(w.fetcher.reserve('22276', 1)).toBe(true)
+    expect(w.fetcher.reserve('22276', 1)).toBe(false)
+    expect(w.fetcher.reserve('22276', 2)).toBe(true)
+    w.fetcher.schedule({ ...w.mk(1, async () => undefined), placeholderMs: w.clock.now() })
+    expect(w.fetcher.reserve('22276', 1)).toBe(false) // taken now
   })
 })
 
@@ -720,11 +791,12 @@ describe('r1 f3 — the deadline bounds the whole re-fetch', () => {
         onLate: () => void final.push(`late ${n}`), onLost: () => void final.push(`lost ${n}`),
       })
     }
-    await clock.advanceTo(t0 + LATE_DEADLINE_MS - 1)
+    const stopAt = LATE_DEADLINE_MS - LATE_EMIT_BUDGET_MS // re-fetching stops here; the lost notice has the rest to be accepted
+    await clock.advanceTo(t0 + stopAt - 1)
     expect(runs).toEqual(['/a1.oga']) // voice 1 holds whisper; 2 and 3 wait in the queue
     expect(final).toEqual([]) // nothing final while work is pending
     expect(lines).toEqual([])
-    await clock.advanceTo(t0 + LATE_DEADLINE_MS)
+    await clock.advanceTo(t0 + stopAt)
     for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r))
     expect(final.sort()).toEqual(['lost 1', 'lost 2', 'lost 3'])
     expect(lines.map(l => l.outcome)).toEqual(['late:failed', 'late:failed', 'late:failed'])
@@ -743,7 +815,62 @@ describe('r1 f3 — the deadline bounds the whole re-fetch', () => {
 
   test('LATE_DEADLINE_MS is 70 min and comes after the last try at +60', () => {
     expect(LATE_DEADLINE_MS).toBe(70 * MIN)
-    expect(LATE_DEADLINE_MS).toBeGreaterThan(LATE_TRY_AFTER_MS[LATE_TRY_AFTER_MS.length - 1])
+    expect(LATE_DEADLINE_MS).toBeGreaterThan(LATE_TRY_AFTER_MS[LATE_TRY_AFTER_MS.length - 1] + LATE_EMIT_BUDGET_MS)
+  })
+})
+
+// ── rr1 f3 — a notification the transport never answers is bounded by the same deadline ─────────────────────────
+describe('rr1 f3 — a never-settling final notification closes once as late:undelivered by +70 min', () => {
+  function hung(kind: 'late' | 'lost-after-tries' | 'lost-at-deadline') {
+    const h = harness({
+      downloads: [kind === 'lost-after-tries' ? async () => { throw err504() } : async () => '/a.oga'],
+      transcribe: kind === 'lost-at-deadline' ? () => new Promise<string>(() => {}) : undefined, // whisper never returns
+    })
+    const notices: string[] = []
+    const fetcher = createLateVoiceFetcher({ writeLine: f => h.lines.push(f), logNotice: r => notices.push(r), nowMs: h.clock.now, setTimer: h.clock.setTimer, clearTimer: h.clock.clearTimer })
+    const calls = { late: 0, lost: 0 }
+    const settle: { resolve: () => void; reject: (e: unknown) => void }[] = []
+    const never = () => new Promise<void>((resolve, reject) => settle.push({ resolve, reject }))
+    h.voice.onLate = () => { calls.late++; return never() }
+    h.voice.onLost = () => { calls.lost++; return never() }
+    fetcher.schedule(h.voice)
+    return { h, fetcher, calls, settle, notices }
+  }
+  const drain = async () => { for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r)) }
+
+  for (const kind of ['late', 'lost-after-tries', 'lost-at-deadline'] as const) {
+    for (const later of ['resolves', 'rejects'] as const) {
+      test(`${kind}: transport never answers → one late:undelivered at the deadline, entry and timers gone; a later ${later} changes nothing`, async () => {
+        const w = hung(kind)
+        await w.h.clock.advanceTo(w.h.t0 + LATE_DEADLINE_MS - 1)
+        expect(w.h.lines).toEqual([]) // still inside the deadline: the notification is still being waited for
+        expect(w.fetcher.has('FILE-1')).toBe(true) // download_attachment still refused meanwhile
+        await w.h.clock.advanceTo(w.h.t0 + LATE_DEADLINE_MS)
+        await drain()
+        expect(w.h.lines.map(l => l.outcome)).toEqual(['late:undelivered'])
+        expect(w.fetcher.size()).toBe(0)
+        expect(w.fetcher.has('FILE-1')).toBe(false)
+        expect(w.h.clock.pending()).toBe(0)
+        expect(w.notices.some(n => n.includes('not accepted by the session at the deadline'))).toBe(true)
+        expect(w.calls.late + w.calls.lost).toBe(1) // exactly one emission was attempted
+        // the transport finally answers — late: no second outcome, no second emission, no timers
+        for (const s of w.settle) later === 'resolves' ? s.resolve() : s.reject(new Error('Not connected'))
+        await drain()
+        await w.h.clock.advanceTo(w.h.t0 + 300 * MIN)
+        expect(w.h.lines.map(l => l.outcome)).toEqual(['late:undelivered'])
+        expect(w.calls.late + w.calls.lost).toBe(1)
+        expect(w.fetcher.size()).toBe(0)
+        expect(w.h.clock.pending()).toBe(0)
+      })
+    }
+  }
+
+  test('a notification accepted before the deadline still closes as late:bridge, and its hard-end timer is cleared', async () => {
+    const h = harness({ downloads: [async () => '/a.oga'] })
+    h.fetcher.schedule(h.voice)
+    await h.clock.advanceTo(h.t0 + 3 * MIN)
+    expect(h.lines.map(l => l.outcome)).toEqual(['late:bridge'])
+    expect(h.clock.pending()).toBe(0)
   })
 })
 
