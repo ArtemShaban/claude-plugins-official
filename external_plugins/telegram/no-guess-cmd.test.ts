@@ -70,7 +70,7 @@ describe('env unset => no guessed command is ever executed', () => {
       transcribe: async p => { ran.push(p); return runCmd(cmd!, [p, 'ru']) },
       logNotice: n => notices.push(n),
     })
-    expect(r).toEqual({ text: '(voice message)', meta: {} })
+    expect(r).toEqual({ text: '(voice message)', meta: { ...author } }) // D-1087 OB-07: the placeholder carries the author keys
     expect(ran).toEqual([])
     expect(notices.length).toBe(1)
     expect(notices[0]).toContain('SAM_TRANSCRIBE_CMD')

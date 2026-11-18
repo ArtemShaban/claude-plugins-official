@@ -82,7 +82,7 @@ async function watchUnhandled<T>(fn: () => Promise<T>, tailMs = 300): Promise<{ 
   }
 }
 
-/** The timers the downloader arms inside the synchronous call (hedge + cap), and which of them got cleared. */
+/** The timers the downloader arms inside the synchronous call (probe + cap), and which of them got cleared. */
 function trackTimers() {
   const realSet = globalThis.setTimeout
   const realClear = globalThis.clearTimeout
@@ -235,7 +235,7 @@ describe('r2 f1: a caller arriving while the cut is cancelling the body gets the
       )
     }) as typeof fetch
     try {
-      dl = createTelegramDownloader({ token: TOKEN, probe, hedgeMs: 60_000 })
+      dl = createTelegramDownloader({ token: TOKEN, probe, probeAfterMs: 60_000 })
       const first = await dl.downloadTelegramFile('F')
       expect(late).toBeDefined()
       const second = (await late) as typeof first
@@ -254,119 +254,33 @@ describe('r2 f1: a caller arriving while the cut is cancelling the body gets the
   }, 15_000)
 })
 
-describe('both hedged attempts get headers at the same moment', () => {
-  test('the first complete body wins, the other attempt is aborted', async () => {
-    const held: ServerResponse[] = []
-    const fileSockets: Socket[] = []
-    const f = await fakeApi((kind, n, req, res) => {
-      if (kind === 'getfile') return n === 1 ? void setTimeout(() => okGetFile(res, { file_size: undefined }), 150) : okGetFile(res, { file_size: undefined })
-      held.push(res)
-      fileSockets.push(req.socket)
-      if (held.length < 2) return
-      for (const r of held) r.writeHead(200) // both bodies start in the same tick
-      for (const r of held) pump(r, 4 * MiB, true)
+// D-1087 (spec dev/analysis/2026-11-18-tg-voice-late-fetch-spec.md criterion 2): the hedged sibling is gone. f6's
+// contract on one attempt: a failure after the probe mark ends the download (no second attempt), no unhandled
+// rejection, both timers (probe + cap) cleared, the socket closed.
+describe('f6 on one attempt — a failure after the probe mark ends the download, nothing left behind', () => {
+  test('getFile connection dies after the probe mark → network error, 1 getFile, timers cleared, socket closed', async () => {
+    const f = await fakeApi((kind, _n, req) => {
+      if (kind === 'getfile') return void setTimeout(() => req.socket.destroy(), 200)
     })
-    const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 })
-    const got = await dl.downloadTelegramFile('F')
-    expect(got.status).toBe('ok')
-    if (got.status === 'ok') expect(got.bytes.byteLength).toBe(4 * MiB)
-    expect(got.journal.dl_att).toBe(2)
-    // file requests arrive attempt 2 first (its getFile was instant), then attempt 1
-    const loser = got.journal.dl_win === 2 ? fileSockets[1] : fileSockets[0]
-    expect(await waitClosed(f, loser)).toBe(true)
-    expect(dl.inflightCount()).toBe(0)
-  }, 20_000)
-})
-
-describe('f2 — attempt 2 never reuses a pooled connection (Bun 1.4.0 `keepalive: false`)', () => {
-  for (const winner of [2, 1] as const) {
-    test(`idle keep-alive connections in the pool; attempt ${winner} wins; attempt 2 is on its own new connections; loser closed`, async () => {
-      let phase: 'warm' | 'race' = 'warm'
-      let raceGetFile = 0
-      const f = await fakeApi((kind, _n, _req, res) => {
-        if (phase === 'warm') return kind === 'getfile' ? void setTimeout(() => okGetFile(res), 50) : okFile(res)
-        if (kind === 'getfile') {
-          raceGetFile++
-          if (winner === 2) return raceGetFile === 1 ? never() : okGetFile(res)
-          return raceGetFile === 1 ? void setTimeout(() => okGetFile(res), 400) : never()
-        }
-        okFile(res)
+    const timers = trackTimers()
+    try {
+      const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, probeAfterMs: 100, capMs: 5_000 })
+      const { value: err, unhandled } = await watchUnhandled(async () => {
+        const p = timers.during(() => dl.downloadTelegramFile('F'))
+        return await p.catch(e => e)
       })
-      const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 })
-      // Warm Bun's pool: two concurrent downloads leave two idle keep-alive sockets to this origin.
-      await Promise.all([dl.downloadTelegramFile('W1'), dl.downloadTelegramFile('W2')])
-      await sleep(50)
-      const warm = f.sockets.filter(s => !f.closed.has(s))
-      expect(warm.length).toBeGreaterThanOrEqual(2) // the pool really holds idle reusable connections
-      phase = 'race'
-      const before = f.requests.length
-      const got = await dl.downloadTelegramFile('R')
-      expect(got.status).toBe('ok')
-      expect(got.journal.dl_att).toBe(2)
-      expect(got.journal.dl_win).toBe(winner)
-      const race = f.requests.slice(before)
-      const a1 = race[0].socket // attempt 1's getFile — the pool may reuse a warm socket for it
-      const a2 = race.filter((r, i) => i > 0 && r.kind === 'getfile')[0].socket
-      expect(a2).not.toBe(a1)
-      expect(warm.includes(a2)).toBe(false) // a NEW connection, although an idle pooled one was free
-      for (const r of race) {
-        if (r.socket !== a1) expect(warm.includes(r.socket)).toBe(false)
-      }
-      const loser = winner === 2 ? a1 : a2
-      expect(await waitClosed(f, loser)).toBe(true)
+      expect(err).toBeInstanceOf(TelegramDownloadError)
+      expect(voiceErrorClass(err)).toMatch(/^(network|sys_ECONNRESET)$/) // a dropped socket: Bun's own code survives
+      expect(unhandled).toEqual([])
+      expect(timers.armed.length).toBe(2) // probe + cap
+      for (const h of timers.armed) expect(timers.cleared.has(h)).toBe(true)
+      expect(f.requests.filter(r => r.kind === 'getfile').length).toBe(1)
+      expect(await waitClosed(f, f.requests[0].socket)).toBe(true)
       expect(dl.inflightCount()).toBe(0)
-    }, 15_000)
-  }
-})
-
-describe('f6 — one attempt fails after the hedge, the sibling returns the bytes', () => {
-  for (const failing of [1, 2] as const) {
-    test(`attempt ${failing} fails after the hedge → success from the other, loser closed, no unhandled rejection, timers cleared`, async () => {
-      let gf = 0
-      const f = await fakeApi((kind, _n, req, res) => {
-        if (kind === 'file') return okFile(res)
-        gf++
-        const mine = gf
-        if (mine === failing) return void setTimeout(() => req.socket.destroy(), 200) // fails at ~200 ms of its own life
-        // the sibling answers after the failure
-        setTimeout(() => okGetFile(res), failing === 1 ? 350 : 500)
-      })
-      const timers = trackTimers()
-      try {
-        const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100, capMs: 5_000 })
-        const { value: got, unhandled } = await watchUnhandled(async () => {
-          const p = timers.during(() => dl.downloadTelegramFile('F'))
-          return await p
-        })
-        expect(got.status).toBe('ok')
-        if (got.status === 'ok') expect([...got.bytes]).toEqual([...FILE])
-        expect(got.journal.dl_att).toBe(2)
-        expect(got.journal.dl_win).toBe(failing === 1 ? 2 : 1)
-        expect(unhandled).toEqual([])
-        expect(timers.armed.length).toBe(2) // hedge + cap
-        for (const h of timers.armed) expect(timers.cleared.has(h)).toBe(true)
-        const loserSock = f.requests.filter(r => r.kind === 'getfile')[failing - 1].socket
-        expect(await waitClosed(f, loserSock)).toBe(true)
-        expect(dl.inflightCount()).toBe(0)
-      } finally {
-        timers.restore()
-      }
-    }, 10_000)
-  }
-
-  test('the losing attempt, aborted after the winner settled, raises no unhandled rejection', async () => {
-    const f = await fakeApi((kind, n, _req, res) => {
-      if (kind === 'getfile' && n === 1) return void setTimeout(() => okGetFile(res), 300)
-      if (kind === 'getfile') return never()
-      okFile(res)
-    })
-    const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 })
-    const { value: got, unhandled } = await watchUnhandled(() => dl.downloadTelegramFile('F'))
-    expect(got.status).toBe('ok')
-    expect(got.journal.dl_win).toBe(1)
-    expect(unhandled).toEqual([])
-    expect(dl.inflightCount()).toBe(0)
-  })
+    } finally {
+      timers.restore()
+    }
+  }, 10_000)
 })
 
 describe('f5 — the bot token never leaves, on every error path', () => {
@@ -471,7 +385,7 @@ describe('f5 — the bot token never leaves, on every error path', () => {
             return isFile ? new Response(FILE) : getFileOk()
           },
           () =>
-            createTelegramDownloader({ token: TOKEN, probe, hedgeMs: 60_000 })
+            createTelegramDownloader({ token: TOKEN, probe, probeAfterMs: 60_000 })
               .downloadTelegramFile('F', { onStart: j => (journal = j) })
               .catch(err => err),
         ),
@@ -495,7 +409,7 @@ describe('f5 — the bot token never leaves, on every error path', () => {
           })
           return new Response(stream)
         },
-        () => createTelegramDownloader({ token: TOKEN, probe, hedgeMs: 60_000 }).downloadTelegramFile('F').catch(err => err),
+        () => createTelegramDownloader({ token: TOKEN, probe, probeAfterMs: 60_000 }).downloadTelegramFile('F').catch(err => err),
       ),
     )
     expectClosed(e)
@@ -519,18 +433,20 @@ describe('f5 — the bot token never leaves, on every error path', () => {
     expect(out.includes(SECRET)).toBe(false)
   })
 
-  test('fake API: an aborted loser (attempt 1 stalls, attempt 2 wins) leaks nothing anywhere', async () => {
-    const f = await fakeApi((kind, n, req, res) => {
-      if (kind === 'getfile' && n === 1) return never()
-      if (kind === 'getfile') return okGetFile(res)
-      okFile(res)
-    })
+  test('fake API: a stalled getFile aborted at the cap leaks nothing anywhere', async () => {
+    const f = await fakeApi(() => never())
+    let journal: unknown
     const { value, out } = await captureOutput(() =>
-      watchUnhandled(() => createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100 }).downloadTelegramFile('F')),
+      watchUnhandled(() =>
+        createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, probeAfterMs: 100, capMs: 400 })
+          .downloadTelegramFile('F', { onStart: j => (journal = j) })
+          .catch(err => err),
+      ),
     )
-    expect(value.value.status).toBe('ok')
+    expectClosed(value.value)
+    expect(voiceErrorClass(value.value)).toBe('timeout')
     expect(value.unhandled).toEqual([])
-    expect(JSON.stringify(value.value.journal)).not.toContain(SECRET)
+    expect(JSON.stringify(journal)).not.toContain(SECRET)
     expect(out.includes(SECRET)).toBe(false)
   })
 
@@ -564,7 +480,7 @@ describe('f5 — the bot token never leaves, on every error path', () => {
             return { ok: true, status: 200, headers: new Headers(), body: { getReader: () => reader, cancel: async () => {} } } as unknown as Response
           },
           () =>
-            createTelegramDownloader({ token: TOKEN, probe, hedgeMs: 60_000 })
+            createTelegramDownloader({ token: TOKEN, probe, probeAfterMs: 60_000 })
               .downloadTelegramFile('F', { onStart: j => (journal = j) })
               .catch(err => err),
         ),
@@ -579,38 +495,29 @@ describe('f5 — the bot token never leaves, on every error path', () => {
   }
 })
 
-describe('r3 f1: the first COMPLETE body wins — a header winner that dies mid-body does not sink the download', () => {
-  test('attempt 1 gets 2xx headers first, sends part of the body, fails; attempt 2 returns the whole file → its bytes, no 3rd attempt', async () => {
-    const FILE2 = new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2])
-    const f = await fakeApi((kind, n, req, res) => {
-      // attempt 1's getFile answers at 150 ms (after the 100 ms hedge); attempt 2's at once.
-      if (kind === 'getfile') return n === 1 ? void setTimeout(() => okGetFile(res), 150) : okGetFile(res)
-      if (n === 1) {
-        // attempt 2's file GET (it arrives first): headers only at 400 ms, then the whole body.
-        return void setTimeout(() => {
-          res.writeHead(200, { 'content-length': String(FILE2.length) })
-          res.end(Buffer.from(FILE2))
-        }, 400)
-      }
-      // attempt 1's file GET: 2xx headers at once (before attempt 2's), half the body, then the connection dies.
+// D-1087: r3 f1 on one attempt — 2xx headers, part of the body, then the connection dies → the download fails
+// (network), no second attempt, timers cleared, nothing left in flight. (The attempt-2 rescue is gone; the late
+// fetcher in voice-delivery.ts re-tries a voice minutes later instead.)
+describe('r3 f1 on one attempt — a body that dies mid-way fails the download, no second attempt', () => {
+  test('2xx headers, half the body, connection dies → network error, 1 getFile + 1 file GET', async () => {
+    const f = await fakeApi((kind, _n, req, res) => {
+      if (kind === 'getfile') return okGetFile(res)
       res.writeHead(200, { 'content-length': String(FILE.length) })
       res.write(Buffer.from(FILE.slice(0, 4)))
       setTimeout(() => req.socket.destroy(), 50)
     })
     const timers = trackTimers()
     try {
-      const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, hedgeMs: 100, capMs: 5_000 })
-      const { value: got, unhandled } = await watchUnhandled(async () => await timers.during(() => dl.downloadTelegramFile('F')))
-      expect(got.status).toBe('ok')
-      if (got.status === 'ok') expect([...got.bytes]).toEqual([...FILE2])
-      expect(got.journal).toMatchObject({ dl_att: 2, dl_win: 2, dl_phase: 'done' })
+      const dl = createTelegramDownloader({ token: TOKEN, origin: f.origin, probe, probeAfterMs: 100, capMs: 5_000 })
+      const { value: err, unhandled } = await watchUnhandled(async () => await timers.during(() => dl.downloadTelegramFile('F')).catch(e => e))
+      expect(err).toBeInstanceOf(TelegramDownloadError)
+      expect(voiceErrorClass(err)).toMatch(/^(network|sys_ECONNRESET)$/)
       expect(unhandled).toEqual([])
       await sleep(300)
-      expect(f.requests.filter(r => r.kind === 'getfile').length).toBe(2) // no 3rd attempt
-      expect(f.requests.filter(r => r.kind === 'file').length).toBe(2)
-      expect(timers.armed.length).toBe(2) // hedge + cap, both cleared
+      expect(f.requests.filter(r => r.kind === 'getfile').length).toBe(1)
+      expect(f.requests.filter(r => r.kind === 'file').length).toBe(1)
+      expect(timers.armed.length).toBe(2) // probe + cap, both cleared
       for (const h of timers.armed) expect(timers.cleared.has(h)).toBe(true)
-      for (const s of f.sockets) expect(await waitClosed(f, s)).toBe(true)
       expect(dl.inflightCount()).toBe(0)
     } finally {
       timers.restore()

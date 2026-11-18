@@ -126,7 +126,9 @@ export function whisperTimeoutMs(durationSeconds: number): number {
 // file can no longer spend whisper's share of the envelope (47819/48003: file at 88.5 s, whisper left 1.4 s). The
 // shared download itself (tg-download.ts) runs on to its 180 s cap, so the session's download_attachment can join
 // it. The envelope stays voiceEnvelopeMs() = whisper budget + this. Photos keep 30 s (PHOTO_DOWNLOAD_TIMEOUT_MS).
-export const DOWNLOAD_TIMEOUT_MS = 90_000
+// D-1087 (owner tg 49565 «подними даймаут с 90 до 120 с … ждать столько же, сколько сама телега ждёт»): 120 s —
+// Telegram's own getFile cut (its 504 Gateway Timeout comes at ≈120 s, RCA 2026-11-18 M5).
+export const DOWNLOAD_TIMEOUT_MS = 120_000
 export const PHOTO_DOWNLOAD_TIMEOUT_MS = 30_000
 
 /** The voice route's outer envelope: the whisper budget plus the bounded download wait (server.ts uses this). */
@@ -351,13 +353,15 @@ export function transcribeFlags(
 //
 // Effect-injected (download/transcribe are callbacks) — same pattern as
 // idea-inbox.ts's transcribeVoiceIdea, so the unit test never spawns a real
-// process or touches the network. ANY of the six named failure modes (no
+// process or touches the network. ANY of the named failure modes (no
 // TRANSCRIBE_CMD; download resolves undefined — covers the existing >20MB
 // cap; download throws — network/getFile error; transcribe throws with a
 // nonzero-exit-style message; transcribe throws with a timeout-style
-// message; transcript is blank — silence) must produce an envelope that is
-// byte-identical to today's baseline: body = caption ?? '(voice message)',
-// meta = {} (no transcript_source/attachment_path/voice_* keys at all).
+// message; transcript is blank — silence) gives the placeholder: body =
+// caption ?? '(voice message)', meta = the author/trust keys only
+// (voiceAuthorMeta) — D-1087 OB-07: a placeholder without them read as the
+// owner's own words (`.claude/rules/owner-content-same-turn.md` п.3 «Кто автор —
+// решает КОНВЕРТ»). No transcript_source / attachment_path on a placeholder.
 export type VoiceEnvelope = {
   text: string
   meta: Record<string, string>
@@ -420,6 +424,10 @@ export type VoiceOutcome =
   | 'placeholder:transcribe'
   | 'placeholder:empty'
   | 'placeholder:timeout'
+  // D-1087: the one closing line of a voice the late fetcher took (createLateVoiceFetcher).
+  | 'late:bridge'
+  | 'late:failed'
+  | 'late:abandoned'
 
 /** The outcome of a finished delivery: what the session got, and for the placeholder the first leg that failed. */
 export function voiceOutcomeOf(o: {
@@ -445,10 +453,12 @@ export interface VoiceLineFields {
   journal: VoiceJournal
   outcome: VoiceOutcome
   totalMs: number
+  /** Late tries run (1..6) on a `late:*` line; absent (`-`) on a first-delivery line. */
+  lateTries?: number
 }
 
 const VOICE_RESULT_RE = /^(ok|none|empty|timeout|network|error|http_[0-9]{3}|exit_[0-9]{1,3}|sys_[A-Z0-9_]{1,24})$/
-const OUTCOME_LINE_RE = /^(bridge|placeholder:(no_cmd|download|transcribe|empty|timeout))$/
+const OUTCOME_LINE_RE = /^(bridge|placeholder:(no_cmd|download|transcribe|empty|timeout)|late:(bridge|failed|abandoned))$/
 
 /** One voice.log line, key=value; an absent field is `-`, so every line has the same keys. */
 export function formatVoiceLine(tsMs: number, pid: number, f: VoiceLineFields): string {
@@ -460,7 +470,10 @@ export function formatVoiceLine(tsMs: number, pid: number, f: VoiceLineFields): 
   const j = f.journal
   // D-1066 download keys, closed sets; `-` when absent (no shared download, e.g. no TRANSCRIBE_CMD or the store path).
   const n = j.net
-  const att = (a: number | undefined) => (a === 1 || a === 2 ? String(a) : '-')
+  // Since D-1087 there is one attempt: dl_att / dl_win are 1 or `-`.
+  const att = (a: number | undefined) => (a === 1 ? '1' : '-')
+  const lt = f.lateTries
+  const lateTries = typeof lt === 'number' && Number.isInteger(lt) && lt >= 1 && lt <= 99 ? String(lt) : '-'
   const phase = n && DL_PHASES.has(n.dl_phase) ? n.dl_phase : '-'
   const probe = n?.probe_ms === 'timeout' || n?.probe_ms === 'error' ? n.probe_ms : num(n?.probe_ms as number | undefined)
   return (
@@ -469,7 +482,7 @@ export function formatVoiceLine(tsMs: number, pid: number, f: VoiceLineFields): 
     ` dl=${res(j.dl)} dl_ms=${num(j.dl_ms)} tr=${res(j.tr)} tr_ms=${num(j.tr_ms)} tr_len=${num(j.tr_len)}` +
     ` outcome=${outcome} total_ms=${num(f.totalMs)}` +
     ` dl_att=${att(n?.dl_att)} dl_win=${att(n?.dl_win)} gf_ms=${num(n?.gf_ms)} fx_ms=${num(n?.fx_ms)}` +
-    ` dl_phase=${phase} probe_ms=${probe}\n`
+    ` dl_phase=${phase} probe_ms=${probe} late_tries=${lateTries}\n`
   )
 }
 
@@ -494,13 +507,28 @@ export function createVoiceLog(opts: {
   }
 }
 
+/** The author/trust keys every voice envelope carries — transcript, placeholder, late text and lost notice (D-1087 OB-07). */
+export function voiceAuthorMeta(author: VoiceAuthorResult): Record<string, string> {
+  return {
+    voice_author: author.voice_author,
+    ...(author.voice_author_id != null ? { voice_author_id: author.voice_author_id } : {}),
+    voice_author_origin: author.voice_author_origin,
+    voice_trust: author.voice_trust,
+  }
+}
+
+/** The placeholder a voice gets when no transcript came (also server.ts's outer envelope-timeout catch). */
+export function voicePlaceholder(caption: string | undefined, author: VoiceAuthorResult): VoiceEnvelope {
+  return { text: caption ?? '(voice message)', meta: voiceAuthorMeta(author) }
+}
+
 export async function deliverVoiceTranscript(
   cmdConfigured: boolean,
   caption: string | undefined,
   author: VoiceAuthorResult,
   fx: VoiceDeliveryEffects,
 ): Promise<VoiceEnvelope> {
-  const fallback: VoiceEnvelope = { text: caption ?? '(voice message)', meta: {} }
+  const fallback = voicePlaceholder(caption, author)
 
   if (!cmdConfigured) {
     fx.logNotice('SAM_TRANSCRIBE_CMD unset — delivering (voice message) placeholder')
@@ -557,10 +585,183 @@ export async function deliverVoiceTranscript(
     meta: {
       transcript_source: 'bridge',
       attachment_path: audioPath,
-      voice_author: author.voice_author,
-      ...(author.voice_author_id != null ? { voice_author_id: author.voice_author_id } : {}),
-      voice_author_origin: author.voice_author_origin,
-      voice_trust: author.voice_trust,
+      ...voiceAuthorMeta(author),
     },
+  }
+}
+
+
+// ── late re-fetch of a voice whose file Telegram did not hand over (D-1087) ──
+// Owner tg 49563 (option «в») → «Ок, делай в» tg 49565; spec sam-data dev/analysis/2026-11-18-tg-voice-late-fetch-spec.md
+// §2 C. The voice was delivered in its place as a placeholder with voice_pending="1"; here the SAME download +
+// transcribe run again at +2/5/10/20/40/60 min, on timers, never under the chat's serialize key (texts after the voice
+// are never held by a try). The end: a transcript → one late notification (onLate); a file that came but whisper
+// failed or gave nothing, or six failed tries → one lost notification (onLost). One voice.log line closes it.
+// In memory only (NON-GOAL: persistence); a plugin stop writes `late:abandoned` per entry (abandonAll).
+
+/** Tries, counted from the placeholder (tg 49563: «через 2, 5, 10, 20, 40 и 60 мин»). */
+export const LATE_TRY_AFTER_MS: readonly number[] = [2, 5, 10, 20, 40, 60].map(m => m * 60_000)
+
+/** download_attachment's answer for a file under re-fetch (§2 C): at once, no network call. */
+export const LATE_VOICE_REFUSAL =
+  'this voice file is being re-fetched by the plugin because Telegram has not handed it over yet — do not download it; ' +
+  'its text arrives by itself as a late message with the same message_id and voice_late_s, or as a voice_lost notice'
+
+/** Download classes worth a later try: Telegram/network-side failures. Never `none` (no file_path / too big) or other 4xx. */
+export function isRetriableDownload(r: VoiceStepResult | undefined): boolean {
+  if (r == null) return false
+  return r === 'timeout' || r === 'network' || r === 'error' || r === 'http_429' || /^http_5[0-9]{2}$/.test(r) || r.startsWith('sys_')
+}
+
+/** Whether a finished first delivery hands its voice to the late fetcher (§2 C «When»). */
+export function lateFetchWanted(o: {
+  cmdConfigured: boolean
+  deliveredBridge: boolean
+  timedOut: boolean
+  journal: VoiceJournal
+}): boolean {
+  return o.cmdConfigured && !o.deliveredBridge && !o.timedOut && isRetriableDownload(o.journal.dl)
+}
+
+/** The placeholder gets voice_pending="1" only when a re-fetch really got scheduled. */
+export function markPending(placeholder: VoiceEnvelope, scheduled: boolean): VoiceEnvelope {
+  return scheduled ? { text: placeholder.text, meta: { ...placeholder.meta, voice_pending: '1' } } : placeholder
+}
+
+export interface LateVoice {
+  chat: string
+  msg: number
+  fileId: string
+  size?: number
+  durS?: number
+  /** The voice's Telegram time, ms — voice_late_s counts from it. */
+  tsMs: number
+  /** When the voice reached the plugin, ms — total_ms of the closing line counts from it. */
+  arrivedMs: number
+  /** When the placeholder went out, ms — the tries count from it. */
+  placeholderMs: number
+  caption?: string
+  author: VoiceAuthorResult
+  /** The first delivery's own download effect (store path for someone else's voice, inbox for the owner's). */
+  download: (journal: VoiceJournal) => Promise<string | undefined>
+  /** The first delivery's own transcribe effect (whisper mutex + the original transcribeFlags). */
+  transcribe: (audioPath: string) => Promise<string>
+  /** The transcript came: the envelope as deliverVoiceTranscript built it, lateS = whole seconds since tsMs. */
+  onLate: (late: VoiceEnvelope, lateS: number) => void
+  /** Telegram never handed the file over (or whisper failed on it). */
+  onLost: () => void
+}
+
+export interface LateVoiceFetcher {
+  /** Take a voice; false when that chat+msg is already taken. */
+  schedule: (v: LateVoice) => boolean
+  /** A file_id under re-fetch right now (download_attachment refuses it). */
+  has: (fileId: string) => boolean
+  /** Plugin stop: one `late:abandoned` line per entry, synchronously; nothing runs after. Returns the count. */
+  abandonAll: () => number
+  size: () => number
+}
+
+export function createLateVoiceFetcher(deps: {
+  writeLine: (f: VoiceLineFields) => void
+  logNotice: (reason: string) => void
+  nowMs?: () => number
+  setTimer?: (fn: () => void, ms: number) => unknown
+  clearTimer?: (h: unknown) => void
+  tryAfterMs?: readonly number[]
+  downloadTimeoutMs?: number
+}): LateVoiceFetcher {
+  const now = deps.nowMs ?? Date.now
+  const setTimer = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
+  const clearTimer = deps.clearTimer ?? ((h: unknown) => clearTimeout(h as ReturnType<typeof setTimeout>))
+  const offsets = deps.tryAfterMs ?? LATE_TRY_AFTER_MS
+  type Entry = LateVoice & { key: string; tries: number; timer?: unknown; done: boolean; last: VoiceJournal }
+  const entries = new Map<string, Entry>()
+
+  const line = (e: Entry, outcome: VoiceOutcome) => {
+    try {
+      deps.writeLine({
+        chat: e.chat,
+        msg: e.msg,
+        size: e.size,
+        durS: e.durS,
+        journal: { ...e.last },
+        outcome,
+        totalMs: now() - e.arrivedMs,
+        lateTries: e.tries,
+      })
+    } catch {}
+  }
+  const end = (e: Entry, outcome: VoiceOutcome) => {
+    e.done = true
+    if (e.timer !== undefined) clearTimer(e.timer)
+    entries.delete(e.key)
+    line(e, outcome)
+  }
+  // The next try is due at placeholder + offsets[tries]; one already overdue (the previous try ran long) starts now —
+  // tries of one voice never overlap because the next is armed only after the previous settled.
+  const arm = (e: Entry) => {
+    e.timer = setTimer(() => void run(e), Math.max(0, e.placeholderMs + offsets[e.tries] - now()))
+  }
+  async function run(e: Entry): Promise<void> {
+    if (e.done) return
+    e.timer = undefined
+    e.tries++
+    const journal: VoiceJournal = {}
+    e.last = journal
+    let got: VoiceEnvelope | undefined
+    try {
+      got = await deliverVoiceTranscript(true, e.caption, e.author, {
+        journal,
+        download: () => e.download(journal),
+        transcribe: e.transcribe,
+        logNotice: r => deps.logNotice(`late try ${e.tries}: ${r}`),
+        nowMs: now,
+        downloadTimeoutMs: deps.downloadTimeoutMs,
+      })
+    } catch (err) {
+      deps.logNotice(`late try ${e.tries} crashed: ${voiceErrorClass(err)}`)
+    }
+    if (e.done) return // abandoned while it ran
+    if (got?.meta.transcript_source === 'bridge') {
+      end(e, 'late:bridge')
+      try {
+        e.onLate(got, Math.max(0, Math.round((now() - e.tsMs) / 1000)))
+      } catch (err) {
+        deps.logNotice(`late notification failed: ${voiceErrorClass(err)}`)
+      }
+      return
+    }
+    if (journal.dl === 'ok' || e.tries >= offsets.length) {
+      end(e, 'late:failed')
+      try {
+        e.onLost()
+      } catch (err) {
+        deps.logNotice(`lost notification failed: ${voiceErrorClass(err)}`)
+      }
+      return
+    }
+    arm(e)
+  }
+
+  return {
+    schedule(v) {
+      const key = `${v.chat}:${v.msg}`
+      if (entries.has(key) || offsets.length === 0) return false
+      const e: Entry = { ...v, key, tries: 0, done: false, last: {} }
+      entries.set(key, e)
+      arm(e)
+      return true
+    },
+    has(fileId) {
+      for (const e of entries.values()) if (e.fileId === fileId) return true
+      return false
+    },
+    abandonAll() {
+      const all = [...entries.values()]
+      for (const e of all) end(e, 'late:abandoned')
+      return all.length
+    },
+    size: () => entries.size,
   }
 }

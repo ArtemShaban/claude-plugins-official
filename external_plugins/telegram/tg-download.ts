@@ -3,18 +3,13 @@
  * spec sam-data dev/analysis/2026-11-16-tg-file-download-fix-spec.md, RCA
  * dev/analysis/2026-11-16-voice-transcription-fallback-rca.md).
  *
- * «одна общая функция скачивания вместо 4 копий: не ответила за ~8 с — параллельно вторая попытка, кто
- * первый, тот и победил; повторный запрос того же файла не качает заново» (tg 48590).
+ * «одна общая функция скачивания вместо 4 копий … повторный запрос того же файла не качает заново» (tg 48590).
+ * D-1087 (owner tg 49565 «вырежи повтор в 8 сек, если он бесполезен»; RCA dev/analysis/2026-11-18-tg-voice-getfile-rca.md
+ * M1: the 8 s second attempt won 0 of 14 — Telegram's getFile stall is per file, not per connection): ONE attempt.
  *
  * - The only place that calls getFile and builds the file URL (both carry the bot token).
- * - Attempt = getFile → file GET, each with its own AbortSignal. Attempt 1 has no file-GET response headers
- *   after HEDGE_MS → attempt 2 starts on a fresh connection; attempt 1 keeps running. Fresh = `keepalive: false`,
- *   Bun's documented per-request switch (Bun 1.4.0 docs, runtime/networking/fetch: «Disable connection reuse for this
- *   request»; «You can disable it [connection pooling] per-request with `keepalive: false`»). Bun 1.4.0 fetch speaks
- *   HTTP/1.1 only, so there is no multiplexing to share either; tg-download.r1.test.ts proves it on a warm pool.
- *   The first attempt to return the COMPLETE file wins and the other is aborted; an attempt that fails (also
- *   mid-body) leaves the other running, and the download fails only when no attempt is left. Never a 3rd attempt;
- *   no hedge once attempt 1 has its file-GET headers.
+ * - One attempt = getFile → file GET, under one AbortSignal. It fails or succeeds once; never a second attempt here
+ *   (a voice whose file did not come is re-fetched later by voice-delivery.ts's late fetcher, not by this module).
  * - Each attempt reads at most TRANSFER_CEILING_BYTES (the Bot API getFile limit): Content-Length over it, or the
  *   bytes actually read going over it (Telegram's file_size is optional and may be wrong) → too_big, body cancelled.
  * - Single-flight per file_id: a call while that file is in flight joins its transfer and gets the same answer. The
@@ -22,14 +17,16 @@
  * - DOWNLOAD_CAP_MS hard cap: all attempts aborted, entry dropped, a `timed out` error.
  * - Every error that leaves this module passes one boundary (`closedError`): never the URL (= never the token), never
  *   Telegram's description text, never a `cause` — also for a failure inside the module itself.
- * - When the hedge fires, one bare TCP connect to api.telegram.org:443 (PROBE_CAP_MS cap) is recorded in the
- *   journal — «следующий сбой сам покажет, чья сторона». Never on the happy path, never awaited by delivery.
+ * - PROBE_AFTER_MS (8 s) with no file-GET headers yet → one bare TCP connect to api.telegram.org:443 (PROBE_CAP_MS cap)
+ *   is recorded in the journal — «следующий сбой сам покажет, чья сторона» (tg 48590). Diagnostic only: it starts
+ *   nothing else, never runs on the happy path, never awaited by delivery.
  *
  * No top-level side effects: server.ts wires the token; tests inject a local fake Bot API (`origin`).
  */
 import { connect } from 'node:net'
 
-export const HEDGE_MS = 8_000
+/** When a still-waiting download records its TCP probe (the old 8 s hedge mark; D-1087 kept only the probe). */
+export const PROBE_AFTER_MS = 8_000
 export const DOWNLOAD_CAP_MS = 180_000
 export const PROBE_CAP_MS = 5_000
 /** The most one attempt ever reads: the Bot API's getFile limit («files of up to 20MB»), = server.ts MAX_DOWNLOAD_BYTES. */
@@ -44,16 +41,16 @@ export type ProbeResult = number | 'timeout' | 'error'
 
 /** Live, shared by every joiner; read by the voice journal at any moment (also after the voice stopped waiting). */
 export interface DownloadJournal {
-  /** Attempts started: 1 | 2. */
+  /** Attempts started: always 1 since D-1087 (the voice.log key stays). */
   dl_att: number
-  /** Winning attempt; absent while nobody won. */
+  /** 1 once the attempt returned the file; absent otherwise. */
   dl_win?: number
-  /** getFile ms of the winner. */
+  /** getFile ms. */
   gf_ms?: number
-  /** File GET ms (headers + body) of the winner. */
+  /** File GET ms (headers + body). */
   fx_ms?: number
   dl_phase: DownloadPhase
-  /** TCP connect ms to api.telegram.org:443, started when the hedge fired; absent = no hedge (or still running). */
+  /** TCP connect ms to api.telegram.org:443, started at PROBE_AFTER_MS; absent = not reached (or still running). */
   probe_ms?: ProbeResult
 }
 
@@ -71,7 +68,7 @@ export interface DownloaderOpts {
   token: string
   /** Test seam: a local fake Bot API, e.g. `http://127.0.0.1:1234`. Default: api.telegram.org. */
   origin?: string
-  hedgeMs?: number
+  probeAfterMs?: number
   capMs?: number
   probe?: () => Promise<ProbeResult>
   nowMs?: () => number
@@ -133,18 +130,17 @@ type Fetched = { status: 'ok'; bytes: Uint8Array; ext: string; uniqueId: string 
 export function createTelegramDownloader(opts: DownloaderOpts) {
   const apiBase = opts.origin ? `${opts.origin}/bot` : TG_API
   const fileBase = opts.origin ? `${opts.origin}/file/bot` : TG_FILE
-  const hedgeMs = opts.hedgeMs ?? HEDGE_MS
+  const probeAfterMs = opts.probeAfterMs ?? PROBE_AFTER_MS
   const capMs = opts.capMs ?? DOWNLOAD_CAP_MS
   const probe = opts.probe ?? (() => tcpProbe())
   const now = opts.nowMs ?? Date.now
   type Entry = { promise: Promise<DownloadResult>; journal: DownloadJournal }
   const inflight = new Map<string, Entry>()
 
-  async function get(url: string, signal: AbortSignal, fresh: boolean, json?: unknown): Promise<Response> {
+  async function get(url: string, signal: AbortSignal, json?: unknown): Promise<Response> {
     try {
       return await fetch(url, {
         signal,
-        ...(fresh ? { keepalive: false } : {}),
         // Bot API methods: POST + JSON body, the form grammY uses (the file id never sits in a URL either).
         ...(json !== undefined
           ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(json) }
@@ -201,11 +197,10 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
     fileId: string,
     st: AttemptState,
     signal: AbortSignal,
-    fresh: boolean,
     onPhase: () => void,
   ): Promise<Fetched> {
     const t0 = now()
-    const gfRes = await get(`${apiBase}${opts.token}/getFile`, signal, fresh, { file_id: fileId })
+    const gfRes = await get(`${apiBase}${opts.token}/getFile`, signal, { file_id: fileId })
     const parsed = await body(() => gfRes.json() as Promise<unknown>, signal).catch(err => {
       if ((err as Error).name === 'AbortError') throw err
       // Not JSON (a proxy page): classify by the HTTP status only.
@@ -224,7 +219,7 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
     st.phase = 'headers'
     onPhase()
     const t1 = now()
-    const res = await get(`${fileBase}${opts.token}/${filePath}`, signal, fresh)
+    const res = await get(`${fileBase}${opts.token}/${filePath}`, signal)
     if (!res.ok) {
       void res.body?.cancel().catch(() => {})
       throw new TelegramDownloadError(`file download failed: HTTP ${res.status}`, { code: `HTTP_${res.status}` })
@@ -242,55 +237,38 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
   }
 
   function start(fileId: string): Entry {
-    const journal: DownloadJournal = { dl_att: 0, dl_phase: 'getfile' }
+    const journal: DownloadJournal = { dl_att: 1, dl_phase: 'getfile' }
     const entry = { journal } as Entry
-    const attempts: { ctrl: AbortController; st: AttemptState }[] = []
+    const ctrl = new AbortController()
+    const st: AttemptState = { phase: 'getfile' }
     let settled = false
-    let pending = 0
-    let hedgeTimer: ReturnType<typeof setTimeout> | undefined
+    let probeTimer: ReturnType<typeof setTimeout> | undefined
     let capTimer: ReturnType<typeof setTimeout> | undefined
 
     entry.promise = new Promise<DownloadResult>((resolve, reject) => {
       const finish = (fn: () => void) => {
         if (settled) return
         settled = true
-        clearTimeout(hedgeTimer)
+        clearTimeout(probeTimer)
         clearTimeout(capTimer)
-        for (const a of attempts) a.ctrl.abort()
+        ctrl.abort()
         inflight.delete(fileId)
         fn()
       }
-      const syncPhase = () => {
-        for (const a of attempts) {
-          if (PHASE_ORDER[a.st.phase] > PHASE_ORDER[journal.dl_phase]) journal.dl_phase = a.st.phase
-        }
-      }
-      const launch = () => {
-        const n = attempts.length + 1
-        const ctrl = new AbortController()
-        const st: AttemptState = { phase: 'getfile' }
-        attempts.push({ ctrl, st })
-        journal.dl_att = n
-        pending++
-        attempt(fileId, st, ctrl.signal, n > 1, syncPhase).then(
-          got =>
-            finish(() => {
-              journal.dl_win = n
-              if (st.gf_ms != null) journal.gf_ms = st.gf_ms
-              if (st.fx_ms != null) journal.fx_ms = st.fx_ms
-              journal.dl_phase = 'done'
-              resolve({ ...got, journal } as DownloadResult)
-            }),
-          err => {
-            pending--
-            // One attempt failed (also mid-body): the other keeps going; fail only when none is left (no retry).
-            if (pending === 0) finish(() => reject(closedError(err)))
-          },
-        )
-      }
-      const hedge = () => {
-        // Only while attempt 1 has no file-GET headers: a streaming body is never fetched twice.
-        if (settled || PHASE_ORDER[attempts[0].st.phase] > PHASE_ORDER.headers) return
+      attempt(fileId, st, ctrl.signal, () => (journal.dl_phase = st.phase)).then(
+        got =>
+          finish(() => {
+            journal.dl_win = 1
+            if (st.gf_ms != null) journal.gf_ms = st.gf_ms
+            if (st.fx_ms != null) journal.fx_ms = st.fx_ms
+            journal.dl_phase = 'done'
+            resolve({ ...got, journal } as DownloadResult)
+          }),
+        err => finish(() => reject(closedError(err))),
+      )
+      probeTimer = setTimeout(() => {
+        // Only while there are no file-GET headers yet: a streaming body is not a stall of the path.
+        if (settled || PHASE_ORDER[st.phase] > PHASE_ORDER.headers) return
         void probe()
           .then(r => {
             journal.probe_ms = r
@@ -298,10 +276,7 @@ export function createTelegramDownloader(opts: DownloaderOpts) {
           .catch(() => {
             journal.probe_ms = 'error'
           })
-        launch()
-      }
-      launch()
-      hedgeTimer = setTimeout(hedge, hedgeMs)
+      }, probeAfterMs)
       capTimer = setTimeout(
         () => finish(() => reject(new TelegramDownloadError(`telegram file download timed out after ${capMs}ms`))),
         capMs,

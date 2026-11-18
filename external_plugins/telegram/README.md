@@ -76,7 +76,7 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 | --- | --- |
 | `reply` | Send to a chat. Takes `chat_id` + `text`, optionally `reply_to` (message ID) for native threading, `message_thread_id` (forum topic id from the inbound meta; omit for General / DM) and `files` (absolute paths) for attachments. Images (`.jpg`/`.png`/`.gif`/`.webp`) send as photos with inline preview; other types send as documents. Max 50MB each. Auto-chunks text; files send as separate messages after the text. Returns the sent message ID(s). |
 | `react` | Add an emoji reaction to a message by ID. **Only Telegram's fixed whitelist** is accepted (👍 👎 ❤ 🔥 👀 etc). |
-| `download_attachment` | Download a file of an inbound message (`attachment_file_id` from the inbound meta) to the local inbox; returns the path to Read. Telegram caps bot downloads at 20 MB. |
+| `download_attachment` | Download a file of an inbound message (`attachment_file_id` from the inbound meta) to the local inbox; returns the path to Read. Telegram caps bot downloads at 20 MB. A voice the plugin is re-fetching itself (`voice_pending="1"`, see «Voice journal») is refused at once with a fixed error — its text comes as a late message. |
 | `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
 | `secretary_watch` | This fork only: subscribe to / unsubscribe from a chat on the owner's secretary list (see «Secretary» below). |
 
@@ -132,32 +132,45 @@ Every inbound voice the bridge tries to transcribe leaves one line in
 no rotation) — the plugin's stderr is not kept anywhere durable. One line, key=value:
 
 ```
-2026-11-09T01:17:47.123Z pid=735 chat=22276 msg=44440 size=12345 dur_s=7 dl=ok dl_ms=400 tr=empty tr_ms=2800 tr_len=0 outcome=placeholder:empty total_ms=3300
+2026-11-09T01:17:47.123Z pid=735 chat=22276 msg=44440 size=12345 dur_s=7 dl=ok dl_ms=400 tr=empty tr_ms=2800 tr_len=0 outcome=placeholder:empty total_ms=3300 dl_att=1 dl_win=1 gf_ms=310 fx_ms=90 dl_phase=done probe_ms=- late_tries=-
 ```
 
 `dl` / `tr` = `ok` · `none` (no file: over the cap, no file_path) · `empty` (no words) · an
 error class (`timeout`, `network`, `http_<code>`, `exit_<code>`, `sys_<CODE>`, `error`); `-` = the
 leg did not run. `outcome` = `bridge` (the session got the transcript) or
-`placeholder:<no_cmd|download|transcribe|empty|timeout>` (it got `(voice message)`, or the caption alone). Never the
+`placeholder:<no_cmd|download|transcribe|empty|timeout>` (it got `(voice message)`, or the caption alone) or, for a
+voice re-fetched late (below), its one closing line `late:<bridge|failed|abandoned>`. Never the
 transcript, the caption, a path or an error text. Code: `voice-delivery.ts` (`formatVoiceLine`).
 
 Download keys (D-1066), appended to the same line:
-`dl_att=<1|2> dl_win=<1|2|-> gf_ms=<getFile ms of the winner> fx_ms=<file GET ms of the winner>
-dl_phase=<done|getfile|headers|body> probe_ms=<ms|timeout|error|->`. `dl_phase` = where the most advanced attempt
-was when the voice stopped waiting; `probe_ms` = one bare TCP connect to api.telegram.org:443, made only when the
-second attempt fired. Reading a stall: `probe_ms` fast + `getfile` on both attempts → Telegram's side;
-`probe_ms` slow / `timeout` → our network path; `dl_win=2` → a per-connection stall the second attempt cured.
-The core control-plane leg `tg-voice-delivery` reads this file.
+`dl_att=<1|-> dl_win=<1|-> gf_ms=<getFile ms> fx_ms=<file GET ms>
+dl_phase=<done|getfile|headers|body> probe_ms=<ms|timeout|error|-> late_tries=<1..6|->`. Since D-1087 there is one
+attempt, so `dl_att` is always 1. `dl_phase` = where the download was when the voice stopped waiting; `probe_ms` =
+one bare TCP connect to api.telegram.org:443, made on its own when the file GET has no headers after 8 s (it starts
+nothing else). Reading a stall: `probe_ms` fast + `getfile` → Telegram's side; `probe_ms` slow / `timeout` → our
+network path. The core control-plane leg `tg-voice-delivery` reads this file.
+
+**Late re-fetch (D-1087).** A voice whose download ended without a file on a Telegram/network-side class (`timeout`,
+`network`, `error`, `sys_*`, `http_5xx`, `http_429`; never `none` or another 4xx), with a transcribe command set, is
+delivered in its place as the placeholder with `voice_pending="1"` and the author/trust keys (every voice placeholder
+carries `voice_author`, `voice_author_id` when known, `voice_author_origin`, `voice_trust`). The plugin then runs the
+same download + transcribe again at +2, +5, +10, +20, +40 and +60 min, in memory, outside the chat's queue (texts sent
+after the voice are never held). A transcript → one more notification with the same `message_id` and `ts`,
+`transcript_source="bridge"`, the author keys and `voice_late_s=<seconds since the voice>`. A file that came but whisper
+failed or gave nothing, or six failed tries → one notification with `voice_lost="1"`. Each such voice gets one closing
+line: `late:bridge` / `late:failed`, `late_tries` = the tries run, `total_ms` = ms since the voice arrived, the dl/tr
+keys of the last try. A plugin stop writes `late:abandoned` per voice still waiting (not persisted across restarts).
+What the agent says to the person on these three attributes: core `.claude/rules/telegram.md`.
 
 ## File downloads
 
 Every Telegram file download (the voice route, photos, `download_attachment`, the chat-store keeper) goes through
-one helper, `tg-download.ts` (`downloadTelegramFile`): if attempt 1 has no response headers after 8 s, a second
-attempt starts on a fresh connection; the first attempt to return the complete file wins and the other is aborted
-(if one attempt fails, also mid-body, the other keeps going). Each attempt reads at most 20 MiB (the Bot API limit),
-judged on the bytes actually read: over it → `too_big` and the body is cancelled. A second request for the same
-`file_id` while it is in flight joins it and gets the same answer. A hard cap of 180 s aborts everything. "Fresh connection" = Bun's `keepalive: false` (Bun docs: «Disable
-connection reuse for this request»). The voice waits for its file at most 90 s (`DOWNLOAD_TIMEOUT_MS`), then gets the whisper budget on top.
+one helper, `tg-download.ts` (`downloadTelegramFile`): one attempt, getFile then the file GET (D-1087 removed the
+8 s second attempt: it won 0 of 14 — Telegram's stall is per file; the 8 s TCP probe stays as a diagnostic). It reads
+at most 20 MiB (the Bot API limit), judged on the bytes actually read: over it → `too_big` and the body is cancelled.
+A second request for the same `file_id` while it is in flight joins it and gets the same answer. A hard cap of 180 s
+aborts it. The voice waits for its file at most 120 s (`DOWNLOAD_TIMEOUT_MS`, ≈ Telegram's own getFile cut; owner tg
+49565), then gets the whisper budget on top.
 It is the only place that builds the file URL (it carries the bot token); its errors carry only a closed class.
 
 ## History: the archive, not the Bot API

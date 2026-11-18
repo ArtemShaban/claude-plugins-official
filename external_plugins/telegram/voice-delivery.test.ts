@@ -15,6 +15,7 @@ import {
   ttsLang,
   userVoiceConfig,
   voiceAuthor,
+  voicePlaceholder,
   whisperTimeoutMs,
   withTimeout,
   type VoiceAuthorResult,
@@ -423,8 +424,10 @@ describe('deliverVoiceTranscript — fail-open (A13)', () => {
     voice_author_origin: 'sender',
     voice_trust: 'owner',
   }
-  const baseline = { text: '(voice message)', meta: {} }
-  const baselineWithCaption = { text: 'a caption', meta: {} }
+  // D-1087 OB-07: the placeholder carries the author/trust keys (was meta {} — a forwarded voice read as the owner's).
+  const authorKeys = { voice_author: 'owner_handle', voice_author_id: '378650081', voice_author_origin: 'sender', voice_trust: 'owner' }
+  const baseline = { text: '(voice message)', meta: authorKeys }
+  const baselineWithCaption = { text: 'a caption', meta: authorKeys }
 
   test('case 1 — no TRANSCRIBE_CMD configured => baseline placeholder', async () => {
     const notices: string[] = []
@@ -560,7 +563,7 @@ describe('F4 fix — a hung download is bounded (timeoutMs + download budget), n
         }),
         timeoutMs + downloadBudgetMs,
         () => outerLogs.push(`voice envelope timed out after ${timeoutMs + downloadBudgetMs}ms`),
-      ).catch(() => ({ text: caption ?? '(voice message)', meta: {} }))
+      ).catch(() => voicePlaceholder(caption, author))
       return envelope
     })
 
@@ -575,7 +578,7 @@ describe('F4 fix — a hung download is bounded (timeoutMs + download budget), n
     const envelope = await task1
     await task2
 
-    expect(envelope).toEqual({ text: '(voice message)', meta: {} })
+    expect(envelope).toEqual({ text: '(voice message)', meta: { voice_author: 'stranger', voice_author_origin: 'sender', voice_trust: 'data' } })
     // exactly one notice — the OUTER timeout, not the inner one (the inner
     // deliverVoiceTranscript never gets to log anything: its own await never
     // returns, because the download it's waiting on never settles).
@@ -601,9 +604,9 @@ describe('F4 fix — a hung download is bounded (timeoutMs + download budget), n
         }),
         timeoutMs + downloadBudgetMs,
         () => {},
-      ).catch(() => ({ text: caption ?? '(voice message)', meta: {} })),
+      ).catch(() => voicePlaceholder(caption, author)),
     )
-    expect(envelope).toEqual({ text: 'a caption', meta: {} })
+    expect(envelope).toEqual({ text: 'a caption', meta: { voice_author: 'stranger', voice_author_origin: 'sender', voice_trust: 'data' } })
   })
 })
 

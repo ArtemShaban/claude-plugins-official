@@ -63,7 +63,7 @@ describe('voice journal — one line per voice, per leg', () => {
     expect(r.outcome).toBe('bridge')
     expect(r.line).toBe(
       '2026-11-09T01:17:47.123Z pid=735 chat=22276 msg=44440 size=12345 dur_s=7' +
-        ' dl=ok dl_ms=400 tr=ok tr_ms=2800 tr_len=15 outcome=bridge total_ms=3300 dl_att=- dl_win=- gf_ms=- fx_ms=- dl_phase=- probe_ms=-\n',
+        ' dl=ok dl_ms=400 tr=ok tr_ms=2800 tr_len=15 outcome=bridge total_ms=3300 dl_att=- dl_win=- gf_ms=- fx_ms=- dl_phase=- probe_ms=- late_tries=-\n',
     )
     expect(r.line).not.toContain('привет')
     expect(r.line).not.toContain('/inbox')
@@ -81,7 +81,7 @@ describe('voice journal — one line per voice, per leg', () => {
     const r = await run({ download: async () => { throw err } })
     expect(r.journal.dl).toBe('network')
     expect(r.outcome).toBe('placeholder:download')
-    expect(r.env).toEqual({ text: '(voice message)', meta: {} })
+    expect(r.env).toEqual({ text: '(voice message)', meta: { voice_author: 'artem', voice_author_id: '111', voice_author_origin: 'sender', voice_trust: 'owner' } })
     expect(r.line).not.toContain('SECRET')
     expect(r.line).not.toContain('getFile')
   })
@@ -150,7 +150,7 @@ describe('voiceErrorClass — closed set', () => {
       chat: '22 276; rm', msg: undefined, journal: { dl: 'weird value' as never }, outcome: 'bridge', totalMs: -1,
     })
     expect(line).toContain(' chat=- msg=- size=- dur_s=- dl=error ')
-    expect(line).toContain(' total_ms=- dl_att=- dl_win=- gf_ms=- fx_ms=- dl_phase=- probe_ms=-\n')
+    expect(line).toContain(' total_ms=- dl_att=- dl_win=- gf_ms=- fx_ms=- dl_phase=- probe_ms=- late_tries=-\n')
   })
 })
 
@@ -168,7 +168,7 @@ describe('createVoiceLog — STATE_DIR/voice.log, 0600, append, fail-open', () =
     const file = join(dir, VOICE_LOG)
     const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
     expect(lines.length).toBe(2)
-    expect(lines[0]).toBe('2026-11-09T01:17:47.123Z pid=7 chat=1 msg=2 size=- dur_s=- dl=ok dl_ms=- tr=- tr_ms=- tr_len=- outcome=bridge total_ms=5 dl_att=- dl_win=- gf_ms=- fx_ms=- dl_phase=- probe_ms=-')
+    expect(lines[0]).toBe('2026-11-09T01:17:47.123Z pid=7 chat=1 msg=2 size=- dur_s=- dl=ok dl_ms=- tr=- tr_ms=- tr_len=- outcome=bridge total_ms=5 dl_att=- dl_win=- gf_ms=- fx_ms=- dl_phase=- probe_ms=- late_tries=-')
     expect(statSync(file).mode & 0o777).toBe(0o600)
   })
 
@@ -191,23 +191,28 @@ describe('createVoiceLog — STATE_DIR/voice.log, 0600, append, fail-open', () =
 // сторона», tg 48590): dl_att dl_win gf_ms fx_ms dl_phase probe_ms, closed sets, `-` when absent. ─────────────
 describe('voice journal — download keys (D-1066)', () => {
   const base = { chat: '22276', msg: 48549, size: 67_482, durS: 16, outcome: 'bridge' as const, totalMs: 9_000 }
-  const keys = (line: string) => line.trim().split(' ').slice(-6).join(' ')
+  const keys = (line: string) => line.trim().split(' ').slice(-7, -1).join(' ')
 
-  test('a hedged download: winner, split times, phase, probe', () => {
+  test('a slow download past the 8 s probe mark: one attempt, split times, phase, probe (D-1087: dl_att always 1)', () => {
     const line = formatVoiceLine(TS, 1, {
       ...base,
-      journal: { dl: 'ok', dl_ms: 8_600, net: { dl_att: 2, dl_win: 2, gf_ms: 180, fx_ms: 320, dl_phase: 'done', probe_ms: 45 } },
+      journal: { dl: 'ok', dl_ms: 8_600, net: { dl_att: 1, dl_win: 1, gf_ms: 8_180, fx_ms: 320, dl_phase: 'done', probe_ms: 45 } },
     })
-    expect(keys(line)).toBe('dl_att=2 dl_win=2 gf_ms=180 fx_ms=320 dl_phase=done probe_ms=45')
+    expect(keys(line)).toBe('dl_att=1 dl_win=1 gf_ms=8180 fx_ms=320 dl_phase=done probe_ms=45')
   })
 
   test('a stall: no winner, phase where it hung, probe timeout', () => {
     const line = formatVoiceLine(TS, 1, {
       ...base,
       outcome: 'placeholder:download',
-      journal: { dl: 'timeout', dl_ms: 90_000, net: { dl_att: 2, dl_phase: 'getfile', probe_ms: 'timeout' } },
+      journal: { dl: 'timeout', dl_ms: 120_000, net: { dl_att: 1, dl_phase: 'getfile', probe_ms: 'timeout' } },
     })
-    expect(keys(line)).toBe('dl_att=2 dl_win=- gf_ms=- fx_ms=- dl_phase=getfile probe_ms=timeout')
+    expect(keys(line)).toBe('dl_att=1 dl_win=- gf_ms=- fx_ms=- dl_phase=getfile probe_ms=timeout')
+  })
+
+  test('a 2 from an old journal shape is not a valid attempt count any more → `-`', () => {
+    const line = formatVoiceLine(TS, 1, { ...base, journal: { dl: 'ok', net: { dl_att: 2, dl_win: 2, dl_phase: 'done' } } })
+    expect(keys(line)).toBe('dl_att=- dl_win=- gf_ms=- fx_ms=- dl_phase=done probe_ms=-')
   })
 
   test('happy path without a hedge: probe_ms=-', () => {
@@ -226,19 +231,21 @@ describe('voice journal — download keys (D-1066)', () => {
   })
 })
 
-// ── the spec's Proof: a fake Bot API that stalls attempt 1 still yields outcome=bridge (real helper, real
-// deliverVoiceTranscript, real voice.log writer; temp dirs, 127.0.0.1, fake token; hedge scaled to 150 ms) ─────
-describe('end-to-end: stalled attempt 1 → hedge → bridge, one voice.log line with the keys', () => {
-  test('outcome=bridge, dl_att=2 dl_win=2, token never in the line', async () => {
+// ── end-to-end: a fake Bot API whose getFile answers late (after the 8 s probe mark, scaled to 150 ms) still yields
+// outcome=bridge on ONE attempt (D-1087: no second getFile); real helper, real deliverVoiceTranscript, real voice.log
+// writer; temp dirs, 127.0.0.1, fake token ─────
+describe('end-to-end: slow getFile → probe → bridge on one attempt, one voice.log line with the keys', () => {
+  test('outcome=bridge, dl_att=1 dl_win=1, one getFile, token never in the line', async () => {
     const { createServer } = await import('node:http')
     const { createTelegramDownloader } = await import('./tg-download')
     const token = '123456789:AAH-SECRET-e2e'
     let getFiles = 0
     const server = createServer((req, res) => {
       if ((req.url ?? '').includes('/getFile')) {
-        if (++getFiles === 1) return // attempt 1 hangs
+        getFiles++
         res.setHeader('content-type', 'application/json')
-        return res.end(JSON.stringify({ ok: true, result: { file_unique_id: 'AgADv', file_size: 4, file_path: 'voice/file_1.oga' } }))
+        // answers after the scaled probe mark
+        return void setTimeout(() => res.end(JSON.stringify({ ok: true, result: { file_unique_id: 'AgADv', file_size: 4, file_path: 'voice/file_1.oga' } })), 400)
       }
       res.end(Buffer.from([1, 2, 3, 4]))
     })
@@ -246,7 +253,7 @@ describe('end-to-end: stalled attempt 1 → hedge → bridge, one voice.log line
     const port = (server.address() as { port: number }).port
     const dir = mkdtempSync(join(tmpdir(), 'voice-e2e-'))
     try {
-      const { downloadTelegramFile } = createTelegramDownloader({ token, origin: `http://127.0.0.1:${port}`, hedgeMs: 150, probe: async () => 30 })
+      const { downloadTelegramFile } = createTelegramDownloader({ token, origin: `http://127.0.0.1:${port}`, probeAfterMs: 150, probe: async () => 30 })
       const journal: VoiceJournal = {}
       const env = await deliverVoiceTranscript(true, undefined, author, {
         journal,
@@ -262,7 +269,8 @@ describe('end-to-end: stalled attempt 1 → hedge → bridge, one voice.log line
       const line = readFileSync(join(dir, VOICE_LOG), 'utf8')
       expect(outcome).toBe('bridge')
       expect(line).toContain(' outcome=bridge ')
-      expect(line).toMatch(/ dl_att=2 dl_win=2 gf_ms=\d+ fx_ms=\d+ dl_phase=done probe_ms=30\n$/)
+      expect(line).toMatch(/ dl_att=1 dl_win=1 gf_ms=\d+ fx_ms=\d+ dl_phase=done probe_ms=30 late_tries=-\n$/)
+      expect(getFiles).toBe(1)
       expect(line).not.toContain('SECRET')
     } finally {
       server.closeAllConnections()

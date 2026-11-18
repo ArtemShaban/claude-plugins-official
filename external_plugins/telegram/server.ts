@@ -76,8 +76,12 @@ import {
   type ChecklistItem,
 } from './checklist'
 import {
+  createLateVoiceFetcher,
   createVoiceLog,
   deliverVoiceTranscript,
+  LATE_VOICE_REFUSAL,
+  lateFetchWanted,
+  markPending,
   PHOTO_DOWNLOAD_TIMEOUT_MS,
   voiceEnvelopeMs,
   serialize,
@@ -85,6 +89,8 @@ import {
   ttsLang,
   userVoiceConfig,
   voiceAuthor,
+  voiceAuthorMeta,
+  voicePlaceholder,
   whisperTimeoutMs,
   voiceOutcomeOf,
   withTimeout,
@@ -263,6 +269,13 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 const SHUTDOWN_LOG = join(STATE_DIR, 'shutdown.log')
 // One line per incoming voice (owner tg 44445): STATE_DIR/voice.log — plugin stderr is kept nowhere.
 const voiceLog = createVoiceLog({ stateDir: STATE_DIR, log: safeStderr })
+// D-1087 (owner tg 49565 «делай в»): a voice whose file Telegram did not hand over is re-fetched at +2/5/10/20/40/60 min
+// off the chat queue; its text then comes as a late notification for the same message (voice-delivery.ts). In memory;
+// shutdown() writes `late:abandoned` per entry.
+const lateVoice = createLateVoiceFetcher({
+  writeLine: voiceLog,
+  logNotice: reason => safeStderr(`telegram channel: voice late fetch: ${reason}\n`),
+})
 // One line per «Да / Нет» / «Готово» press (D-1049, spec §5): STATE_DIR/buttons.log.
 const buttonsLog = createButtonsLog({ stateDir: STATE_DIR, log: safeStderr })
 
@@ -379,8 +392,8 @@ process.on('uncaughtException', (err: any) => {
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
-// The ONE Telegram file download (D-1066, tg-download.ts): hedged 2nd attempt at 8 s, single-flight per
-// file_id, 180 s cap. Every site below goes through it; nothing else here calls getFile or builds a file URL.
+// The ONE Telegram file download (D-1066, tg-download.ts): one attempt (D-1087), TCP probe at 8 s, single-flight
+// per file_id, 180 s cap. Every site below goes through it; nothing else here calls getFile or builds a file URL.
 const { downloadTelegramFile } = createTelegramDownloader({ token: TOKEN })
 // getUpdates time limit (poll timeout + 15 s) + the poll.json heartbeat the core
 // watchdog reads — poll-liveness.ts. Only getUpdates is touched.
@@ -1385,6 +1398,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'download_attachment': {
         const file_id = args.file_id as string
+        // D-1087 OB-08: a voice under late re-fetch is refused at once (no network call) — its text comes by itself.
+        if (lateVoice.has(file_id)) throw new Error(LATE_VOICE_REFUSAL)
         // Joins the bridge's in-flight download of the same file (D-1066 single-flight) instead of a second one.
         const got = await downloadTelegramFile(file_id)
         if (got.status === 'no_file') throw new Error('Telegram returned no file_path — file may have expired')
@@ -1468,6 +1483,10 @@ function shutdown(reason = 'shutdown: unknown'): void {
   // uncaughtException handler (that still protects the polling/runtime path).
   safeStderr('telegram channel: shutting down\n')
   logShutdown(reason)
+  // D-1087 OB-11: voices still under late re-fetch → one `late:abandoned` voice.log line each, synchronously.
+  try {
+    lateVoice.abandonAll()
+  } catch {}
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
@@ -2376,6 +2395,47 @@ async function handleInbound(
     let imagePath: string | undefined
     let voiceMeta: Record<string, string> = {}
 
+    // Forward origin for NON-voice messages (owner tg 18168/18170): a
+    // forwarded text/photo/document must not look like the sender's own
+    // words. Same mapping as voiceAuthor (shared in voice-delivery.ts); voice
+    // keeps its own voice_author_* attributes unchanged. Not forwarded => {}.
+    // Plus the ORIGINAL date for every forward, voice included (tg 29540).
+    // ONE computation with the archive line: messageContextMeta (tg-archive.ts, team spec §2.3).
+    const contextMeta = messageContextMeta(ctx.message, attachment?.kind)
+    const groupPolicy = access.groups[chat_id]
+    // Team group (spec §2.5, owner tg 49427 «подкладывать автоматом … не надо»): never the buffer,
+    // even with contextBuffer set or a stale buffer file; the agent reads the archive itself.
+    const teamWake = isTeamGroup(groupPolicy)
+    // The ONE builder of this message's envelope meta — the wake below and a voice's late / lost notification
+    // (D-1087 §2 C) both use it, so the late text carries exactly the original chat_id / message_id / ts / topic.
+    const baseMeta: Record<string, string> = {
+      chat_id,
+      ...(msgId != null ? { message_id: String(msgId) } : {}),
+      user: from.username ?? String(from.id),
+      user_id: String(from.id),
+      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+      // Forum topic of the inbound message (R-OUT): surface it so Claude can
+      // pass message_thread_id back to the reply tool and land the answer in
+      // the same topic. Absent for General / DM.
+      ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
+      // The trigger of the telegram.md rule «woken in a team group → read the topic first».
+      ...(teamWake ? { group_mode: 'team' } : {}),
+      ...contextMeta,
+      ...(attachment ? {
+        attachment_kind: attachment.kind,
+        attachment_file_id: attachment.file_id,
+        ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+        ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+        ...(attachment.name ? { attachment_name: attachment.name } : {}),
+      } : {}),
+    }
+    // A late / lost voice notification: emitted directly (like reactions), never through deliverWakeWithBuffer and
+    // never under this chat's serialize key — the group buffer was already used by the placeholder's wake.
+    const emitDirect = (content: string, meta: Record<string, string>) =>
+      void mcp.notification({ method: 'notifications/claude/channel', params: { content, meta } }).catch(err =>
+        safeStderr(`telegram channel: late voice notification failed (chat=${chat_id} msg=${msgId ?? '?'}): ${err}\n`),
+      )
+
     // F4 fix (analysis/2026-09-17-voice-bridge-u3-verdict.md): every leg that
     // can hang (the voice envelope's own download, which has NO bound of its
     // own at the time — a bare `fetch` in downloadFileToInbox; since D-1066 also bounded inside — and the pre-existing
@@ -2405,26 +2465,30 @@ async function handleInbound(
       const journal: VoiceJournal = {}
       const voiceStart = Date.now()
       let envelopeTimedOut = false
+      // D-883: someone else's voice is delivered from the chat store (its transcript lands
+      // next to it — core transcribe.sh); his own, or a store failure, keeps the inbox path.
+      // The same effect is reused by a late re-fetch (D-1087), with that try's own journal.
+      const voiceDownload = async (j: VoiceJournal) =>
+        (await keepOthersMedia(ctx, fileId, sizeHint)) ??
+        downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga', net => (j.net = net))
+      // Whisper mutex (§6.3, EXTRAS(2)): the SAME serialize() keyed on a
+      // fixed 'whisper' key bounds concurrent whisper runs to 1 across ALL
+      // chats (whisper is ~1.5GB RSS on a 16GB miniK) — a slow voice in
+      // chat B still waits behind chat A's transcription here, even though
+      // the two chats' TEXT delivery never waits on each other above.
+      // Reused by a late re-fetch with the original transcribeFlags (owner-log extract for the original msg_id).
+      const voiceTranscribe = (audioPath: string) =>
+        serialize('whisper', () =>
+          runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, lang, {
+            timeoutMs,
+            extraArgs: transcribeFlags(ownerSent, msgId, chat_id),
+          }),
+        )
       const envelope = await withTimeout(
         deliverVoiceTranscript(TRANSCRIBE_CMD != null, ctx.message?.caption, author, {
           journal,
-          // D-883: someone else's voice is delivered from the chat store (its transcript lands
-          // next to it — core transcribe.sh); his own, or a store failure, keeps the inbox path.
-          download: async () =>
-            (await keepOthersMedia(ctx, fileId, sizeHint)) ??
-            downloadFileToInbox(fileId, INBOX_DIR, sizeHint, 'oga', net => (journal.net = net)),
-          // Whisper mutex (§6.3, EXTRAS(2)): the SAME serialize() keyed on a
-          // fixed 'whisper' key bounds concurrent whisper runs to 1 across ALL
-          // chats (whisper is ~1.5GB RSS on a 16GB miniK) — a slow voice in
-          // chat B still waits behind chat A's transcription here, even though
-          // the two chats' TEXT delivery never waits on each other above.
-          transcribe: audioPath =>
-            serialize('whisper', () =>
-              runTranscribeCmd(TRANSCRIBE_CMD!, audioPath, lang, {
-                timeoutMs,
-                extraArgs: transcribeFlags(ownerSent, msgId, chat_id),
-              }),
-            ),
+          download: () => voiceDownload(journal),
+          transcribe: voiceTranscribe,
           logNotice: voiceLogNotice,
         }),
         // Ceiling = the whisper budget (already sized to whisper's own
@@ -2440,9 +2504,8 @@ async function handleInbound(
           envelopeTimedOut = true
           voiceLogNotice(`voice envelope timed out after ${voiceEnvelopeMs(timeoutMs)}ms`)
         },
-      ).catch(() => ({ text: ctx.message?.caption ?? '(voice message)', meta: {} as Record<string, string> }))
-      bodyText = envelope.text
-      voiceMeta = envelope.meta
+      ).catch(() => voicePlaceholder(ctx.message?.caption, author))
+      const deliveredBridge = envelope.meta.transcript_source === 'bridge'
       // Fail-open: voiceLog never throws; the extra try keeps even a bug here off the delivery path.
       try {
         voiceLog({
@@ -2454,12 +2517,42 @@ async function handleInbound(
           outcome: voiceOutcomeOf({
             cmdConfigured: TRANSCRIBE_CMD != null,
             journal,
-            deliveredBridge: voiceMeta.transcript_source === 'bridge',
+            deliveredBridge,
             timedOut: envelopeTimedOut,
           }),
           totalMs: Date.now() - voiceStart,
         })
       } catch {}
+      // D-1087 §2 C: a Telegram/network-side download failure → the late fetcher takes the voice, and only then
+      // the placeholder says voice_pending="1".
+      let scheduled = false
+      if (
+        msgId != null &&
+        lateFetchWanted({ cmdConfigured: TRANSCRIBE_CMD != null, deliveredBridge, timedOut: envelopeTimedOut, journal })
+      ) {
+        const caption = ctx.message?.caption
+        scheduled = lateVoice.schedule({
+          chat: chat_id,
+          msg: msgId,
+          fileId,
+          size: sizeHint,
+          durS: attachment.duration,
+          tsMs: (ctx.message?.date ?? 0) * 1000,
+          arrivedMs: voiceStart,
+          placeholderMs: Date.now(),
+          caption,
+          author,
+          download: voiceDownload,
+          transcribe: voiceTranscribe,
+          onLate: (late, lateS) =>
+            emitDirect(late.text, { ...baseMeta, ...late.meta, voice_late_s: String(lateS) }),
+          onLost: () =>
+            emitDirect(caption ?? '(voice message)', { ...baseMeta, ...voiceAuthorMeta(author), voice_lost: '1' }),
+        })
+      }
+      const delivered = markPending(envelope, scheduled)
+      bodyText = delivered.text
+      voiceMeta = delivered.meta
     } else if (downloadImage) {
       imagePath = await withTimeout(
         downloadImage(),
@@ -2468,19 +2561,7 @@ async function handleInbound(
       ).catch(() => undefined)
     }
 
-    // Reply context — Telegram's Bot API exposes the message being replied to
-    // (reply_to_message) and, since Bot API 7.0, a `quote` for a partial
-    // selection. Surface it in meta so Claude knows which earlier message the
-    // sender is responding to. Snippets are sanitized + truncated (uploader-
-    // controlled text could otherwise break out of the <channel> tag).
-    // clipUtf16, not .slice: a cut through an emoji left a lone surrogate.
-    // Forward origin for NON-voice messages (owner tg 18168/18170): a
-    // forwarded text/photo/document must not look like the sender's own
-    // words. Same mapping as voiceAuthor (shared in voice-delivery.ts); voice
-    // keeps its own voice_author_* attributes unchanged. Not forwarded => {}.
-    // Plus the ORIGINAL date for every forward, voice included (tg 29540).
-    // ONE computation with the archive line: messageContextMeta (tg-archive.ts, team spec §2.3).
-    const contextMeta = messageContextMeta(ctx.message, attachment?.kind)
+    // Reply context (reply_to_message / quote, sanitized + clipped) rides in contextMeta, computed above.
 
     // Group context-buffer delivery (group-buffer.ts): a configured group with
     // contextBuffer:true accumulates non-mention messages instead of dropping
@@ -2491,10 +2572,6 @@ async function handleInbound(
     // contextBufferEnabled(...) true, so bufferedEntries stays [] and
     // deliverWakeWithBuffer sends `bodyText` unchanged with no extra meta —
     // exactly today's payload.
-    const groupPolicy = access.groups[chat_id]
-    // Team group (spec §2.5, owner tg 49427 «подкладывать автоматом … не надо»): never the buffer,
-    // even with contextBuffer set or a stale buffer file; the agent reads the archive itself.
-    const teamWake = isTeamGroup(groupPolicy)
     const bufferedEntries: BufferEntry[] = !teamWake && contextBufferEnabled(groupPolicy)
       ? readGroupBuffer(GROUP_BUFFER_DIR, chat_id)
       : []
@@ -2516,26 +2593,8 @@ async function handleInbound(
             params: {
               content,
               meta: {
-                chat_id,
-                ...(msgId != null ? { message_id: String(msgId) } : {}),
-                user: from.username ?? String(from.id),
-                user_id: String(from.id),
-                ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-                // Forum topic of the inbound message (R-OUT): surface it so Claude can
-                // pass message_thread_id back to the reply tool and land the answer in
-                // the same topic. Absent for General / DM.
-                ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
-                // The trigger of the telegram.md rule «woken in a team group → read the topic first».
-                ...(teamWake ? { group_mode: 'team' } : {}),
-                ...contextMeta,
+                ...baseMeta,
                 ...(imagePath ? { image_path: imagePath } : {}),
-                ...(attachment ? {
-                  attachment_kind: attachment.kind,
-                  attachment_file_id: attachment.file_id,
-                  ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-                  ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-                  ...(attachment.name ? { attachment_name: attachment.name } : {}),
-                } : {}),
                 ...voiceMeta,
                 ...extraMeta,
               },
