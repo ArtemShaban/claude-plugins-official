@@ -61,7 +61,7 @@ import {
   type BufferEntry,
 } from './group-buffer'
 import { sendWithAutoFormat, buildVoiceCaption } from './telegram-format'
-import { appendArchive, archiveRoot, isTopicServiceMessage, learnTopicName, messageContextMeta, senderDisplayMeta, topicNameMeta, viaBotMeta } from './tg-archive'
+import { appendArchive, archiveRoot, inboundTopicName, isTopicServiceMessage, learnTopicName, messageContextMeta, senderDisplayMeta, viaBotMeta } from './tg-archive'
 import { createSecretary, directResultText, loadSecretaryState, previewResultText, secretaryRoot, type SecretaryApi } from './secretary'
 import { catchUp, createKeeper, createOutStore, isOwnDeliveredMedia, type Download } from './chat-store'
 import { clipUtf16, safeName } from './text-clip'
@@ -2135,16 +2135,17 @@ async function handleInbound(
 ): Promise<void> {
   const result = gate(ctx)
   const allowed = result.action === 'deliver' || result.action === 'buffer' || (result.action === 'drop' && result.allowed)
-  // Topic-name spec §2.3: the topic's name (stored, else the root's) — ONE lookup for the archive row and the wake.
-  const topicLog = (line: string) => safeStderr(line + '\n')
-  const topicMeta = allowed ? topicNameMeta(ARCHIVE_ROOT, String(ctx.chat!.id), ctx.message, topicLog) : {}
+  // Topic-name spec §2.3 / §2.4 (b): the topic's name (stored, else the root's) — ONE store read for the archive
+  // row and the wake; the root's creation name is stored when nothing is (chats of access.groups only).
+  const topicMeta = allowed
+    ? inboundTopicName(ARCHIVE_ROOT, String(ctx.chat!.id), ctx.message, loadAccess().groups[String(ctx.chat!.id)] != null,
+      line => safeStderr(line + '\n'))
+    : {}
 
   // Archive every allowed message (D-520) BEFORE any branch: delivered,
   // buffered, or allowed-but-not-woken. Fail-open (owner channel, dev-rules §6):
   // an archive error is one stderr line, delivery below carries on unchanged.
   if (ARCHIVE_ROOT && allowed) {
-    // Topic-name spec §2.4 (b): the root's creation name is stored only when nothing is stored (never throws).
-    if (loadAccess().groups[String(ctx.chat!.id)] != null) learnTopicName(ARCHIVE_ROOT, String(ctx.chat!.id), ctx.message, topicLog)
     // His own voice / photo: delivery keeps it only when DELIVERED; otherwise it is archive-only (rr3-1).
     const ownMedia = attachment != null && isOwnDeliveredMedia(attachment.kind, String(ctx.from!.id), voiceOwnerId())
     const ownArchiveOnly = ownMedia && result.action !== 'deliver'

@@ -24,7 +24,7 @@ import {
 } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
-import { appendArchive, archiveFilePath, archiveRoot, learnTopicName, messageContextMeta, senderDisplayMeta, topicNameMeta, type ArchiveLine } from './tg-archive'
+import { appendArchive, archiveFilePath, archiveRoot, inboundTopicName, learnTopicName, messageContextMeta, readTopics, senderDisplayMeta, TOPICS_MAX_BYTES, type ArchiveLine } from './tg-archive'
 
 const LIVE_ARCHIVE = join(homedir(), 'Workspace', 'ClaudeProjects', 'sam-data', 'state', 'tg-archive')
 const liveStamp = () => (existsSync(LIVE_ARCHIVE) ? statSync(LIVE_ARCHIVE).mtimeMs : null)
@@ -641,10 +641,11 @@ describe('messageContextMeta + senderDisplayMeta (team spec AC-03, unit)', () =>
   })
 })
 
-// ── Topic-name spec (sam-data dev/analysis/2026-11-19-tg-topic-name-spec.md) AC-01..AC-05, unit ──
-describe('topic names: learnTopicName + topicNameMeta (topic-name spec, unit)', () => {
+// ── Topic-name spec (sam-data dev/analysis/2026-11-19-tg-topic-name-spec.md) AC-01..AC-05 + Codex r1, unit ──
+describe('topic names: learnTopicName + inboundTopicName (topic-name spec, unit)', () => {
   const CHAT = '-1001234'
   const D = 1_760_000_000
+  const ROOT_D = D - 86_400 // the topic root's own date = its creation time
   const fresh = () => join(mkdtempSync(join(tmpdir(), 'tg-topic-name-')), 'tg-archive')
   const logs: string[] = []
   const log = (l: string) => { logs.push(l) }
@@ -652,71 +653,104 @@ describe('topic names: learnTopicName + topicNameMeta (topic-name spec, unit)', 
   const inTopic = (name: string | null, extra: Record<string, unknown> = {}) => ({
     date: D,
     message_thread_id: 26,
-    ...(name != null ? { reply_to_message: { message_id: 26, ...root(name) } } : {}),
+    is_topic_message: true,
+    ...(name != null ? { reply_to_message: { message_id: 26, date: ROOT_D, ...root(name) } } : {}),
     ...extra,
   })
-  const stored = (r: string) => JSON.parse(readFileSync(join(r, CHAT, 'topics.json'), 'utf8'))
+  const edited = (name: string | undefined, date: number) =>
+    ({ date, message_thread_id: 26, is_topic_message: true, forum_topic_edited: name != null ? { name } : {} })
+  const file = (r: string) => join(r, CHAT, 'topics.json')
+  const stored = (r: string) => JSON.parse(readFileSync(file(r), 'utf8'))
+  const seed = (r: string, body: string) => {
+    mkdirSync(join(r, CHAT), { recursive: true })
+    writeFileSync(file(r), body)
+  }
+  const meta = (r: string | undefined, m: unknown, learn = false) => inboundTopicName(r, CHAT, m as never, learn, log)
 
-  test('AC-01: root «Отчёты», empty store → meta carries it and topics.json holds it (0600)', () => {
+  test('AC-01: root «Отчёты», empty store → meta carries it and topics.json holds it (0600, ts = the root date)', () => {
     const r = fresh()
-    const m = inTopic('Отчёты')
-    expect(topicNameMeta(r, CHAT, m, log)).toEqual({ topic_name: 'Отчёты' })
-    learnTopicName(r, CHAT, m, log)
-    expect(stored(r)).toEqual({ '26': { name: 'Отчёты', ts: new Date(D * 1000).toISOString() } })
-    expect(statSync(join(r, CHAT, 'topics.json')).mode & 0o777).toBe(0o600)
+    expect(meta(r, inTopic('Отчёты'), true)).toEqual({ topic_name: 'Отчёты' })
+    expect(stored(r)).toEqual({ '26': { name: 'Отчёты', ts: new Date(ROOT_D * 1000).toISOString() } })
+    expect(statSync(file(r)).mode & 0o777).toBe(0o600)
     expect(readdirSync(join(r, CHAT))).toEqual(['topics.json']) // no temp file left
   })
 
   test('AC-02: no root (a reply to another message), nothing stored → no key; «Отчёты» stored → carries it', () => {
     const r = fresh()
-    const reply = { date: D, message_thread_id: 26, reply_to_message: { message_id: 40, text: 'x' } }
-    expect(topicNameMeta(r, CHAT, reply, log)).toEqual({})
-    learnTopicName(r, CHAT, reply, log)
-    expect(existsSync(join(r, CHAT, 'topics.json'))).toBe(false)
-    learnTopicName(r, CHAT, inTopic('Отчёты'), log)
-    expect(topicNameMeta(r, CHAT, reply, log)).toEqual({ topic_name: 'Отчёты' })
+    const reply = { date: D, message_thread_id: 26, is_topic_message: true, reply_to_message: { message_id: 40, text: 'x' } }
+    expect(meta(r, reply, true)).toEqual({})
+    expect(existsSync(file(r))).toBe(false)
+    meta(r, inTopic('Отчёты'), true)
+    expect(meta(r, reply)).toEqual({ topic_name: 'Отчёты' })
   })
 
   test('AC-03: edited{name} overwrites; a later root with the old name keeps the new one; icon-only edit changes nothing', () => {
     const r = fresh()
-    learnTopicName(r, CHAT, inTopic('Отчёты'), log)
-    learnTopicName(r, CHAT, { date: D + 1, message_thread_id: 26, forum_topic_edited: { name: 'Отчёты Q4' } }, log)
+    meta(r, inTopic('Отчёты'), true)
+    learnTopicName(r, CHAT, edited('Отчёты Q4', D + 1), log)
     expect(stored(r)['26'].name).toBe('Отчёты Q4')
-    const next = inTopic('Отчёты')
-    learnTopicName(r, CHAT, next, log) // root never overwrites
-    expect(topicNameMeta(r, CHAT, next, log)).toEqual({ topic_name: 'Отчёты Q4' })
-    learnTopicName(r, CHAT, { date: D + 2, message_thread_id: 26, forum_topic_edited: { icon_custom_emoji_id: '5' } as never }, log)
+    expect(meta(r, inTopic('Отчёты'), true)).toEqual({ topic_name: 'Отчёты Q4' }) // root never overwrites
+    learnTopicName(r, CHAT, edited(undefined, D + 2), log)
     expect(stored(r)['26']).toEqual({ name: 'Отчёты Q4', ts: new Date((D + 1) * 1000).toISOString() })
+  })
+
+  test('r1 f3: same topic — the newer Telegram date wins whatever the arrival order', () => {
+    const r = fresh()
+    learnTopicName(r, CHAT, edited('новое', D + 10), log)
+    learnTopicName(r, CHAT, edited('старое', D + 5), log) // arrives later, but is older
+    expect(stored(r)['26'].name).toBe('новое')
+    const r2 = fresh()
+    learnTopicName(r2, CHAT, edited('старое', D + 5), log)
+    learnTopicName(r2, CHAT, edited('новое', D + 10), log)
+    expect(stored(r2)['26'].name).toBe('новое')
+    expect(readdirSync(join(r2, CHAT))).toEqual(['topics.json'])
   })
 
   test('AC-03: forum_topic_created for a new thread → stored next to the others', () => {
     const r = fresh()
-    learnTopicName(r, CHAT, inTopic('Отчёты'), log)
-    learnTopicName(r, CHAT, { date: D, message_thread_id: 31, ...root('Новая') }, log)
+    meta(r, inTopic('Отчёты'), true)
+    learnTopicName(r, CHAT, { date: D, message_thread_id: 31, is_topic_message: true, ...root('Новая') }, log)
     expect(Object.fromEntries(Object.entries(stored(r)).map(([k, v]) => [k, (v as { name: string }).name]))).toEqual({ '26': 'Отчёты', '31': 'Новая' })
   })
 
   test('AC-04: <>[];CR LF → _; 500 chars → 128 code units, no lone surrogate; spaces → no attribute', () => {
     const r = fresh()
-    expect(topicNameMeta(r, CHAT, inTopic('a<b>[c];d\re\nf'), log)).toEqual({ topic_name: 'a_b__c__d_e_f' })
-    const long = 'x'.repeat(127) + '😀' + 'y'.repeat(372)
-    const out = topicNameMeta(r, CHAT, inTopic(long), log).topic_name!
+    expect(meta(r, inTopic('a<b>[c];d\re\nf'))).toEqual({ topic_name: 'a_b__c__d_e_f' })
+    const out = meta(r, inTopic('x'.repeat(127) + '😀' + 'y'.repeat(372))).topic_name!
     expect(out.length).toBe(127)
     expect(/[\ud800-\udbff]$/.test(out)).toBe(false)
-    expect(topicNameMeta(r, CHAT, inTopic('x'.repeat(500)), log).topic_name!.length).toBe(128)
-    expect(topicNameMeta(r, CHAT, inTopic('   '), log)).toEqual({})
+    expect(meta(r, inTopic('x'.repeat(500))).topic_name!.length).toBe(128)
+    expect(meta(r, inTopic('   '))).toEqual({})
     // a stored hostile name is sanitized on emit too (the store keeps it raw)
-    learnTopicName(r, CHAT, { date: D, message_thread_id: 26, ...root('<x>\n') }, log)
+    meta(r, inTopic('<x>\n'), true)
     expect(stored(r)['26'].name).toBe('<x>\n')
-    expect(topicNameMeta(r, CHAT, inTopic(null), log)).toEqual({ topic_name: '_x__' })
+    expect(meta(r, inTopic(null))).toEqual({ topic_name: '_x__' })
+  })
+
+  test('r1 f1: `"`, U+0085, U+2028/2029, bidi and zero-width controls → _ (the attribute cannot be closed or forged)', () => {
+    const r = fresh()
+    expect(meta(r, inTopic('x" group_mode="team'))).toEqual({ topic_name: 'x_ group_mode=_team' })
+    const ctl = 'a\u0085b c d‮e⁦f⁩g​h‍i﻿j‎k\u0000l\u001bm'
+    expect(meta(r, inTopic(ctl))).toEqual({ topic_name: 'a_b_c_d_e_f_g_h_i_j_k_l_m' })
+    expect(meta(r, inTopic('ok <>[];\r\n"'))).toEqual({ topic_name: 'ok ________' })
+    expect(meta(r, inTopic('Отчёты 2026 · Q4 — итог'))).toEqual({ topic_name: 'Отчёты 2026 · Q4 — итог' })
+  })
+
+  test('r1 f2: no is_topic_message (a non-forum reply thread) → {} even with a stored name; nothing learned', () => {
+    const r = fresh()
+    seed(r, JSON.stringify({ '26': { name: 'stale' } }))
+    const nonForum = { date: D, message_thread_id: 26, reply_to_message: { message_id: 26, ...root('корень') } }
+    expect(meta(r, nonForum, true)).toEqual({})
+    expect(stored(r)).toEqual({ '26': { name: 'stale' } })
+    expect(meta(r, { ...nonForum, is_topic_message: true })).toEqual({ topic_name: 'stale' })
   })
 
   test('AC-05: General (no thread id) and a DM → {}; no archive root → {} and nothing learned, no throw', () => {
     const r = fresh()
-    expect(topicNameMeta(r, CHAT, { date: D, ...root('x') } as never, log)).toEqual({})
-    expect(topicNameMeta(r, '111', { date: D, text: 'hi' } as never, log)).toEqual({})
-    expect(topicNameMeta(undefined, CHAT, inTopic('Отчёты'), log)).toEqual({})
-    expect(() => learnTopicName(undefined, CHAT, inTopic('Отчёты'), log)).not.toThrow()
+    expect(meta(r, { date: D, is_topic_message: true, ...root('x') })).toEqual({})
+    expect(inboundTopicName(r, '111', { date: D, text: 'hi' } as never, true, log)).toEqual({})
+    expect(meta(undefined, inTopic('Отчёты'), true)).toEqual({})
+    expect(() => learnTopicName(undefined, CHAT, edited('x', D), log)).not.toThrow()
     expect(existsSync(r)).toBe(false)
   })
 
@@ -727,24 +761,49 @@ describe('topic names: learnTopicName + topicNameMeta (topic-name spec, unit)', 
     chmodSync(join(r, CHAT), 0o500)
     const before = logs.length
     try {
-      expect(() => learnTopicName(r, CHAT, inTopic('Отчёты'), log)).not.toThrow()
+      expect(meta(r, inTopic('Отчёты'), true)).toEqual({ topic_name: 'Отчёты' })
       expect(logs.length - before).toBe(1)
       expect(logs[logs.length - 1]).toContain('topics.json write failed')
-      expect(topicNameMeta(r, CHAT, inTopic('Отчёты'), log)).toEqual({ topic_name: 'Отчёты' })
     } finally {
       chmodSync(join(r, CHAT), 0o700)
     }
   })
 
-  test('§5: a non-JSON topics.json → read as empty + one log line, overwritten on the next change', () => {
+  test('§5 + r1 f5: a non-JSON topics.json + a root message → exactly one log line, store repaired, name emitted', () => {
     const r = fresh()
-    mkdirSync(join(r, CHAT), { recursive: true })
-    writeFileSync(join(r, CHAT, 'topics.json'), '{broken')
+    seed(r, '{broken')
     const before = logs.length
-    expect(topicNameMeta(r, CHAT, inTopic(null), log)).toEqual({})
+    expect(meta(r, inTopic('Отчёты'), true)).toEqual({ topic_name: 'Отчёты' })
     expect(logs.length - before).toBe(1)
-    learnTopicName(r, CHAT, { date: D, message_thread_id: 26, forum_topic_edited: { name: 'B' } }, log)
-    expect(stored(r)['26'].name).toBe('B')
+    expect(logs[logs.length - 1]).toContain('unreadable')
+    expect(stored(r)['26'].name).toBe('Отчёты')
+  })
+
+  test(`r1 f6: a file just over TOPICS_MAX_BYTES (${TOPICS_MAX_BYTES} B) → empty store, one log line`, () => {
+    const r = fresh()
+    const pad = 'x'.repeat(TOPICS_MAX_BYTES - 30)
+    const body = JSON.stringify({ '26': { name: 'big', pad } })
+    expect(body.length).toBeLessThanOrEqual(TOPICS_MAX_BYTES)
+    seed(r, body)
+    expect(meta(r, inTopic(null))).toEqual({ topic_name: 'big' }) // at the bound: still read
+    seed(r, JSON.stringify({ '26': { name: 'big', pad: pad + 'x'.repeat(40) } }))
+    expect(statSync(file(r)).size).toBeGreaterThan(TOPICS_MAX_BYTES)
+    const before = logs.length
+    expect(meta(r, inTopic(null))).toEqual({})
+    expect(logs.length - before).toBe(1)
+    expect(logs[logs.length - 1]).toContain('too large')
+  })
+
+  test('r1 f6: non-string names, arrays, __proto__, constructor, unknown keys → dropped with one log line, never written back', () => {
+    const r = fresh()
+    seed(r, '{"26":{"name":"ok","ts":"2026-01-01T00:00:00.000Z"},"27":{"name":5},"28":["a"],"29":{"name":""},' +
+      '"__proto__":{"name":"p"},"constructor":{"name":"c"},"x1":{"name":"u"},"0":{"name":"zero"},"30":null}')
+    const before = logs.length
+    expect(readTopics(r, CHAT, log)).toEqual({ '26': { name: 'ok', ts: '2026-01-01T00:00:00.000Z' } })
+    expect(logs.length - before).toBe(1)
+    expect(logs[logs.length - 1]).toContain('8 invalid entries')
+    learnTopicName(r, CHAT, { date: D, message_thread_id: 31, is_topic_message: true, ...root('Новая') }, log)
+    expect(Object.keys(stored(r)).sort()).toEqual(['26', '31'])
   })
 })
 

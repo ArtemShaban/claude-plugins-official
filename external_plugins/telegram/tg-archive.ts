@@ -15,7 +15,8 @@
 // Who is "allowed" is decided by gate() in server.ts (the ONE allowlist); this
 // module only writes. Pure fs, no grammy import, so it is unit-testable.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs'
+import { randomUUID } from 'crypto'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { basename, join } from 'path'
 import type { MessageOrigin } from 'grammy/types'
 import { groupBufferPath } from './group-buffer'
@@ -153,23 +154,33 @@ export function appendArchive(root: string, line: ArchiveLine): void {
 // ── Forum topic names (spec sam-data dev/analysis/2026-11-19-tg-topic-name-spec.md, owner tg 49767 / 49776) ──
 // Bot API has no method to fetch a topic's name, so it is learned from what the bot already receives: the
 // service messages forum_topic_created / forum_topic_edited{name}, and the topic root riding on a topic message
-// as reply_to_message. The root carries the CREATION name, so it is stored only when nothing is stored yet;
-// created / edited always overwrite. Store: <chat dir>/topics.json {"<thread id>": {name: raw, ts: ISO}},
-// read on each lookup (no cache), written whole-file atomically only when the name changes — so a rename
-// survives a restart (the root alone would bring back the old name).
+// as reply_to_message. The root carries the CREATION name, so it only fills a gap (its ts = the root's own date,
+// the creation time, older than any rename); created / edited overwrite unless the stored entry is newer by
+// Telegram date. Store: <chat dir>/topics.json {"<thread id>": {name: raw, ts: ISO}}, read on each lookup (no
+// cache), written whole-file (unique temp + rename) only when the name changes — so a rename survives a restart.
+//
+// One writer (Codex r1 f3): Telegram serves getUpdates to exactly ONE consumer per bot token (a second gets
+// 409 Conflict), and server.ts replaces a stale poller at start (PID_FILE, «replacing stale poller»), so one
+// process learns a chat's names. Inside it every read-modify-write below is synchronous — no await between the
+// read and the rename — so two handlers never interleave. The newer-date rule keeps an old event from winning
+// if one ever arrives late.
 
 export const TOPIC_NAME_CAP = 128
+/** r1 f6: a bigger topics.json is not read (one diagnostic, empty store) — room for ~1000 topics of 128-char names. */
+export const TOPICS_MAX_BYTES = 256 * 1024
 
 /** The slice of a Telegram message the topic-name helpers read (grammY Message is assignable). */
 export type TopicMessage = {
   date?: number
   message_thread_id?: number
+  is_topic_message?: boolean
   forum_topic_created?: { name?: string }
   forum_topic_edited?: { name?: string }
-  reply_to_message?: { forum_topic_created?: unknown }
+  reply_to_message?: { date?: number; forum_topic_created?: unknown }
 }
 
-type TopicStore = Record<string, { name?: unknown; ts?: unknown }>
+type TopicEntry = { name: string; ts?: string }
+type TopicStore = Record<string, TopicEntry>
 
 export function topicsFilePath(root: string, chatId: string): string {
   return join(archiveChatDir(root, chatId), 'topics.json')
@@ -178,47 +189,61 @@ export function topicsFilePath(root: string, chatId: string): string {
 const nonEmpty = (s: unknown): string | undefined => (typeof s === 'string' && s !== '' ? s : undefined)
 const rootName = (msg: TopicMessage | undefined): string | undefined =>
   nonEmpty((msg?.reply_to_message?.forum_topic_created as { name?: unknown } | undefined)?.name)
+const isoOf = (date: number | undefined): string => new Date((date ?? 0) * 1000).toISOString()
+const THREAD_KEY = /^[1-9]\d{0,15}$/
 
-/** The chat's stored topics; no file → {}; unreadable / not a JSON object → {} + one log line (overwritten on the next change). */
+/**
+ * r1 f1: the name goes verbatim into a `<channel>` attribute — on top of safeName, `"` and every control /
+ * format / line- or paragraph-separator character (U+0085, U+2028, U+2029, bidi, zero-width) → `_`.
+ */
+export function safeAttr(s: string | undefined): string | undefined {
+  return safeName(s)?.replace(/["\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, '_')
+}
+
+/**
+ * The chat's stored topics: only numeric thread keys with a non-empty string name (r1 f6). No file → {};
+ * over TOPICS_MAX_BYTES, unreadable or not a JSON object → {} + one log line (overwritten on the next change);
+ * invalid entries are dropped with one log line and never written back.
+ */
 export function readTopics(root: string, chatId: string, log: (line: string) => void): TopicStore {
   const p = topicsFilePath(root, chatId)
   if (!existsSync(p)) return {}
   try {
+    const size = statSync(p).size
+    if (size > TOPICS_MAX_BYTES) {
+      log(`telegram channel: topics.json too large (${size} B > ${TOPICS_MAX_BYTES} B, ${p}) — read as empty`)
+      return {}
+    }
     const v: unknown = JSON.parse(readFileSync(p, 'utf8'))
-    if (v != null && typeof v === 'object' && !Array.isArray(v)) return v as TopicStore
-    log(`telegram channel: topics.json is not an object (${p}) — read as empty`)
+    if (v == null || typeof v !== 'object' || Array.isArray(v)) {
+      log(`telegram channel: topics.json is not an object (${p}) — read as empty`)
+      return {}
+    }
+    const out: TopicStore = {}
+    let dropped = 0
+    for (const [k, e] of Object.entries(v)) {
+      const rec = e != null && typeof e === 'object' && !Array.isArray(e) ? (e as { name?: unknown; ts?: unknown }) : undefined
+      const name = THREAD_KEY.test(k) ? nonEmpty(rec?.name) : undefined
+      if (name == null) {
+        dropped++
+        continue
+      }
+      out[k] = typeof rec?.ts === 'string' ? { name, ts: rec.ts } : { name }
+    }
+    if (dropped) log(`telegram channel: topics.json — ${dropped} invalid entries ignored (${p})`)
+    return out
   } catch (err) {
     log(`telegram channel: topics.json unreadable (${p}): ${err}`)
+    return {}
   }
-  return {}
 }
 
-const storedName = (store: TopicStore, threadId: number): string | undefined => nonEmpty(store[String(threadId)]?.name)
-
-/** A topic service message (created / edited): learned from, never archived, never a wake. */
-export function isTopicServiceMessage(msg: TopicMessage | undefined): boolean {
-  return msg?.forum_topic_created != null || msg?.forum_topic_edited != null
-}
-
-/**
- * Learn the name this message tells: created / edited-with-a-name → overwrite; an icon-only edit → nothing;
- * a topic message whose root carries forum_topic_created → its name, only when nothing is stored. No archive
- * root or no thread id → nothing. The caller checks the chat is in access.groups. Never throws: a store
- * failure is one log line (fail-open, owner channel).
- */
-export function learnTopicName(root: string | undefined, chatId: string, msg: TopicMessage | undefined, log: (line: string) => void): void {
-  const threadId = msg?.message_thread_id
-  if (!root || msg == null || threadId == null) return
-  const service = isTopicServiceMessage(msg)
-  const name = service ? nonEmpty(msg.forum_topic_created?.name) ?? nonEmpty(msg.forum_topic_edited?.name) : rootName(msg)
-  if (name == null) return
+/** Write the store with one entry set; never throws (a failure is one log line — fail-open, owner channel). */
+function writeTopic(root: string, chatId: string, store: TopicStore, threadId: number, entry: TopicEntry, log: (line: string) => void): void {
   try {
-    const store = readTopics(root, chatId, log)
-    const current = storedName(store, threadId)
-    if (current === name || (!service && current != null)) return
-    store[String(threadId)] = { name, ts: new Date((msg.date ?? 0) * 1000).toISOString() }
+    store[String(threadId)] = entry
     const p = join(ensureChatDir(root, chatId), 'topics.json')
-    const tmp = `${p}.${process.pid}.tmp`
+    const tmp = `${p}.${process.pid}.${randomUUID()}.tmp`
     try {
       writeFileSync(tmp, JSON.stringify(store), { mode: 0o600 })
       renameSync(tmp, p)
@@ -230,15 +255,50 @@ export function learnTopicName(root: string | undefined, chatId: string, msg: To
   }
 }
 
+/** A topic service message (created / edited): learned from, never archived, never a wake. */
+export function isTopicServiceMessage(msg: TopicMessage | undefined): boolean {
+  return msg?.forum_topic_created != null || msg?.forum_topic_edited != null
+}
+
 /**
- * `{topic_name}` of a topic message — the stored name, else the root's creation name — sanitized like
- * reply_to_text (safeName + clip at 128) and dropped when empty after trim; {} when unknown, outside a
- * topic, or with no archive root. ONE computation for the wake and the archive row.
+ * Learn from a topic service message: created / edited-with-a-name → stored, unless the stored entry has a newer
+ * Telegram date; an icon-only edit → nothing. No archive root or no thread id → nothing. The caller checks the
+ * chat is in access.groups. Never throws.
  */
-export function topicNameMeta(root: string | undefined, chatId: string, msg: TopicMessage | undefined, log: (line: string) => void): { topic_name?: string } {
+export function learnTopicName(root: string | undefined, chatId: string, msg: TopicMessage | undefined, log: (line: string) => void): void {
   const threadId = msg?.message_thread_id
-  if (!root || threadId == null) return {}
-  const raw = storedName(readTopics(root, chatId, log), threadId) ?? rootName(msg)
-  const v = clipUtf16(safeName(raw), TOPIC_NAME_CAP)
+  if (!root || msg == null || threadId == null || !isTopicServiceMessage(msg)) return
+  const name = nonEmpty(msg.forum_topic_created?.name) ?? nonEmpty(msg.forum_topic_edited?.name)
+  if (name == null) return
+  const ts = isoOf(msg.date)
+  const store = readTopics(root, chatId, log)
+  const current = store[String(threadId)]
+  if (current != null && (current.name === name || (current.ts != null && current.ts > ts))) return
+  writeTopic(root, chatId, store, threadId, { name, ts }, log)
+}
+
+/**
+ * `{topic_name}` of an ordinary inbound message — ONE store read for the archive row and the wake (r1 f5).
+ * Only a real forum-topic message (`is_topic_message === true`, r1 f2) with a thread id and an archive root;
+ * otherwise {}. Name = stored, else the root's creation name; `learn` (chat in access.groups) stores the root's
+ * name when nothing is stored. Sanitized by safeAttr, clipped at 128 without a lone surrogate, dropped when
+ * empty after trim. Never throws.
+ */
+export function inboundTopicName(
+  root: string | undefined,
+  chatId: string,
+  msg: TopicMessage | undefined,
+  learn: boolean,
+  log: (line: string) => void,
+): { topic_name?: string } {
+  const threadId = msg?.message_thread_id
+  if (!root || msg == null || threadId == null || msg.is_topic_message !== true) return {}
+  const store = readTopics(root, chatId, log)
+  const stored = store[String(threadId)]?.name
+  const fromRoot = rootName(msg)
+  if (learn && stored == null && fromRoot != null) {
+    writeTopic(root, chatId, store, threadId, { name: fromRoot, ts: isoOf(msg.reply_to_message?.date) }, log)
+  }
+  const v = clipUtf16(safeAttr(stored ?? fromRoot), TOPIC_NAME_CAP)
   return v && v.trim() ? { topic_name: v } : {}
 }

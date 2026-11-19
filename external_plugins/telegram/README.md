@@ -203,8 +203,10 @@ as one JSON line to `~/Workspace/ClaudeProjects/sam-data/state/tg-archive/<chat>
 voice too), plus `sender_display` (first + last name) and `via_bot` (an inline-bot result), and `archive_only: true` on his own
 voice / photo that did not wake the session — text and labels only, no media bytes). `thread_id` is the forum topic id: the reader's `--topic` filters by it.
 The topic's name, once the plugin has seen it (topic created, renamed, or the topic root riding on a message),
-goes as `topic_name` (sanitized, ≤128) into the row and the wake, and is kept per group in `<chat>/topics.json`
-(`{"<thread id>": {"name", "ts"}}`, groups in `access.groups` only; a rename overwrites, a root name only fills a gap).
+goes as `topic_name` into the row and the wake of a forum-topic message (`is_topic_message`; `<>[];"` and every
+control / format / line-separator character → `_`, ≤128), and is kept per group in `<chat>/topics.json`
+(`{"<thread id>": {"name", "ts"}}`, ≤256 KB, groups in `access.groups` only; a rename overwrites unless the stored
+entry is newer by Telegram date, a root name only fills a gap).
 A team group (`team: true`, see ACCESS.md) archives every member and wakes only on an
 explicit, typed (not forwarded, not via an inline bot) `@<bot>` in the own message of the install
 owner or of an authorized client co-owner (`/etc/sam-telegram-access/co-owners`); any other content
