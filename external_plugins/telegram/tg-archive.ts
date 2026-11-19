@@ -15,7 +15,7 @@
 // Who is "allowed" is decided by gate() in server.ts (the ONE allowlist); this
 // module only writes. Pure fs, no grammy import, so it is unit-testable.
 
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs'
 import { basename, join } from 'path'
 import type { MessageOrigin } from 'grammy/types'
 import { groupBufferPath } from './group-buffer'
@@ -56,6 +56,8 @@ export type ArchiveLine = {
    * so catch-up can always tell it from a delivered one. Absent on every other line.
    */
   archive_only?: true
+  /** Topic-name spec §2.3: the forum topic's name when the plugin knows it (topicNameMeta); same value as the wake. */
+  topic_name?: string
 }
 
 /** The slice of a Telegram message messageContextMeta reads (grammY Message is assignable). */
@@ -146,4 +148,97 @@ export function ensureChatDir(root: string, chatId: string): string {
 export function appendArchive(root: string, line: ArchiveLine): void {
   ensureChatDir(root, line.chat_id)
   appendFileSync(archiveFilePath(root, line.chat_id, line.ts), JSON.stringify(line) + '\n', { mode: 0o600 })
+}
+
+// ── Forum topic names (spec sam-data dev/analysis/2026-11-19-tg-topic-name-spec.md, owner tg 49767 / 49776) ──
+// Bot API has no method to fetch a topic's name, so it is learned from what the bot already receives: the
+// service messages forum_topic_created / forum_topic_edited{name}, and the topic root riding on a topic message
+// as reply_to_message. The root carries the CREATION name, so it is stored only when nothing is stored yet;
+// created / edited always overwrite. Store: <chat dir>/topics.json {"<thread id>": {name: raw, ts: ISO}},
+// read on each lookup (no cache), written whole-file atomically only when the name changes — so a rename
+// survives a restart (the root alone would bring back the old name).
+
+export const TOPIC_NAME_CAP = 128
+
+/** The slice of a Telegram message the topic-name helpers read (grammY Message is assignable). */
+export type TopicMessage = {
+  date?: number
+  message_thread_id?: number
+  forum_topic_created?: { name?: string }
+  forum_topic_edited?: { name?: string }
+  reply_to_message?: { forum_topic_created?: unknown }
+}
+
+type TopicStore = Record<string, { name?: unknown; ts?: unknown }>
+
+export function topicsFilePath(root: string, chatId: string): string {
+  return join(archiveChatDir(root, chatId), 'topics.json')
+}
+
+const nonEmpty = (s: unknown): string | undefined => (typeof s === 'string' && s !== '' ? s : undefined)
+const rootName = (msg: TopicMessage | undefined): string | undefined =>
+  nonEmpty((msg?.reply_to_message?.forum_topic_created as { name?: unknown } | undefined)?.name)
+
+/** The chat's stored topics; no file → {}; unreadable / not a JSON object → {} + one log line (overwritten on the next change). */
+export function readTopics(root: string, chatId: string, log: (line: string) => void): TopicStore {
+  const p = topicsFilePath(root, chatId)
+  if (!existsSync(p)) return {}
+  try {
+    const v: unknown = JSON.parse(readFileSync(p, 'utf8'))
+    if (v != null && typeof v === 'object' && !Array.isArray(v)) return v as TopicStore
+    log(`telegram channel: topics.json is not an object (${p}) — read as empty`)
+  } catch (err) {
+    log(`telegram channel: topics.json unreadable (${p}): ${err}`)
+  }
+  return {}
+}
+
+const storedName = (store: TopicStore, threadId: number): string | undefined => nonEmpty(store[String(threadId)]?.name)
+
+/** A topic service message (created / edited): learned from, never archived, never a wake. */
+export function isTopicServiceMessage(msg: TopicMessage | undefined): boolean {
+  return msg?.forum_topic_created != null || msg?.forum_topic_edited != null
+}
+
+/**
+ * Learn the name this message tells: created / edited-with-a-name → overwrite; an icon-only edit → nothing;
+ * a topic message whose root carries forum_topic_created → its name, only when nothing is stored. No archive
+ * root or no thread id → nothing. The caller checks the chat is in access.groups. Never throws: a store
+ * failure is one log line (fail-open, owner channel).
+ */
+export function learnTopicName(root: string | undefined, chatId: string, msg: TopicMessage | undefined, log: (line: string) => void): void {
+  const threadId = msg?.message_thread_id
+  if (!root || msg == null || threadId == null) return
+  const service = isTopicServiceMessage(msg)
+  const name = service ? nonEmpty(msg.forum_topic_created?.name) ?? nonEmpty(msg.forum_topic_edited?.name) : rootName(msg)
+  if (name == null) return
+  try {
+    const store = readTopics(root, chatId, log)
+    const current = storedName(store, threadId)
+    if (current === name || (!service && current != null)) return
+    store[String(threadId)] = { name, ts: new Date((msg.date ?? 0) * 1000).toISOString() }
+    const p = join(ensureChatDir(root, chatId), 'topics.json')
+    const tmp = `${p}.${process.pid}.tmp`
+    try {
+      writeFileSync(tmp, JSON.stringify(store), { mode: 0o600 })
+      renameSync(tmp, p)
+    } finally {
+      if (existsSync(tmp)) unlinkSync(tmp)
+    }
+  } catch (err) {
+    log(`telegram channel: topics.json write failed (chat=${chatId} thread=${threadId}): ${err}`)
+  }
+}
+
+/**
+ * `{topic_name}` of a topic message — the stored name, else the root's creation name — sanitized like
+ * reply_to_text (safeName + clip at 128) and dropped when empty after trim; {} when unknown, outside a
+ * topic, or with no archive root. ONE computation for the wake and the archive row.
+ */
+export function topicNameMeta(root: string | undefined, chatId: string, msg: TopicMessage | undefined, log: (line: string) => void): { topic_name?: string } {
+  const threadId = msg?.message_thread_id
+  if (!root || threadId == null) return {}
+  const raw = storedName(readTopics(root, chatId, log), threadId) ?? rootName(msg)
+  const v = clipUtf16(safeName(raw), TOPIC_NAME_CAP)
+  return v && v.trim() ? { topic_name: v } : {}
 }

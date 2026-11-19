@@ -9,7 +9,7 @@
  * archive and /etc/sam-telegram-access are never read or written.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -22,6 +22,11 @@ const TEAM2 = -1001112229999 // a team group whose archive month file cannot be 
 const OLD = -1005556667778 // an existing group: requireMention, everyone allowed, no buffer
 const BUF = -1009990001112 // positive control: an existing group with contextBuffer + a stale buffer
 const TOPIC = 7
+// Topic-name spec (sam-data dev/analysis/2026-11-19-tg-topic-name-spec.md) AC-01..AC-05: own chats, so the
+// exhaustive TEAM assertions below stay as they were.
+const TNAME = -1001112227777 // a team group: names learned from roots and service messages
+const TRO = -1001112226666 // a team group whose archive chat folder is read-only
+const UNLISTED = -1001112225555 // not in access.groups: its service messages teach nothing
 const NOW_S = Math.floor(Date.now() / 1000)
 const MONTH = new Date(NOW_S * 1000).toISOString().slice(0, 7)
 
@@ -52,6 +57,11 @@ function groupMsg(id: number, chat: number, from: From, extra: Record<string, un
     },
   }
 }
+const rootOf = (chat: number, thread: number, name: string) =>
+  ({ message_id: thread, date: NOW_S, chat: { id: chat, type: 'supergroup' }, from: botUser, forum_topic_created: { name, icon_color: 1 } })
+const replyTo = (chat: number, id: number) =>
+  ({ message_id: id, date: NOW_S, chat: { id: chat, type: 'supergroup' }, from: { id: MEMBER, is_bot: false, first_name: 'Член' }, text: 'другое' })
+const HOSTILE = 'a<b>[c];d\re\nf'
 const voice = (id: string) => ({ voice: { file_id: id, file_unique_id: 'u' + id, duration: 2, file_size: 5 } })
 
 // r2 f3: one fixture per fallback content kind (server.ts OTHER_CONTENT_KINDS) — kind → its update id. The coverage
@@ -114,6 +124,28 @@ const UPDATES = [
   groupMsg(130, BUF, member, at(' привет'), null),
   // DM from the owner (old fields byte-equal)
   { update_id: 140, message: { message_id: 140, date: NOW_S, chat: { id: OWNER, type: 'private' }, from: { is_bot: false, ...owner }, text: 'в личке' } },
+  // ── topic names (topic-name spec) ──
+  // AC-01: his @ in topic 26, the root says «Отчёты», nothing stored
+  groupMsg(150, TNAME, owner, { ...at(' отчёт'), reply_to_message: rootOf(TNAME, 26, 'Отчёты') }, 26),
+  // AC-02: a reply to another message in topic 26 (no root) — «Отчёты» is stored by now
+  groupMsg(151, TNAME, owner, { ...at(' ещё'), reply_to_message: replyTo(TNAME, 150) }, 26),
+  // AC-02: a reply to another message in topic 27 (no root), nothing stored there
+  groupMsg(152, TNAME, owner, { ...at(' там'), reply_to_message: replyTo(TNAME, 140) }, 27),
+  // AC-03: renamed, then an icon-only edit, then a new topic is created — no line, no wake for any of them
+  groupMsg(153, TNAME, owner, { forum_topic_edited: { name: 'Отчёты Q4' }, reply_to_message: rootOf(TNAME, 26, 'Отчёты') }, 26),
+  groupMsg(154, TNAME, owner, { forum_topic_edited: { icon_custom_emoji_id: '5' }, reply_to_message: rootOf(TNAME, 26, 'Отчёты') }, 26),
+  groupMsg(155, TNAME, owner, { forum_topic_created: { name: 'Новая', icon_color: 1 }, reply_to_message: undefined }, 155),
+  // AC-03: the next message in 26, its root still says «Отчёты»
+  groupMsg(156, TNAME, owner, { ...at(' после'), reply_to_message: rootOf(TNAME, 26, 'Отчёты') }, 26),
+  // AC-04: a hostile name on the root, and one of spaces
+  groupMsg(157, TNAME, owner, { ...at(' x'), reply_to_message: rootOf(TNAME, 40, HOSTILE) }, 40),
+  groupMsg(158, TNAME, owner, { ...at(' y'), reply_to_message: rootOf(TNAME, 41, '   ') }, 41),
+  // AC-05: a service message in a chat absent from access.groups
+  groupMsg(159, UNLISTED, owner, { forum_topic_created: { name: 'Чужая', icon_color: 1 }, reply_to_message: undefined }, 159),
+  // AC-05: a read-only chat folder — the wake still carries the root's name
+  groupMsg(160, TRO, owner, { ...at(' ro'), reply_to_message: rootOf(TRO, 5, 'RO') }, 5),
+  // AC-05: a non-forum group reply carrying message_thread_id but no root
+  groupMsg(161, OLD, member, { ...at(' в старой'), reply_to_message: replyTo(OLD, 99) }, 99),
 ]
 
 beforeAll(async () => {
@@ -130,6 +162,8 @@ beforeAll(async () => {
       // r1 f2: asyncThreads on his wake topic must not turn his @ into an idea capture
       [String(TEAM)]: { team: true, requireMention: true, allowFrom: ['none'], contextBuffer: true, asyncThreads: [String(TOPIC)] },
       [String(TEAM2)]: { team: true, requireMention: true, allowFrom: ['none'] },
+      [String(TNAME)]: { team: true, requireMention: true, allowFrom: ['none'] },
+      [String(TRO)]: { team: true, requireMention: true, allowFrom: ['none'] },
       [String(OLD)]: { requireMention: true, allowFrom: [] },
       [String(BUF)]: { requireMention: true, allowFrom: [], contextBuffer: true },
     },
@@ -146,6 +180,8 @@ beforeAll(async () => {
   writeFileSync(join(data, 'config.json'), JSON.stringify({ user: { telegram_chat_id: String(OWNER) } }))
   archive = join(data, 'state', 'tg-archive')
   mkdirSync(join(archive, String(TEAM2), `${MONTH}.jsonl`), { recursive: true }) // r1 f4: appendArchive throws there
+  mkdirSync(join(archive, String(TRO)), { recursive: true })
+  chmodSync(join(archive, String(TRO)), 0o500) // topic-name AC-05: topics.json cannot be written there
   ideaDir = join(dir, 'ideas')
   mkdirSync(ideaDir, { recursive: true })
 
@@ -222,6 +258,7 @@ require('node-fetch').default = fake
 }, 30000)
 
 afterAll(() => {
+  chmodSync(join(archive, String(TRO)), 0o700)
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -421,5 +458,71 @@ describe('team group — kept files (AC-05, OB-02)', () => {
   test('r1 f4: the archive append threw, the keeper still kept his no-@ voice', () => {
     expect(stderr).toContain('tg-archive append failed')
     expect(kept(TEAM2)).toContain('124.oga')
+  })
+})
+
+describe('topic names in the wake and the archive (topic-name spec AC-01..AC-05)', () => {
+  const topics = (chat: number) => {
+    const p = join(archive, String(chat), 'topics.json')
+    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : undefined
+  }
+  const keysOf = (o: Record<string, unknown>) => Object.keys(o)
+
+  test('AC-01: root «Отчёты», empty store → wake topic_name right after message_thread_id, row too, topics.json holds it', () => {
+    const m = metaOf(150)!.meta
+    expect(m).toMatchObject({ message_thread_id: '26', topic_name: 'Отчёты' })
+    const k = keysOf(m)
+    expect(k.indexOf('topic_name')).toBe(k.indexOf('message_thread_id') + 1)
+    expect(line(TNAME, 150)).toMatchObject({ thread_id: 26, topic_name: 'Отчёты' })
+  })
+
+  test('AC-02: no root + nothing stored → no key in wake or row; no root + «Отчёты» stored → both carry it', () => {
+    expect('topic_name' in metaOf(152)!.meta).toBe(false)
+    expect('topic_name' in line(TNAME, 152)!).toBe(false)
+    expect(metaOf(151)!.meta.topic_name).toBe('Отчёты')
+    expect(line(TNAME, 151)!.topic_name).toBe('Отчёты')
+  })
+
+  test('AC-03: rename → store says «Отчёты Q4», the next message (root still «Отчёты») carries «Отчёты Q4»; icon-only edit changes nothing; created → stored', () => {
+    const t = topics(TNAME)
+    expect(t['26'].name).toBe('Отчёты Q4')
+    expect(t['155'].name).toBe('Новая')
+    expect(metaOf(156)!.meta.topic_name).toBe('Отчёты Q4')
+    expect(line(TNAME, 156)!.topic_name).toBe('Отчёты Q4')
+  })
+
+  test('AC-03: the three service messages → no archive line, no wake, no 👀', () => {
+    const acks = calls.filter(c => c.startsWith('setMessageReaction')).map(c => c.split(' ')[1])
+    for (const id of [153, 154, 155, 159]) {
+      expect(line(TNAME, id)).toBeUndefined()
+      expect(notifIds()).not.toContain(String(id))
+      expect(acks).not.toContain(String(id))
+    }
+  })
+
+  test('AC-04: <>[];CR LF → _ in the wake and the row; a name of spaces → no attribute', () => {
+    expect(metaOf(157)!.meta.topic_name).toBe('a_b__c__d_e_f')
+    expect(line(TNAME, 157)!.topic_name).toBe('a_b__c__d_e_f')
+    expect('topic_name' in metaOf(158)!.meta).toBe(false)
+    expect('topic_name' in line(TNAME, 158)!).toBe(false)
+  })
+
+  test('AC-05: General, a DM, a non-forum reply with message_thread_id → no topic_name in wake or row', () => {
+    expect('topic_name' in line(TEAM, 110)!).toBe(false)
+    expect('topic_name' in metaOf(140)!.meta).toBe(false)
+    expect('topic_name' in line(OWNER, 140)!).toBe(false)
+    expect(metaOf(161)!.meta.message_thread_id).toBe('99')
+    expect('topic_name' in metaOf(161)!.meta).toBe(false)
+    expect('topic_name' in line(OLD, 161)!).toBe(false)
+    expect(existsSync(join(archive, String(OWNER), 'topics.json'))).toBe(false)
+  })
+
+  test('AC-05: a service message in a chat absent from access.groups → no topics.json', () => {
+    expect(existsSync(join(archive, String(UNLISTED), 'topics.json'))).toBe(false)
+  })
+
+  test('AC-05: a read-only chat folder → one stderr line, the wake still delivered with the root\'s name', () => {
+    expect(metaOf(160)!.meta.topic_name).toBe('RO')
+    expect(stderr.split('\n').filter(l => l.includes('topics.json') && l.includes(String(TRO))).length).toBe(1)
   })
 })

@@ -61,7 +61,7 @@ import {
   type BufferEntry,
 } from './group-buffer'
 import { sendWithAutoFormat, buildVoiceCaption } from './telegram-format'
-import { appendArchive, archiveRoot, messageContextMeta, senderDisplayMeta, viaBotMeta } from './tg-archive'
+import { appendArchive, archiveRoot, isTopicServiceMessage, learnTopicName, messageContextMeta, senderDisplayMeta, topicNameMeta, viaBotMeta } from './tg-archive'
 import { createSecretary, directResultText, loadSecretaryState, previewResultText, secretaryRoot, type SecretaryApi } from './secretary'
 import { catchUp, createKeeper, createOutStore, isOwnDeliveredMedia, type Download } from './chat-store'
 import { clipUtf16, safeName } from './text-clip'
@@ -1863,6 +1863,14 @@ const OTHER_CONTENT_KINDS = ['animation', 'dice', 'game', 'story', 'paid_media',
 bot.on('message', async ctx => {
   const chat = ctx.chat
   if (chat.type !== 'group' && chat.type !== 'supergroup') return
+  // Topic-name spec §2.4 (a): forum_topic_created / forum_topic_edited teach the topic's name (chats of
+  // access.groups only), then stop — a service message stays unarchived and wakes nothing, as before.
+  if (isTopicServiceMessage(ctx.message)) {
+    if (loadAccess().groups[String(chat.id)] != null) {
+      learnTopicName(ARCHIVE_ROOT, String(chat.id), ctx.message, line => safeStderr(line + '\n'))
+    }
+    return
+  }
   if (!isTeamGroup(loadAccess().groups[String(chat.id)])) return
   const m = ctx.message as unknown as Record<string, unknown>
   const kind = OTHER_CONTENT_KINDS.find(k => m[k] != null)
@@ -2126,14 +2134,17 @@ async function handleInbound(
   archiveOnly = false,
 ): Promise<void> {
   const result = gate(ctx)
+  const allowed = result.action === 'deliver' || result.action === 'buffer' || (result.action === 'drop' && result.allowed)
+  // Topic-name spec §2.3: the topic's name (stored, else the root's) — ONE lookup for the archive row and the wake.
+  const topicLog = (line: string) => safeStderr(line + '\n')
+  const topicMeta = allowed ? topicNameMeta(ARCHIVE_ROOT, String(ctx.chat!.id), ctx.message, topicLog) : {}
 
   // Archive every allowed message (D-520) BEFORE any branch: delivered,
   // buffered, or allowed-but-not-woken. Fail-open (owner channel, dev-rules §6):
   // an archive error is one stderr line, delivery below carries on unchanged.
-  if (
-    ARCHIVE_ROOT &&
-    (result.action === 'deliver' || result.action === 'buffer' || (result.action === 'drop' && result.allowed))
-  ) {
+  if (ARCHIVE_ROOT && allowed) {
+    // Topic-name spec §2.4 (b): the root's creation name is stored only when nothing is stored (never throws).
+    if (loadAccess().groups[String(ctx.chat!.id)] != null) learnTopicName(ARCHIVE_ROOT, String(ctx.chat!.id), ctx.message, topicLog)
     // His own voice / photo: delivery keeps it only when DELIVERED; otherwise it is archive-only (rr3-1).
     const ownMedia = attachment != null && isOwnDeliveredMedia(attachment.kind, String(ctx.from!.id), voiceOwnerId())
     const ownArchiveOnly = ownMedia && result.action !== 'deliver'
@@ -2147,6 +2158,7 @@ async function handleInbound(
         sender_id: String(ctx.from!.id),
         kind: attachment?.kind ?? archiveKind ?? 'text',
         ...(threadId != null ? { thread_id: threadId } : {}),
+        ...topicMeta,
         ...(attachment?.file_id ? { file_id: attachment.file_id } : {}),
         // Team spec §2.3: reply / quote / forward (every kind, voice too) + «кто писал»; additive.
         ...messageContextMeta(msg),
@@ -2427,6 +2439,8 @@ async function handleInbound(
       // pass message_thread_id back to the reply tool and land the answer in
       // the same topic. Absent for General / DM.
       ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
+      // The topic's name when known (topic-name spec §2.3); written by group members → data.
+      ...topicMeta,
       // The trigger of the telegram.md rule «woken in a team group → read the topic first».
       ...(teamWake ? { group_mode: 'team' } : {}),
       ...contextMeta,
