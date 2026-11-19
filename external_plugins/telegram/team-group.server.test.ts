@@ -12,6 +12,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { readTopics } from './tg-archive'
 
 const OWNER = 111111111
 const MEMBER = 444444444
@@ -28,7 +29,8 @@ const TNAME = -1001112227777 // a team group: names learned from roots and servi
 const TRO = -1001112226666 // a team group whose archive chat folder is read-only
 const UNLISTED = -1001112225555 // not in access.groups: its service messages teach nothing
 const FORUM = -1001112224444 // Codex r1 f1: a NON-team forum group (requireMention, everyone allowed)
-const TCORRUPT = -1001112223333 // Codex r1 f5: a team group whose topics.json is not JSON
+const TCORRUPT = -1001112223333 // Codex r1 f5: a team group whose topics.jsonl holds a corrupt line
+const STALE_TS = '2026-01-01T00:00:00.000Z'
 const NOW_S = Math.floor(Date.now() / 1000)
 const MONTH = new Date(NOW_S * 1000).toISOString().slice(0, 7)
 
@@ -148,11 +150,11 @@ const UPDATES = [
   // AC-05: a read-only chat folder — the wake still carries the root's name
   groupMsg(160, TRO, owner, { ...at(' ro'), reply_to_message: rootOf(TRO, 5, 'RO') }, 5),
   // AC-05 + r1 f2: a non-forum group reply carrying message_thread_id, no root, no is_topic_message — OLD's
-  // topics.json is preseeded with key 99 («stale») and must not leak in
+  // topics.jsonl is preseeded with thread 99 («stale») and must not leak in
   groupMsg(161, OLD, member, { ...at(' в старой'), reply_to_message: replyTo(OLD, 99), is_topic_message: undefined }, 99),
   // r1 f1: a non-team forum group, a topic named to forge an attribute
   groupMsg(162, FORUM, member, { ...at(' форум'), reply_to_message: rootOf(FORUM, 8, FORGE) }, 8),
-  // r1 f5: corrupt topics.json + one allowed root-carrying message
+  // r1 f5: a corrupt topics.jsonl line + one allowed root-carrying message
   groupMsg(163, TCORRUPT, owner, { ...at(' почини'), reply_to_message: rootOf(TCORRUPT, 5, 'Fixed') }, 5),
 ]
 
@@ -191,11 +193,11 @@ beforeAll(async () => {
   archive = join(data, 'state', 'tg-archive')
   mkdirSync(join(archive, String(TEAM2), `${MONTH}.jsonl`), { recursive: true }) // r1 f4: appendArchive throws there
   mkdirSync(join(archive, String(TRO)), { recursive: true })
-  chmodSync(join(archive, String(TRO)), 0o500) // topic-name AC-05: topics.json cannot be written there
+  chmodSync(join(archive, String(TRO)), 0o500) // topic-name AC-05: topics.jsonl cannot be written there
   mkdirSync(join(archive, String(OLD)), { recursive: true })
-  writeFileSync(join(archive, String(OLD), 'topics.json'), JSON.stringify({ '99': { name: 'stale' } })) // r1 f2
+  writeFileSync(join(archive, String(OLD), 'topics.jsonl'), '\n' + JSON.stringify({ thread: '99', name: 'stale', ts: STALE_TS })) // r1 f2
   mkdirSync(join(archive, String(TCORRUPT)), { recursive: true })
-  writeFileSync(join(archive, String(TCORRUPT), 'topics.json'), '{broken') // r1 f5
+  writeFileSync(join(archive, String(TCORRUPT), 'topics.jsonl'), '{broken') // r1 f5
   ideaDir = join(dir, 'ideas')
   mkdirSync(ideaDir, { recursive: true })
 
@@ -476,13 +478,11 @@ describe('team group — kept files (AC-05, OB-02)', () => {
 })
 
 describe('topic names in the wake and the archive (topic-name spec AC-01..AC-05)', () => {
-  const topics = (chat: number) => {
-    const p = join(archive, String(chat), 'topics.json')
-    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : undefined
-  }
+  const topics = (chat: number) =>
+    existsSync(join(archive, String(chat), 'topics.jsonl')) ? readTopics(archive, String(chat), () => {}) : undefined
   const keysOf = (o: Record<string, unknown>) => Object.keys(o)
 
-  test('AC-01: root «Отчёты», empty store → wake topic_name right after message_thread_id, row too, topics.json holds it', () => {
+  test('AC-01: root «Отчёты», empty store → wake topic_name right after message_thread_id, row too, topics.jsonl holds it', () => {
     const m = metaOf(150)!.meta
     expect(m).toMatchObject({ message_thread_id: '26', topic_name: 'Отчёты' })
     const k = keysOf(m)
@@ -529,16 +529,16 @@ describe('topic names in the wake and the archive (topic-name spec AC-01..AC-05)
     expect('topic_name' in line(TEAM, 110)!).toBe(false)
     expect('topic_name' in metaOf(140)!.meta).toBe(false)
     expect('topic_name' in line(OWNER, 140)!).toBe(false)
-    // r1 f2: OLD's topics.json holds key 99 («stale»); a non-forum reply (no is_topic_message) never shows it
-    expect(topics(OLD)).toEqual({ '99': { name: 'stale' } })
+    // r1 f2: OLD's topics.jsonl holds thread 99 («stale»); a non-forum reply (no is_topic_message) never shows it
+    expect(topics(OLD)).toEqual({ '99': { name: 'stale', ts: STALE_TS } })
     expect(metaOf(161)!.meta.message_thread_id).toBe('99')
     expect('topic_name' in metaOf(161)!.meta).toBe(false)
     expect('topic_name' in line(OLD, 161)!).toBe(false)
-    expect(existsSync(join(archive, String(OWNER), 'topics.json'))).toBe(false)
+    expect(existsSync(join(archive, String(OWNER), 'topics.jsonl'))).toBe(false)
   })
 
-  test('AC-05: a service message in a chat absent from access.groups → no topics.json', () => {
-    expect(existsSync(join(archive, String(UNLISTED), 'topics.json'))).toBe(false)
+  test('AC-05: a service message in a chat absent from access.groups → no topics.jsonl', () => {
+    expect(existsSync(join(archive, String(UNLISTED), 'topics.jsonl'))).toBe(false)
   })
 
   test('AC-05: a read-only chat folder → one stderr line, the wake still delivered with the root\'s name', () => {
@@ -559,7 +559,7 @@ describe('topic names in the wake and the archive (topic-name spec AC-01..AC-05)
     expect(line(FORUM, 162)!.topic_name).toBe('x_ group_mode=_team')
   })
 
-  test('r1 f5: corrupt topics.json + one root-carrying message → exactly one diagnostic, store repaired, wake carries the name', () => {
+  test('r1 f5: a corrupt topics.jsonl line + one root-carrying message → exactly one diagnostic, store repaired, wake carries the name', () => {
     expect(stderr.split('\n').filter(l => l.includes('topics.json') && l.includes(String(TCORRUPT))).length).toBe(1)
     expect(topics(TCORRUPT)['5'].name).toBe('Fixed')
     expect(metaOf(163)!.meta).toMatchObject({ message_thread_id: '5', topic_name: 'Fixed', group_mode: 'team' })

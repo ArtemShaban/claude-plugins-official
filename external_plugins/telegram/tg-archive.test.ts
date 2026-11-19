@@ -641,11 +641,12 @@ describe('messageContextMeta + senderDisplayMeta (team spec AC-03, unit)', () =>
   })
 })
 
-// ── Topic-name spec (sam-data dev/analysis/2026-11-19-tg-topic-name-spec.md) AC-01..AC-05 + Codex r1, unit ──
+// ── Topic-name spec (sam-data dev/analysis/2026-11-19-tg-topic-name-spec.md) AC-01..AC-05 + Codex r1 / rr1, unit ──
 describe('topic names: learnTopicName + inboundTopicName (topic-name spec, unit)', () => {
   const CHAT = '-1001234'
   const D = 1_760_000_000
   const ROOT_D = D - 86_400 // the topic root's own date = its creation time
+  const iso = (d: number) => new Date(d * 1000).toISOString()
   const fresh = () => join(mkdtempSync(join(tmpdir(), 'tg-topic-name-')), 'tg-archive')
   const logs: string[] = []
   const log = (l: string) => { logs.push(l) }
@@ -659,20 +660,24 @@ describe('topic names: learnTopicName + inboundTopicName (topic-name spec, unit)
   })
   const edited = (name: string | undefined, date: number) =>
     ({ date, message_thread_id: 26, is_topic_message: true, forum_topic_edited: name != null ? { name } : {} })
-  const file = (r: string) => join(r, CHAT, 'topics.json')
-  const stored = (r: string) => JSON.parse(readFileSync(file(r), 'utf8'))
+  const file = (r: string) => join(r, CHAT, 'topics.jsonl')
+  const stored = (r: string) => readTopics(r, CHAT, () => {})
+  const rawLines = (r: string) => readFileSync(file(r), 'utf8').split('\n').filter(l => l !== '')
   const seed = (r: string, body: string) => {
     mkdirSync(join(r, CHAT), { recursive: true })
     writeFileSync(file(r), body)
   }
+  const line = (thread: unknown, name: unknown, ts: unknown) => '\n' + JSON.stringify({ thread, name, ts })
   const meta = (r: string | undefined, m: unknown, learn = false) => inboundTopicName(r, CHAT, m as never, learn, log)
 
-  test('AC-01: root «Отчёты», empty store → meta carries it and topics.json holds it (0600, ts = the root date)', () => {
+  test('AC-01: root «Отчёты», empty store → meta carries it and topics.jsonl holds it (0600, ts = the root date)', () => {
     const r = fresh()
     expect(meta(r, inTopic('Отчёты'), true)).toEqual({ topic_name: 'Отчёты' })
-    expect(stored(r)).toEqual({ '26': { name: 'Отчёты', ts: new Date(ROOT_D * 1000).toISOString() } })
+    expect(stored(r)).toEqual({ '26': { name: 'Отчёты', ts: iso(ROOT_D) } })
     expect(statSync(file(r)).mode & 0o777).toBe(0o600)
-    expect(readdirSync(join(r, CHAT))).toEqual(['topics.json']) // no temp file left
+    expect(readdirSync(join(r, CHAT))).toEqual(['topics.jsonl'])
+    meta(r, inTopic('Отчёты'), true)
+    expect(rawLines(r).length).toBe(1) // a known topic appends nothing on each message
   })
 
   test('AC-02: no root (a reply to another message), nothing stored → no key; «Отчёты» stored → carries it', () => {
@@ -691,7 +696,7 @@ describe('topic names: learnTopicName + inboundTopicName (topic-name spec, unit)
     expect(stored(r)['26'].name).toBe('Отчёты Q4')
     expect(meta(r, inTopic('Отчёты'), true)).toEqual({ topic_name: 'Отчёты Q4' }) // root never overwrites
     learnTopicName(r, CHAT, edited(undefined, D + 2), log)
-    expect(stored(r)['26']).toEqual({ name: 'Отчёты Q4', ts: new Date((D + 1) * 1000).toISOString() })
+    expect(stored(r)['26']).toEqual({ name: 'Отчёты Q4', ts: iso(D + 1) })
   })
 
   test('r1 f3: same topic — the newer Telegram date wins whatever the arrival order', () => {
@@ -703,14 +708,43 @@ describe('topic names: learnTopicName + inboundTopicName (topic-name spec, unit)
     learnTopicName(r2, CHAT, edited('старое', D + 5), log)
     learnTopicName(r2, CHAT, edited('новое', D + 10), log)
     expect(stored(r2)['26'].name).toBe('новое')
-    expect(readdirSync(join(r2, CHAT))).toEqual(['topics.json'])
+    expect(readdirSync(join(r2, CHAT))).toEqual(['topics.jsonl'])
+  })
+
+  test('rr1 f9: t10(B), t30(B), then a late t20(A) → B stays, with the t30 watermark', () => {
+    const r = fresh()
+    learnTopicName(r, CHAT, edited('B', D + 10), log)
+    learnTopicName(r, CHAT, edited('B', D + 30), log)
+    learnTopicName(r, CHAT, edited('A', D + 20), log)
+    expect(stored(r)['26']).toEqual({ name: 'B', ts: iso(D + 30) })
+    expect(meta(r, inTopic(null))).toEqual({ topic_name: 'B' })
+  })
+
+  test('rr1 f9: a stored ts:"z" or a far-future ISO ts cannot veto a normal later rename', () => {
+    const r = fresh()
+    seed(r, line('26', 'stale', 'z'))
+    learnTopicName(r, CHAT, edited('новое', D), log)
+    expect(stored(r)['26']).toEqual({ name: 'новое', ts: iso(D) })
+    const r2 = fresh()
+    seed(r2, line('26', 'stale', '9999-12-31T23:59:59.000Z'))
+    learnTopicName(r2, CHAT, edited('новое', D), log)
+    expect(stored(r2)['26']).toEqual({ name: 'новое', ts: iso(D) })
+    // the same far-future date coming through the API is not stored either, so it cannot veto later
+    const r3 = fresh()
+    learnTopicName(r3, CHAT, edited('будущее', 253_402_300_799), log)
+    learnTopicName(r3, CHAT, edited('новое', D), log)
+    expect(stored(r3)['26']).toEqual({ name: 'новое', ts: iso(D) })
+    // non-canonical but parseable dates are invalid too
+    const r4 = fresh()
+    seed(r4, line('26', 'a', '2026-01-01') + line('26', 'b', 'Thu, 01 Jan 2099 00:00:00 GMT') + line('26', 'c', 1e15))
+    expect(stored(r4)).toEqual({})
   })
 
   test('AC-03: forum_topic_created for a new thread → stored next to the others', () => {
     const r = fresh()
     meta(r, inTopic('Отчёты'), true)
     learnTopicName(r, CHAT, { date: D, message_thread_id: 31, is_topic_message: true, ...root('Новая') }, log)
-    expect(Object.fromEntries(Object.entries(stored(r)).map(([k, v]) => [k, (v as { name: string }).name]))).toEqual({ '26': 'Отчёты', '31': 'Новая' })
+    expect(Object.fromEntries(Object.entries(stored(r)).map(([k, v]) => [k, v.name]))).toEqual({ '26': 'Отчёты', '31': 'Новая' })
   })
 
   test('AC-04: <>[];CR LF → _; 500 chars → 128 code units, no lone surrogate; spaces → no attribute', () => {
@@ -738,10 +772,10 @@ describe('topic names: learnTopicName + inboundTopicName (topic-name spec, unit)
 
   test('r1 f2: no is_topic_message (a non-forum reply thread) → {} even with a stored name; nothing learned', () => {
     const r = fresh()
-    seed(r, JSON.stringify({ '26': { name: 'stale' } }))
+    seed(r, line('26', 'stale', iso(ROOT_D)))
     const nonForum = { date: D, message_thread_id: 26, reply_to_message: { message_id: 26, ...root('корень') } }
     expect(meta(r, nonForum, true)).toEqual({})
-    expect(stored(r)).toEqual({ '26': { name: 'stale' } })
+    expect(rawLines(r).length).toBe(1)
     expect(meta(r, { ...nonForum, is_topic_message: true })).toEqual({ topic_name: 'stale' })
   })
 
@@ -763,48 +797,68 @@ describe('topic names: learnTopicName + inboundTopicName (topic-name spec, unit)
     try {
       expect(meta(r, inTopic('Отчёты'), true)).toEqual({ topic_name: 'Отчёты' })
       expect(logs.length - before).toBe(1)
-      expect(logs[logs.length - 1]).toContain('topics.json write failed')
+      expect(logs[logs.length - 1]).toContain('topics.jsonl write failed')
     } finally {
       chmodSync(join(r, CHAT), 0o700)
     }
   })
 
-  test('§5 + r1 f5: a non-JSON topics.json + a root message → exactly one log line, store repaired, name emitted', () => {
+  test('§5 + r1 f5: a corrupt line (no newline) + a root message → exactly one log line, name stored and emitted', () => {
     const r = fresh()
     seed(r, '{broken')
     const before = logs.length
     expect(meta(r, inTopic('Отчёты'), true)).toEqual({ topic_name: 'Отчёты' })
     expect(logs.length - before).toBe(1)
-    expect(logs[logs.length - 1]).toContain('unreadable')
-    expect(stored(r)['26'].name).toBe('Отчёты')
+    expect(logs[logs.length - 1]).toContain('1 invalid lines')
+    expect(stored(r)['26'].name).toBe('Отчёты') // the record after the torn line survives
+    meta(r, inTopic(null)) // the same diagnostic is not repeated on every lookup
+    expect(logs.length - before).toBe(1)
   })
 
-  test(`r1 f6: a file just over TOPICS_MAX_BYTES (${TOPICS_MAX_BYTES} B) → empty store, one log line`, () => {
+  test(`r1 f6: over TOPICS_MAX_BYTES (${TOPICS_MAX_BYTES} B) → only the newest bytes are read, the cut line skipped`, () => {
     const r = fresh()
-    const pad = 'x'.repeat(TOPICS_MAX_BYTES - 30)
-    const body = JSON.stringify({ '26': { name: 'big', pad } })
-    expect(body.length).toBeLessThanOrEqual(TOPICS_MAX_BYTES)
-    seed(r, body)
-    expect(meta(r, inTopic(null))).toEqual({ topic_name: 'big' }) // at the bound: still read
-    seed(r, JSON.stringify({ '26': { name: 'big', pad: pad + 'x'.repeat(40) } }))
+    const old = line('31', 'старая', iso(D - 10))
+    const pad = line('99', 'p'.repeat(TOPICS_MAX_BYTES), iso(D - 5)) // one line bigger than the window
+    seed(r, old + pad + line('26', 'новая', iso(D)))
     expect(statSync(file(r)).size).toBeGreaterThan(TOPICS_MAX_BYTES)
     const before = logs.length
-    expect(meta(r, inTopic(null))).toEqual({})
-    expect(logs.length - before).toBe(1)
-    expect(logs[logs.length - 1]).toContain('too large')
+    expect(stored(r)).toEqual({ '26': { name: 'новая', ts: iso(D) } })
+    expect(logs.length - before).toBe(0) // the cut line is not counted as invalid
   })
 
-  test('r1 f6: non-string names, arrays, __proto__, constructor, unknown keys → dropped with one log line, never written back', () => {
+  test('r1 f6: bad threads (__proto__, constructor, 0, x1), non-string / empty names, arrays, null → skipped, one log line', () => {
     const r = fresh()
-    seed(r, '{"26":{"name":"ok","ts":"2026-01-01T00:00:00.000Z"},"27":{"name":5},"28":["a"],"29":{"name":""},' +
-      '"__proto__":{"name":"p"},"constructor":{"name":"c"},"x1":{"name":"u"},"0":{"name":"zero"},"30":null}')
+    const ok = iso(D)
+    seed(r, line('26', 'ok', ok) + line('27', 5, ok) + '\n["a"]' + line('29', '', ok) + line('__proto__', 'p', ok) +
+      line('constructor', 'c', ok) + line('x1', 'u', ok) + line('0', 'zero', ok) + '\nnull' + line(31, 'num', ok))
     const before = logs.length
-    expect(readTopics(r, CHAT, log)).toEqual({ '26': { name: 'ok', ts: '2026-01-01T00:00:00.000Z' } })
+    expect(readTopics(r, CHAT, log)).toEqual({ '26': { name: 'ok', ts: ok } })
     expect(logs.length - before).toBe(1)
-    expect(logs[logs.length - 1]).toContain('8 invalid entries')
+    expect(logs[logs.length - 1]).toContain('9 invalid lines')
     learnTopicName(r, CHAT, { date: D, message_thread_id: 31, is_topic_message: true, ...root('Новая') }, log)
     expect(Object.keys(stored(r)).sort()).toEqual(['26', '31'])
   })
+
+  test('rr1 f3: two processes (different TELEGRAM_STATE_DIR / token) share the archive root — barrier after both read, both threads kept', async () => {
+    // Each child blocks INSIDE learnTopicName right before its store write (fs hook) until both have read the
+    // store; then both write. A read-modify-rename store loses one thread here. Repeated 5 times.
+    const child = './topic-name.child.ts'
+    for (let round = 0; round < 5; round++) {
+      const r = fresh()
+      meta(r, inTopic('Отчёты'), true) // the original store holds thread 26
+      const bar = mkdtempSync(join(tmpdir(), 'tg-topic-bar-'))
+      const run = (thread: number, who: string) => Bun.spawn([process.execPath, child], {
+        cwd: import.meta.dir,
+        env: { ...process.env, TOPIC_CHILD_ROOT: r, TOPIC_CHILD_CHAT: CHAT, TOPIC_CHILD_THREAD: String(thread),
+          TOPIC_CHILD_BARRIER: bar, TOPIC_CHILD_ME: who, TELEGRAM_STATE_DIR: join(bar, 'state-' + who), TELEGRAM_BOT_TOKEN: who + ':x' },
+        stdout: 'pipe', stderr: 'pipe',
+      })
+      const kids = [run(41, 'a'), run(42, 'b')]
+      const codes = await Promise.all(kids.map(k => k.exited))
+      if (codes.some(c => c !== 0)) throw new Error((await Promise.all(kids.map(k => new Response(k.stderr).text()))).join('\n'))
+      expect(Object.keys(stored(r)).sort()).toEqual(['26', '41', '42'])
+    }
+  }, 60_000)
 })
 
 test('live archive dir untouched by this file (mtime)', () => {
