@@ -206,7 +206,7 @@ The topic's name, once the plugin has seen it (topic created, renamed, or the to
 goes as `topic_name` into the row and the wake of a forum-topic message (`is_topic_message`; `<>[];"` and every
 control / format / line-separator character → `_`, ≤128), and is kept per group in `<chat>/topics.jsonl`
 (append-only, one `{"thread", "name", "ts"}` line per learned name, one O_APPEND write — safe for several bot
-processes sharing the archive; groups in `access.groups` only). The reader takes the newest 256 KB; per topic the
+processes sharing the archive; groups in `access.groups` only). The reader folds the whole log (renames are rare, so the file stays small); per topic the
 line with the newest valid Telegram date wins (malformed or future dates are ignored), a root name only fills a gap.
 A team group (`team: true`, see ACCESS.md) archives every member and wakes only on an
 explicit, typed (not forwarded, not via an inline bot) `@<bot>` in the own message of the install

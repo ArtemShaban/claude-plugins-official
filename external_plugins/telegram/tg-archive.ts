@@ -15,7 +15,7 @@
 // Who is "allowed" is decided by gate() in server.ts (the ONE allowlist); this
 // module only writes. Pure fs, no grammy import, so it is unit-testable.
 
-import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, writeFileSync, writeSync } from 'fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from 'fs'
 import { basename, join } from 'path'
 import type { MessageOrigin } from 'grammy/types'
 import { groupBufferPath } from './group-buffer'
@@ -163,10 +163,10 @@ export function appendArchive(root: string, line: ArchiveLine): void {
 // one. The reader folds the lines in file order: per thread the entry with the greatest VALID ts wins (canonical
 // ISO, finite, not after now + TOPIC_TS_FUTURE_MS; equal ts → the later line). A same-name event with a newer ts is
 // appended too, so the watermark advances and an older different-name event cannot win later.
+// The WHOLE log is read and folded (rr2 f10: a tail window would evict a topic's latest record and bring back its
+// creation name); renames are rare, so the file stays small.
 
 export const TOPIC_NAME_CAP = 128
-/** r1 f6: only the newest TOPICS_MAX_BYTES of topics.jsonl are read (the oldest lines drop off) — ~1000 events. */
-export const TOPICS_MAX_BYTES = 256 * 1024
 /** rr1 f9: a stored or incoming ts further in the future than this is invalid (clock-skew allowance). */
 export const TOPIC_TS_FUTURE_MS = 5 * 60_000
 
@@ -224,38 +224,24 @@ function diag(p: string, line: string | undefined, log: (line: string) => void):
 }
 
 /**
- * The chat's topics, folded from topics.jsonl (newest TOPICS_MAX_BYTES only, r1 f6): numeric thread key,
+ * The chat's topics, folded from the whole topics.jsonl (rr2 f10): numeric thread key,
  * non-empty string name, valid ts (rr1 f9) — anything else is skipped. No file → {}. Invalid lines / an
  * unreadable file → one log line per change of that state, not per lookup. Never throws.
  */
 export function readTopics(root: string, chatId: string, log: (line: string) => void): TopicStore {
   const p = topicsFilePath(root, chatId)
-  if (!existsSync(p)) return {}
+  if (!existsSync(p)) {
+    diag(p, undefined, log) // rr2 f11: a missing store is a clean state — the next unreadable episode logs again
+    return {}
+  }
   let text: string
-  let clipped = false
   try {
-    const fd = openSync(p, 'r')
-    try {
-      const size = fstatSync(fd).size
-      const len = Math.min(size, TOPICS_MAX_BYTES)
-      const buf = Buffer.alloc(len)
-      let got = 0
-      while (got < len) {
-        const n = readSync(fd, buf, got, len - got, size - len + got)
-        if (n <= 0) break
-        got += n
-      }
-      text = buf.subarray(0, got).toString('utf8')
-      clipped = size > len
-    } finally {
-      closeSync(fd)
-    }
+    text = readFileSync(p, 'utf8')
   } catch (err) {
     diag(p, `telegram channel: topics.jsonl unreadable (${p}): ${err}`, log)
     return {}
   }
   const lines = text.split('\n')
-  if (clipped) lines.shift() // a line cut by the window start is not a record
   const out: TopicStore = {}
   const best: Record<string, number> = {}
   let dropped = 0

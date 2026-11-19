@@ -12,6 +12,7 @@
 import { describe, test, expect } from 'bun:test'
 import { spawnSync } from 'child_process'
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
@@ -24,7 +25,7 @@ import {
 } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
-import { appendArchive, archiveFilePath, archiveRoot, inboundTopicName, learnTopicName, messageContextMeta, readTopics, senderDisplayMeta, TOPICS_MAX_BYTES, type ArchiveLine } from './tg-archive'
+import { appendArchive, archiveFilePath, archiveRoot, inboundTopicName, learnTopicName, messageContextMeta, readTopics, senderDisplayMeta, type ArchiveLine } from './tg-archive'
 
 const LIVE_ARCHIVE = join(homedir(), 'Workspace', 'ClaudeProjects', 'sam-data', 'state', 'tg-archive')
 const liveStamp = () => (existsSync(LIVE_ARCHIVE) ? statSync(LIVE_ARCHIVE).mtimeMs : null)
@@ -815,15 +816,44 @@ describe('topic names: learnTopicName + inboundTopicName (topic-name spec, unit)
     expect(logs.length - before).toBe(1)
   })
 
-  test(`r1 f6: over TOPICS_MAX_BYTES (${TOPICS_MAX_BYTES} B) → only the newest bytes are read, the cut line skipped`, () => {
+  test('rr2 f10: a rename survives more than 256 KiB of other topics\' records — a fresh lookup carrying the root keeps B, appends nothing', () => {
     const r = fresh()
-    const old = line('31', 'старая', iso(D - 10))
-    const pad = line('99', 'p'.repeat(TOPICS_MAX_BYTES), iso(D - 5)) // one line bigger than the window
-    seed(r, old + pad + line('26', 'новая', iso(D)))
-    expect(statSync(file(r)).size).toBeGreaterThan(TOPICS_MAX_BYTES)
-    const before = logs.length
-    expect(stored(r)).toEqual({ '26': { name: 'новая', ts: iso(D) } })
-    expect(logs.length - before).toBe(0) // the cut line is not counted as invalid
+    learnTopicName(r, CHAT, { date: ROOT_D, message_thread_id: 26, is_topic_message: true, ...root('A') }, log) // creation name A
+    learnTopicName(r, CHAT, edited('B', D), log) // rename B
+    // far more than 256 KiB of valid records for other named threads, dated after B
+    let bulk = ''
+    for (let i = 0; i < 4000; i++) bulk += line(String(100 + (i % 50)), 'n'.repeat(80) + i, iso(D + 1 + i))
+    appendFileSync(file(r), bulk)
+    expect(statSync(file(r)).size).toBeGreaterThan(256 * 1024)
+    const n = rawLines(r).length
+    // fresh reader (restart-equivalent): a root message carrying the stale creation name A
+    expect(meta(r, inTopic('A'), true)).toEqual({ topic_name: 'B' })
+    expect(stored(r)['26']).toEqual({ name: 'B', ts: iso(D) })
+    expect(rawLines(r).length).toBe(n) // A was not appended
+  })
+
+  test('rr2 f11: unreadable → absent → the same unreadable again = one diagnostic per episode (two), none repeated within one', () => {
+    const r = fresh()
+    seed(r, line('26', 'x', iso(D)))
+    const errs = () => logs.filter(l => l.includes('topics.jsonl unreadable'))
+    const base = errs().length
+    chmodSync(file(r), 0o000)
+    try {
+      readTopics(r, CHAT, log)
+      readTopics(r, CHAT, log)
+      expect(errs().length - base).toBe(1)
+      chmodSync(file(r), 0o600)
+      rmSync(file(r)) // absent: a clean state
+      expect(readTopics(r, CHAT, log)).toEqual({})
+      expect(errs().length - base).toBe(1)
+      writeFileSync(file(r), line('26', 'x', iso(D)))
+      chmodSync(file(r), 0o000) // the same unreadable condition again
+      readTopics(r, CHAT, log)
+      readTopics(r, CHAT, log)
+      expect(errs().length - base).toBe(2)
+    } finally {
+      try { chmodSync(file(r), 0o600) } catch {}
+    }
   })
 
   test('r1 f6: bad threads (__proto__, constructor, 0, x1), non-string / empty names, arrays, null → skipped, one log line', () => {
